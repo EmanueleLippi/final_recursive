@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -147,6 +147,19 @@ def score_pass_logs(
         return float("inf")
     return float(np.mean(losses) + worst_block_weight * np.max(losses))
 
+def _sample_path_indices(n_total: int, sample_paths: int) -> np.ndarray:
+    n_total = int(n_total)
+    if n_total <= 0:
+        return np.zeros((0,), dtype=np.int32)
+    n_paths = max(1, min(int(sample_paths), n_total))
+    return np.arange(n_paths, dtype=np.int32)
+
+def _safe_component_label(label: str, fallback: str) -> str:
+    value = str(label or fallback).strip()
+    if value == "":
+        value = str(fallback)
+    return "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in value)
+
 def plot_recursive_exact_comparison(
     stitched: Dict[str, np.ndarray],
     Y_exact: np.ndarray,
@@ -155,6 +168,8 @@ def plot_recursive_exact_comparison(
     out_dir: str,
     sample_paths: int = 5,
     file_suffix: str = "",
+    include_path_plots: bool = True,
+    include_error_plots: bool = True,
 ) -> None:
     if not _PLOTTING_AVAILABLE:
         print("[Plot] matplotlib non disponibile: skip plot_recursive_exact_comparison")
@@ -173,43 +188,89 @@ def plot_recursive_exact_comparison(
         return
 
     os.makedirs(out_dir, exist_ok=True)
-    n_paths = max(1, min(int(sample_paths), int(t_all.shape[0])))
+    path_indices = _sample_path_indices(int(t_all.shape[0]), int(sample_paths))
     z_labels = _z_component_labels(int(Z_pred.shape[2]))
     z_colors = ["b", "g", "r", "m", "c", "y", "k"]
 
-    plt.figure(figsize=(12, 6))
-    for i in range(n_paths):
-        alpha = 0.95 if i == 0 else 0.28
-        width = 1.8 if i == 0 else 0.9
-        pred_label = "Y pred" if i == 0 else None
-        exact_label = "Y exact" if i == 0 else None
-        plt.plot(
-            t_all[i, :, 0],
-            Y_pred[i, :, 0],
-            color="tab:blue",
-            alpha=alpha,
-            linewidth=width,
-            label=pred_label,
-        )
-        plt.plot(
-            t_all[i, :, 0],
-            Y_exact[i, :, 0],
-            color="tab:red",
-            alpha=alpha,
-            linewidth=width,
-            linestyle="--",
-            label=exact_label,
-        )
-    for block in blocks[:-1]:
-        plt.axvline(float(block["t_end"]), color="k", linestyle="--", linewidth=0.8, alpha=0.25)
-    plt.title("Recursive stitched prediction - Y predicted vs exact")
-    plt.xlabel("Time")
-    plt.ylabel("Y")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, f"recursive_stitched_Y_exact{file_suffix}.png"), dpi=160)
-    plt.close()
+    if include_path_plots and path_indices.size > 0:
+        plt.figure(figsize=(12, 6))
+        for local_i, path_i in enumerate(path_indices):
+            alpha = 0.95 if local_i == 0 else 0.42
+            width = 1.8 if local_i == 0 else 1.0
+            pred_label = "Y pred" if local_i == 0 else None
+            exact_label = "Y exact" if local_i == 0 else None
+            plt.plot(
+                t_all[path_i, :, 0],
+                Y_pred[path_i, :, 0],
+                color="tab:blue",
+                alpha=alpha,
+                linewidth=width,
+                label=pred_label,
+            )
+            plt.plot(
+                t_all[path_i, :, 0],
+                Y_exact[path_i, :, 0],
+                color="tab:red",
+                alpha=alpha,
+                linewidth=width,
+                linestyle="--",
+                label=exact_label,
+            )
+        for block in blocks[:-1]:
+            plt.axvline(float(block["t_end"]), color="k", linestyle="--", linewidth=0.8, alpha=0.25)
+        plt.title("Recursive stitched prediction - Y predicted vs exact")
+        plt.xlabel("Time")
+        plt.ylabel("Y")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, f"recursive_stitched_Y_exact{file_suffix}.png"), dpi=160)
+        plt.close()
+
+        path_colors = plt.cm.tab10(np.linspace(0.0, 1.0, max(path_indices.size, 2)))
+        for d in range(Z_pred.shape[2]):
+            label = z_labels[d] if d < len(z_labels) else f"Z[{d}]"
+            safe_label = _safe_component_label(label, f"Z_{d}")
+            plt.figure(figsize=(12, 6))
+            for local_i, path_i in enumerate(path_indices):
+                color = path_colors[local_i % len(path_colors)]
+                alpha = 0.95 if local_i == 0 else 0.55
+                width = 1.8 if local_i == 0 else 1.0
+                pred_label = f"{label} pred" if local_i == 0 else None
+                exact_label = f"{label} exact" if local_i == 0 else None
+                plt.plot(
+                    t_all[path_i, :, 0],
+                    Z_pred[path_i, :, d],
+                    color=color,
+                    alpha=alpha,
+                    linewidth=width,
+                    label=pred_label,
+                )
+                plt.plot(
+                    t_all[path_i, :, 0],
+                    Z_exact[path_i, :, d],
+                    color=color,
+                    alpha=alpha,
+                    linewidth=width,
+                    linestyle="--",
+                    label=exact_label,
+                )
+            for block in blocks[:-1]:
+                plt.axvline(float(block["t_end"]), color="k", linestyle="--", linewidth=0.8, alpha=0.25)
+            plt.title(f"Recursive stitched prediction - {label} predicted vs exact")
+            plt.xlabel("Time")
+            plt.ylabel(label)
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(
+                os.path.join(out_dir, f"recursive_stitched_{safe_label}_exact{file_suffix}.png"),
+                dpi=160,
+            )
+            plt.close()
+
+    if not include_error_plots:
+        return
 
     abs_err_Z_full = np.abs(Z_pred - Z_exact)
     valid_mask = np.abs(Z_exact) > 1.0e-8

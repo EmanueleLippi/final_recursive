@@ -19,6 +19,19 @@ from .schedules import load_training_plan_csv, parse_float_sequence_arg, resolve
 from .tf_backend import set_tf_seed
 from .tests import run_tests
 
+
+def _parse_optional_component_weights(value: str, arg_name: str, D: int):
+    value = str(value or "").strip()
+    if value == "":
+        return None
+    weights = parse_float_sequence_arg(value, arg_name=arg_name)
+    if len(weights) not in (1, int(D)):
+        raise ValueError(f"{arg_name} must contain 1 or {int(D)} values, got {len(weights)}")
+    if any(weight < 0.0 for weight in weights):
+        raise ValueError(f"{arg_name} must contain non-negative values")
+    return [float(weight) for weight in weights]
+
+
 def run_program(argv: Optional[List[str]] = None):
     parser = argparse.ArgumentParser(description="Recursive time-stitching experiment (TF2 native)")
     parser.add_argument("--mode", type=str, default="recursive", choices=["standard", "recursive", "both"])
@@ -108,11 +121,21 @@ def run_program(argv: Optional[List[str]] = None):
         "--selection_metric",
         type=str,
         default="auto",
-        choices=["auto", "loss", "last", "exact_mae_y", "exact_rmse_y", "exact_abs_y0"],
+        choices=[
+            "auto",
+            "loss",
+            "last",
+            "exact_mae_y",
+            "exact_rmse_y",
+            "exact_abs_y0",
+            "exact_mae_z",
+            "exact_mae_z_s",
+        ],
         help=(
             "Metrica di selezione della pass finale: "
             "auto usa exact_mae_y se exact_solution e' attiva, altrimenti loss; "
-            "last forza la selezione dell'ultima passata completata."
+            "last forza la selezione dell'ultima passata completata; "
+            "exact_mae_z ed exact_mae_z_s selezionano rispettivamente su tutto Z e su Z_S."
         ),
     )
     parser.add_argument(
@@ -145,6 +168,23 @@ def run_program(argv: Optional[List[str]] = None):
         type=int,
         default=1234,
         help="Seed usato per costruire un evaluation bundle nuovo quando non viene caricato.",
+    )
+    parser.add_argument(
+        "--visual_sample_paths",
+        type=int,
+        default=8,
+        help=(
+            "Numero di path random deterministici usati solo per figure Y/Z pred-vs-exact. "
+            "Le metriche exact restano calcolate sull'evaluation bundle grande."
+        ),
+    )
+    parser.add_argument(
+        "--visual_seed",
+        type=int,
+        default=-1,
+        help=(
+            "Seed per i path visuali. Usa -1 per derivarlo automaticamente da --eval_seed."
+        ),
     )
     parser.add_argument(
         "--pass1_init",
@@ -220,7 +260,70 @@ def run_program(argv: Optional[List[str]] = None):
         default=None,
         help="Override del parametro const per Girsanov"
     )
+    parser.add_argument(
+        "--dynamic_loss_dt_normalization",
+        action="store_true",
+        help=(
+            "Normalizza il residuo dinamico per dt nella composizione di loss migliorata. "
+            "Default disattivo per preservare la compatibilita' legacy."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic_loss_weight",
+        type=float,
+        default=1.0,
+        help="Peso del residuo dinamico nella composizione di loss migliorata.",
+    )
+    parser.add_argument(
+        "--same_xi_antithetic_sampling",
+        action="store_true",
+        help=(
+            "Nelle coppie antitetiche usa la stessa Xi iniziale oltre a Brownian increments opposti. "
+            "Default disattivo per preservare il campionamento legacy."
+        ),
+    )
+    parser.add_argument(
+        "--terminal_y_loss_weight",
+        type=float,
+        default=1.0,
+        help="Peso del vincolo terminale su Y nella composizione di loss migliorata.",
+    )
+    parser.add_argument(
+        "--terminal_z_loss_weight",
+        type=float,
+        default=1.0,
+        help="Peso globale del vincolo terminale su Z nella composizione di loss migliorata.",
+    )
+    parser.add_argument(
+        "--terminal_z_component_weights",
+        type=str,
+        default="",
+        help=(
+            "Pesi opzionali per le componenti terminali di Z, separati da virgola. "
+            "Usa un solo valore per broadcast oppure D valori, ad esempio '3,1,2,0'."
+        ),
+    )
+    parser.add_argument(
+        "--structural_z_loss_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Peso opzionale per penalizzare componenti strutturalmente nulle di Z. "
+            "Resta inattivo a 0."
+        ),
+    )
+    parser.add_argument(
+        "--structural_z_component_weights",
+        type=str,
+        default="",
+        help=(
+            "Pesi per la penalita strutturale sulle componenti di Z, separati da virgola. "
+            "Esempio per penalizzare Z_H: '0,1,0,0'."
+        ),
+    )
     args = parser.parse_args(argv)
+    if int(args.visual_sample_paths) < 1:
+        raise ValueError("--visual_sample_paths must be >= 1")
 
     from .orchestration import (
         print_recursive_pass,
@@ -236,6 +339,16 @@ def run_program(argv: Optional[List[str]] = None):
     N = args.N
     D = args.D
     effective_const = 1.0 if args.const_override is None else float(args.const_override)
+    terminal_z_component_weights = _parse_optional_component_weights(
+        args.terminal_z_component_weights,
+        arg_name="--terminal_z_component_weights",
+        D=D,
+    )
+    structural_z_component_weights = _parse_optional_component_weights(
+        args.structural_z_component_weights,
+        arg_name="--structural_z_component_weights",
+        D=D,
+    )
     coarse_curriculum_consts = parse_float_sequence_arg(
         args.coarse_curriculum_consts,
         arg_name="--coarse_curriculum_consts",
@@ -281,6 +394,14 @@ def run_program(argv: Optional[List[str]] = None):
         "s2": np.float32(0.5),
         "s3": np.float32(0.5),
         "const": np.float32(effective_const),
+        "same_xi_antithetic_sampling": bool(args.same_xi_antithetic_sampling),
+        "dynamic_loss_dt_normalization": bool(args.dynamic_loss_dt_normalization),
+        "dynamic_loss_weight": np.float32(args.dynamic_loss_weight),
+        "terminal_y_loss_weight": np.float32(args.terminal_y_loss_weight),
+        "terminal_z_loss_weight": np.float32(args.terminal_z_loss_weight),
+        "terminal_z_component_weights": terminal_z_component_weights,
+        "structural_z_loss_weight": np.float32(args.structural_z_loss_weight),
+        "structural_z_component_weights": structural_z_component_weights,
     }
 
     layers = [D + 1] + 4 * [256] + [1]
@@ -350,6 +471,8 @@ def run_program(argv: Optional[List[str]] = None):
         "exact_regression_action": effective_exact_regression_action,
         "eval_bundle_path": str(args.eval_bundle_path),
         "eval_seed": int(args.eval_seed),
+        "visual_sample_paths": int(args.visual_sample_paths),
+        "visual_seed": None if int(args.visual_seed) < 0 else int(args.visual_seed),
         "pass1_init": str(args.pass1_init),
         "coarse_prepass_M": int(args.coarse_prepass_M),
         "coarse_prepass_N": int(args.coarse_prepass_N),
@@ -366,6 +489,14 @@ def run_program(argv: Optional[List[str]] = None):
         "params": params,
         "const_override": None if args.const_override is None else float(args.const_override),
         "effective_const": float(effective_const),
+        "same_xi_antithetic_sampling": bool(args.same_xi_antithetic_sampling),
+        "dynamic_loss_dt_normalization": bool(args.dynamic_loss_dt_normalization),
+        "dynamic_loss_weight": float(args.dynamic_loss_weight),
+        "terminal_y_loss_weight": float(args.terminal_y_loss_weight),
+        "terminal_z_loss_weight": float(args.terminal_z_loss_weight),
+        "terminal_z_component_weights": terminal_z_component_weights,
+        "structural_z_loss_weight": float(args.structural_z_loss_weight),
+        "structural_z_component_weights": structural_z_component_weights,
         "plotting_available": _PLOTTING_AVAILABLE,
     }
     save_json(run_config, os.path.join(run_root, "run_config.json"))
@@ -598,7 +729,9 @@ def run_program(argv: Optional[List[str]] = None):
                 eval_bundle_path=eval_bundle_path,
                 eval_seed=int(args.eval_seed),
                 eval_min_paths=max(64, M),
-                sample_paths=8,
+                sample_paths=int(args.visual_sample_paths),
+                visual_sample_paths=int(args.visual_sample_paths),
+                visual_seed=None if int(args.visual_seed) < 0 else int(args.visual_seed),
                 enforce_exact_regression_guardrail=is_last_requested_pass,
                 print_compact_logs=is_last_requested_pass,
                 exclude_pass_ids_from_selection=excluded_pass_ids_from_selection,
@@ -659,7 +792,9 @@ def run_program(argv: Optional[List[str]] = None):
                 eval_bundle_path=eval_bundle_path,
                 eval_seed=int(args.eval_seed),
                 eval_min_paths=max(64, M),
-                sample_paths=8,
+                sample_paths=int(args.visual_sample_paths),
+                visual_sample_paths=int(args.visual_sample_paths),
+                visual_seed=None if int(args.visual_seed) < 0 else int(args.visual_seed),
                 enforce_exact_regression_guardrail=True,
                 print_compact_logs=True,
                 exclude_pass_ids_from_selection=excluded_pass_ids_from_selection,

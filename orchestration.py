@@ -39,6 +39,30 @@ from .schedules import (
 )
 from .tf_backend import reset_backend_state
 
+_BASE_EVAL_LOG_KEYS = {
+    "mean_loss",
+    "std_loss",
+    "mean_loss_per_sample",
+    "std_loss_per_sample",
+    "mean_y0",
+    "std_y0",
+}
+
+
+def _prefixed_eval_diagnostics(eval_stats: Dict[str, Any]) -> Dict[str, float]:
+    diagnostics = {}
+    for key, value in eval_stats.items():
+        if key in _BASE_EVAL_LOG_KEYS:
+            continue
+        if not (str(key).startswith("mean_loss_") or str(key).startswith("std_loss_")):
+            continue
+        try:
+            diagnostics[f"eval_{key}"] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return diagnostics
+
+
 def print_recursive_pass(
     pass_entries: List[Dict[str, Any]],
     blocks: List[Dict[str, float]],
@@ -56,6 +80,8 @@ def print_recursive_pass(
     eval_seed: int = 1234,
     eval_min_paths: int = 64,
     sample_paths: int = 8,
+    visual_sample_paths: Optional[int] = None,
+    visual_seed: Optional[int] = None,
     enforce_exact_regression_guardrail: bool = True,
     print_compact_logs: bool = True,
     exclude_pass_ids_from_selection: Optional[List[int]] = None,
@@ -177,9 +203,32 @@ def print_recursive_pass(
             f"seed={int(eval_seed)}"
         )
 
+    visual_path_count = int(sample_paths if visual_sample_paths is None else visual_sample_paths)
+    visual_seed_effective = int(eval_seed) + 7919 if visual_seed is None else int(visual_seed)
+    Xi_visual = None
+    visual_rollout_inputs = None
+    if exact_solution is not None and visual_path_count > 0:
+        Xi_visual = make_deterministic_xi_default(
+            visual_path_count,
+            D,
+            seed=visual_seed_effective,
+        )
+        visual_rollout_inputs = build_stitched_rollout_inputs(
+            blocks=blocks,
+            M=Xi_visual.shape[0],
+            N_per_block=N_per_block,
+            D=D,
+            seed=visual_seed_effective,
+        )
+        print(
+            f"[VisualBundle] created M={Xi_visual.shape[0]}, seed={visual_seed_effective}"
+        )
+
     stitched_by_pass = {}
     exact_summary_by_pass = {}
     exact_bundle_by_pass = {}
+    visual_stitched_by_pass = {}
+    visual_exact_bundle_by_pass = {}
     for p in pass_entries:
         pass_id = int(p["pass_id"])
         pass_tag = _pass_tag(pass_id)
@@ -248,7 +297,47 @@ def print_recursive_pass(
                 out_dir=plots_dir,
                 sample_paths=sample_paths,
                 file_suffix=f"_{pass_tag}",
+                include_path_plots=False,
+                include_error_plots=True,
             )
+
+            if Xi_visual is not None and visual_rollout_inputs is not None:
+                visual_stitched = predict_recursive_stitched(
+                    block_blobs=p["blobs"],
+                    blocks=blocks,
+                    Xi_initial=Xi_visual,
+                    params=params,
+                    N_per_block=N_per_block,
+                    D=D,
+                    layers=layers,
+                    T_total=T_total,
+                    rollout_inputs=visual_rollout_inputs,
+                    coupling_const=float(coupling_const),
+                )
+                visual_exact_bundle = compute_stitched_exact_bundle(
+                    stitched=visual_stitched,
+                    exact_solution=exact_solution,
+                )
+                visual_stitched_by_pass[pass_id] = visual_stitched
+                visual_exact_bundle_by_pass[pass_id] = visual_exact_bundle
+                np.savez(
+                    os.path.join(rec_dir, f"visual_stitched_predictions_{pass_tag}.npz"),
+                    t=visual_stitched["t"],
+                    X=visual_stitched["X"],
+                    Y=visual_stitched["Y"],
+                    Z=visual_stitched["Z"],
+                )
+                plot_recursive_exact_comparison(
+                    stitched=visual_stitched,
+                    Y_exact=visual_exact_bundle["Y_exact"],
+                    Z_exact=visual_exact_bundle["Z_exact"],
+                    blocks=blocks,
+                    out_dir=plots_dir,
+                    sample_paths=visual_path_count,
+                    file_suffix=f"_{pass_tag}",
+                    include_path_plots=True,
+                    include_error_plots=False,
+                )
 
     if (
         enforce_exact_regression_guardrail
@@ -293,6 +382,8 @@ def print_recursive_pass(
 
     selected_stitched = stitched_by_pass[selected_pass_id]
     selected_exact_bundle = exact_bundle_by_pass.get(selected_pass_id, None)
+    selected_visual_stitched = visual_stitched_by_pass.get(selected_pass_id, None)
+    selected_visual_exact_bundle = visual_exact_bundle_by_pass.get(selected_pass_id, None)
     np.savez(
         os.path.join(rec_dir, "stitched_predictions_final.npz"),
         t=selected_stitched["t"],
@@ -328,7 +419,28 @@ def print_recursive_pass(
             out_dir=plots_dir,
             sample_paths=sample_paths,
             file_suffix="",
+            include_path_plots=False,
+            include_error_plots=True,
         )
+        if selected_visual_stitched is not None and selected_visual_exact_bundle is not None:
+            np.savez(
+                os.path.join(rec_dir, "visual_stitched_predictions_final.npz"),
+                t=selected_visual_stitched["t"],
+                X=selected_visual_stitched["X"],
+                Y=selected_visual_stitched["Y"],
+                Z=selected_visual_stitched["Z"],
+            )
+            plot_recursive_exact_comparison(
+                stitched=selected_visual_stitched,
+                Y_exact=selected_visual_exact_bundle["Y_exact"],
+                Z_exact=selected_visual_exact_bundle["Z_exact"],
+                blocks=blocks,
+                out_dir=plots_dir,
+                sample_paths=visual_path_count,
+                file_suffix="",
+                include_path_plots=True,
+                include_error_plots=False,
+            )
 
     plot_recursive_stitched_y_convergence(
         stitched_by_pass=stitched_by_pass,
@@ -364,6 +476,8 @@ def print_recursive_pass(
         },
         "eval_bundle_path": eval_bundle_path,
         "evaluation_bundle_M": int(Xi_stitched.shape[0]),
+        "visual_sample_paths": int(max(0, visual_path_count)),
+        "visual_seed": int(visual_seed_effective),
     }
 
 def resolve_pass_selection(
@@ -404,11 +518,17 @@ def resolve_pass_selection(
         "exact_mae_y": ("exact.mean_abs_error_y", lambda s: float(s["mean_abs_error_y"])),
         "exact_rmse_y": ("exact.rmse_y", lambda s: float(s["rmse_y"])),
         "exact_abs_y0": ("exact.abs_error_mean_y0", lambda s: float(s["abs_error_mean_y0"])),
+        "exact_mae_z": ("exact.mean_abs_error_z", lambda s: float(s["mean_abs_error_z"])),
+        "exact_mae_z_s": (
+            "exact.mean_abs_error_z_component_Z_S",
+            lambda s: float(s["mean_abs_error_z_by_component"][0]),
+        ),
     }
     if metric not in metric_extractors:
         raise ValueError(
             f"Unsupported selection_metric='{selection_metric}'. "
-            "Supported: auto, loss, last, exact_mae_y, exact_rmse_y, exact_abs_y0"
+            "Supported: auto, loss, last, exact_mae_y, exact_rmse_y, exact_abs_y0, "
+            "exact_mae_z, exact_mae_z_s"
         )
     if len(exact_summary_by_pass) == 0:
         raise RuntimeError(
@@ -538,6 +658,7 @@ def train_with_standard_schedule(
                     "eval_std_y0": eval_stats["std_y0"],
                     "elapsed_sec": float(elapsed),
                 }
+                | _prefixed_eval_diagnostics(eval_stats)
             )
             print(
                 f"[StageSummary] {label} const={level:.1f}, lr={lr:.1e}, iters={n_iter}, "
@@ -580,6 +701,7 @@ def train_with_standard_schedule(
                 "eval_std_y0": eval_stats["std_y0"],
                 "elapsed_sec": float(elapsed),
             }
+            | _prefixed_eval_diagnostics(eval_stats)
         )
         print(
             f"[FinalSummary] {label} const={float(coupling_const):.1f}, lr={lr:.1e}, iters={n_iter}, "
@@ -913,7 +1035,7 @@ def run_recursive_training(
                     "freeze_threshold": float(freeze_loss_threshold),
                     "freeze_neighbor_radius": int(freeze_neighbor_radius),
                     "active_set_enabled": True,
-                }
+                } | _prefixed_eval_diagnostics(eval_stats)
                 logs.append(log_row)
                 block_blobs[b] = blob
                 next_blob = blob
@@ -1016,7 +1138,7 @@ def run_recursive_training(
                 "freeze_threshold": float(freeze_loss_threshold),
                 "freeze_neighbor_radius": int(freeze_neighbor_radius),
                 "active_set_enabled": bool(active_set_summary.get("enabled", False)),
-            }
+            } | _prefixed_eval_diagnostics(block_stats["eval_stats"])
             logs.append(log_row)
 
             block_blobs[b] = blob

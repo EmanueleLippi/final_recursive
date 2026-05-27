@@ -144,6 +144,58 @@ def test_rollout_inputs_are_antithetic() -> None:
         np.testing.assert_allclose(dW[1], -dW[3], atol=1.0e-6)
 
 
+def test_exact_path_plot_outputs() -> None:
+    from .plotting import _PLOTTING_AVAILABLE, plot_recursive_exact_comparison
+
+    if not _PLOTTING_AVAILABLE:
+        return
+
+    M = 3
+    T_steps = 5
+    D = 4
+    t = np.tile(np.linspace(0.0, 1.0, T_steps, dtype=np.float32).reshape(1, T_steps, 1), (M, 1, 1))
+    X = np.zeros((M, T_steps, D), dtype=np.float32)
+    Y_pred = np.zeros((M, T_steps, 1), dtype=np.float32)
+    Z_pred = np.zeros((M, T_steps, D), dtype=np.float32)
+    Y_exact = np.zeros_like(Y_pred)
+    Z_exact = np.zeros_like(Z_pred)
+    for i in range(M):
+        Y_pred[i, :, 0] = i + t[i, :, 0]
+        Y_exact[i, :, 0] = i + 0.9 * t[i, :, 0]
+        for d in range(D):
+            Z_pred[i, :, d] = (d + 1) * (i + 1) * t[i, :, 0]
+            Z_exact[i, :, d] = 0.8 * Z_pred[i, :, d]
+    stitched = {"t": t, "X": X, "Y": Y_pred, "Z": Z_pred}
+    blocks = [{"t_start": 0.0, "t_end": 0.5}, {"t_start": 0.5, "t_end": 1.0}]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = Path(tmp)
+        plot_recursive_exact_comparison(
+            stitched=stitched,
+            Y_exact=Y_exact,
+            Z_exact=Z_exact,
+            blocks=blocks,
+            out_dir=str(out_dir),
+            sample_paths=2,
+            file_suffix="_unit",
+            include_path_plots=True,
+            include_error_plots=True,
+        )
+        expected = [
+            "recursive_stitched_Y_exact_unit.png",
+            "recursive_stitched_Z_S_exact_unit.png",
+            "recursive_stitched_Z_H_exact_unit.png",
+            "recursive_stitched_Z_V_exact_unit.png",
+            "recursive_stitched_Z_X_exact_unit.png",
+            "recursive_stitched_Z_rel_error_unit.png",
+            "recursive_stitched_abs_error_unit.png",
+        ]
+        for name in expected:
+            path = out_dir / name
+            assert path.exists(), name
+            assert path.stat().st_size > 0, name
+
+
 def test_tf2_model_smoke_and_blob_roundtrip() -> None:
     from .models import NN_Quadratic_Coupled_Recursive
     from .tf_backend import set_seed, tf
@@ -217,6 +269,259 @@ def test_tf2_model_smoke_and_blob_roundtrip() -> None:
 
     model.close()
     model2.close()
+
+
+def test_loss_improvement_flags_are_finite() -> None:
+    from .models import NN_Quadratic_Coupled_Recursive
+    from .tf_backend import set_seed
+
+    set_seed(17)
+    params = _default_params()
+    params.update(
+        {
+            "dynamic_loss_dt_normalization": True,
+            "dynamic_loss_weight": np.float32(1.0),
+            "terminal_y_loss_weight": np.float32(1.0),
+            "terminal_z_loss_weight": np.float32(2.0),
+            "terminal_z_component_weights": [3.0, 0.25, 2.0, 0.0],
+            "structural_z_loss_weight": np.float32(0.5),
+            "structural_z_component_weights": [0.0, 1.0, 0.0, 0.0],
+        }
+    )
+    model = NN_Quadratic_Coupled_Recursive(
+        Xi_generator=Xi_generator_default,
+        T=0.25,
+        M=4,
+        N=2,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        normalize_time_input=True,
+    )
+    t_batch, W_batch, Xi_batch = model.fetch_minibatch()
+    loss, _, _, _, components = model.loss_function(
+        t_batch,
+        W_batch,
+        Xi_batch,
+        const_value=1.0,
+        return_components=True,
+    )
+    assert np.isfinite(float(loss.numpy()))
+    assert np.isfinite(float(components["loss_total"].numpy()))
+    assert np.isfinite(float(components["loss_dynamic"].numpy()))
+    assert np.isfinite(float(components["loss_terminal_z"].numpy()))
+    np.testing.assert_allclose(
+        float(loss.numpy()),
+        float(components["loss_total"].numpy()),
+        rtol=1.0e-6,
+        atol=1.0e-6,
+    )
+
+    stats = model.evaluate(const_value=1.0, n_batches=1)
+    for key in (
+        "mean_loss_dynamic",
+        "mean_loss_terminal_y",
+        "mean_loss_terminal_z",
+        "mean_loss_structural_z",
+        "mean_loss_weighted_terminal_z_component_0",
+        "mean_loss_weighted_structural_z_component_1",
+    ):
+        assert key in stats
+        assert np.isfinite(stats[key])
+    train_stats = model.train(
+        N_Iter=1,
+        learning_rate=1.0e-3,
+        const_value=1.0,
+        eval_every=1,
+        val_batches=1,
+    )
+    assert train_stats["best_iter"] == 0
+    assert np.isfinite(train_stats["best_score"])
+    model.close()
+
+
+def test_terminal_blob_constants_survive_train_graph() -> None:
+    from .models import NN_Quadratic_Coupled_Recursive
+    from .tf_backend import set_seed
+
+    set_seed(19)
+    params = _default_params()
+    layers = [5, 8, 1]
+    terminal_blob = _make_blob(layers)
+    model = NN_Quadratic_Coupled_Recursive(
+        Xi_generator=Xi_generator_default,
+        T=0.25,
+        M=4,
+        N=2,
+        D=4,
+        layers=layers,
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.5,
+        terminal_blob=terminal_blob,
+        normalize_time_input=True,
+    )
+    train_stats = model.train(
+        N_Iter=1,
+        learning_rate=1.0e-3,
+        const_value=1.0,
+        eval_every=1,
+        val_batches=1,
+    )
+    assert train_stats["best_iter"] == 0
+    assert np.isfinite(train_stats["best_score"])
+
+    eval_stats = model.evaluate(const_value=1.0, n_batches=1)
+    assert np.isfinite(eval_stats["mean_loss"])
+    t_batch, W_batch, Xi_batch = model.fetch_minibatch()
+    X, Y, Z = model.predict(Xi_batch, t_batch, W_batch, const_value=1.0)
+    assert X.shape == (4, 3, 4)
+    assert Y.shape == (4, 3, 1)
+    assert Z.shape == (4, 3, 4)
+    model.close()
+
+
+def test_recursive_visual_bundle_acceptance() -> None:
+    from .orchestration import print_recursive_pass
+    from .plotting import _PLOTTING_AVAILABLE
+    from .tf_backend import set_seed
+
+    set_seed(29)
+    params = _default_params()
+    layers = [5, 8, 1]
+    blob = _make_blob(layers)
+    blocks = [{"idx": 0, "t_start": 0.0, "t_end": 0.25, "T_block": 0.25}]
+    logs = [
+        {
+            "pass": 1,
+            "block": 0,
+            "t_start": 0.0,
+            "t_end": 0.25,
+            "T_block": 0.25,
+            "eval_mean_loss": 1.0,
+            "eval_std_loss": 0.0,
+            "eval_mean_loss_per_sample": 0.25,
+            "eval_std_loss_per_sample": 0.0,
+            "eval_mean_y0": 0.0,
+            "precision_target": None,
+            "refine_rounds": 0,
+        }
+    ]
+    exact = build_exact_solution_functions("quadratic_coupled", params, D=4)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        summary = print_recursive_pass(
+            pass_entries=[{"pass_id": 1, "logs": logs, "blobs": [blob]}],
+            blocks=blocks,
+            rec_dir=str(tmp_path),
+            params=params,
+            N_per_block=2,
+            D=4,
+            layers=layers,
+            T_total=0.25,
+            exact_solution=exact,
+            selection_metric="loss",
+            eval_bundle_path=str(tmp_path / "evaluation_bundle.npz"),
+            eval_seed=101,
+            eval_min_paths=4,
+            sample_paths=2,
+            visual_sample_paths=2,
+            visual_seed=202,
+            print_compact_logs=False,
+        )
+        assert summary["visual_sample_paths"] == 2
+        assert summary["visual_seed"] == 202
+        assert (tmp_path / "visual_stitched_predictions_pass00.npz").exists()
+        assert (tmp_path / "visual_stitched_predictions_final.npz").exists()
+        assert (tmp_path / "exact_metrics_final.json").exists()
+        if _PLOTTING_AVAILABLE:
+            expected_plots = [
+                "recursive_stitched_Y_exact_pass00.png",
+                "recursive_stitched_Z_S_exact_pass00.png",
+                "recursive_stitched_Z_V_exact_pass00.png",
+                "recursive_stitched_abs_error_pass00.png",
+                "recursive_stitched_Y_exact.png",
+                "recursive_stitched_Z_S_exact.png",
+            ]
+            for name in expected_plots:
+                path = tmp_path / "plots" / name
+                assert path.exists(), name
+                assert path.stat().st_size > 0, name
+
+
+def test_same_xi_antithetic_minibatch() -> None:
+    from .models import NN_Quadratic_Coupled_Recursive
+    from .tf_backend import set_seed
+
+    set_seed(23)
+    params = _default_params()
+    params["same_xi_antithetic_sampling"] = True
+    model = NN_Quadratic_Coupled_Recursive(
+        Xi_generator=Xi_generator_default,
+        T=0.25,
+        M=5,
+        N=2,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.5,
+        t_end=0.75,
+        T_total=0.75,
+        normalize_time_input=True,
+    )
+    t_batch, W_batch, Xi_batch = model.fetch_minibatch()
+    dW = W_batch[:, 1:, :] - W_batch[:, :-1, :]
+    np.testing.assert_allclose(dW[0], -dW[2], atol=1.0e-6)
+    np.testing.assert_allclose(dW[1], -dW[3], atol=1.0e-6)
+    np.testing.assert_allclose(Xi_batch[0], Xi_batch[2], atol=1.0e-6)
+    np.testing.assert_allclose(Xi_batch[1], Xi_batch[3], atol=1.0e-6)
+    assert np.isclose(t_batch[0, 0, 0], 0.5)
+    assert np.isclose(t_batch[0, -1, 0], 0.75)
+    model.close()
+
+
+def test_z_selection_metrics() -> None:
+    from .orchestration import resolve_pass_selection
+
+    pass_scores = {1: 10.0, 2: 1.0}
+    exact_summary = {
+        1: {
+            "mean_abs_error_y": 5.0,
+            "rmse_y": 6.0,
+            "abs_error_mean_y0": 7.0,
+            "mean_abs_error_z": 0.30,
+            "mean_abs_error_z_by_component": [0.90, 0.01, 0.20, 0.0],
+        },
+        2: {
+            "mean_abs_error_y": 6.0,
+            "rmse_y": 7.0,
+            "abs_error_mean_y0": 8.0,
+            "mean_abs_error_z": 0.20,
+            "mean_abs_error_z_by_component": [0.70, 0.02, 0.25, 0.0],
+        },
+    }
+    selected, label, score, _ = resolve_pass_selection(
+        pass_scores,
+        exact_summary,
+        selection_metric="exact_mae_z",
+    )
+    assert selected == 2
+    assert label == "exact.mean_abs_error_z"
+    assert np.isclose(score, 0.20)
+
+    selected, label, score, _ = resolve_pass_selection(
+        pass_scores,
+        exact_summary,
+        selection_metric="exact_mae_z_s",
+    )
+    assert selected == 2
+    assert label == "exact.mean_abs_error_z_component_Z_S"
+    assert np.isclose(score, 0.70)
 
 
 def test_v1_prediction_parity() -> None:
@@ -348,6 +653,7 @@ def run_tests(argv: List[str] | None = None) -> int:
     cases: List[tuple[str, Callable[[], None]]] = [
         ("numpy_math_and_schedules", test_numpy_math_and_schedules),
         ("rollout_inputs_are_antithetic", test_rollout_inputs_are_antithetic),
+        ("exact_path_plot_outputs", test_exact_path_plot_outputs),
     ]
 
     ok = True
@@ -356,6 +662,26 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "tf2_model_smoke_and_blob_roundtrip",
         "test_tf2_model_smoke_and_blob_roundtrip",
+    ) and ok
+    ok = _run_subprocess_case(
+        "loss_improvement_flags_are_finite",
+        "test_loss_improvement_flags_are_finite",
+    ) and ok
+    ok = _run_subprocess_case(
+        "terminal_blob_constants_survive_train_graph",
+        "test_terminal_blob_constants_survive_train_graph",
+    ) and ok
+    ok = _run_subprocess_case(
+        "recursive_visual_bundle_acceptance",
+        "test_recursive_visual_bundle_acceptance",
+    ) and ok
+    ok = _run_subprocess_case(
+        "same_xi_antithetic_minibatch",
+        "test_same_xi_antithetic_minibatch",
+    ) and ok
+    ok = _run_subprocess_case(
+        "z_selection_metrics",
+        "test_z_selection_metrics",
     ) and ok
     if args.include_v1_parity:
         ok = _run_subprocess_case("v1_prediction_parity", "test_v1_prediction_parity") and ok

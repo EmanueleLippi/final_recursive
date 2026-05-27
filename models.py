@@ -51,6 +51,14 @@ class FBSNN(tf.Module, ABC):
         layers,
         clip_grad_norm=1.0,
         use_antithetic_sampling=True,
+        same_xi_antithetic_sampling=False,
+        dynamic_loss_dt_normalization=False,
+        dynamic_loss_weight=1.0,
+        terminal_y_loss_weight=1.0,
+        terminal_z_loss_weight=1.0,
+        terminal_z_component_weights=None,
+        structural_z_loss_weight=0.0,
+        structural_z_component_weights=None,
         log_device_placement=False,
     ):
         super().__init__(name=self.__class__.__name__)
@@ -62,6 +70,38 @@ class FBSNN(tf.Module, ABC):
         self.layers = list(layers)
         self.clip_grad_norm = clip_grad_norm
         self.use_antithetic_sampling = bool(use_antithetic_sampling)
+        self.same_xi_antithetic_sampling = bool(same_xi_antithetic_sampling)
+        self.dynamic_loss_dt_normalization = bool(dynamic_loss_dt_normalization)
+        self.dynamic_loss_weight = np.float32(dynamic_loss_weight)
+        self.terminal_y_loss_weight = np.float32(terminal_y_loss_weight)
+        self.terminal_z_loss_weight = np.float32(terminal_z_loss_weight)
+        self.structural_z_loss_weight = np.float32(structural_z_loss_weight)
+        for name in (
+            "dynamic_loss_weight",
+            "terminal_y_loss_weight",
+            "terminal_z_loss_weight",
+            "structural_z_loss_weight",
+        ):
+            value = float(getattr(self, name))
+            if not np.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        self.terminal_z_component_weights_np = self._prepare_component_weights(
+            terminal_z_component_weights,
+            default_value=1.0,
+            name="terminal_z_component_weights",
+        )
+        self.structural_z_component_weights_np = self._prepare_component_weights(
+            structural_z_component_weights,
+            default_value=0.0,
+            name="structural_z_component_weights",
+        )
+        self.terminal_z_component_weights_tf = tf.constant(
+            self.terminal_z_component_weights_np, dtype=tf.float32
+        )
+        self.structural_z_component_weights_tf = tf.constant(
+            self.structural_z_component_weights_np, dtype=tf.float32
+        )
+        self._legacy_loss_composition = self._is_legacy_loss_config()
         self.log_device_placement = bool(log_device_placement)
         self.const = np.float32(getattr(self, "const", 1.0))
         self.const_tf = tf.Variable(
@@ -79,6 +119,40 @@ class FBSNN(tf.Module, ABC):
             weights=self.weights,
             biases=self.biases,
             const=self.const_tf,
+        )
+
+    def _prepare_component_weights(self, values, default_value: float, name: str) -> np.ndarray:
+        if values is None:
+            weights = np.full((self.D,), np.float32(default_value), dtype=np.float32)
+        else:
+            if isinstance(values, str):
+                raw_values = [item.strip() for item in values.split(",") if item.strip() != ""]
+                weights = np.asarray(raw_values, dtype=np.float32)
+            else:
+                weights = np.asarray(values, dtype=np.float32).reshape(-1)
+            if weights.size == 0:
+                weights = np.full((self.D,), np.float32(default_value), dtype=np.float32)
+            elif weights.size == 1:
+                weights = np.full((self.D,), np.float32(weights[0]), dtype=np.float32)
+            elif weights.size != self.D:
+                raise ValueError(
+                    f"{name} must contain 1 or {self.D} values, got {weights.size}"
+                )
+        if not np.all(np.isfinite(weights)):
+            raise ValueError(f"{name} must contain only finite values")
+        if np.any(weights < 0.0):
+            raise ValueError(f"{name} must be non-negative")
+        return weights.reshape(1, self.D).astype(np.float32)
+
+    def _is_legacy_loss_config(self) -> bool:
+        return bool(
+            not self.dynamic_loss_dt_normalization
+            and np.isclose(float(self.dynamic_loss_weight), 1.0)
+            and np.isclose(float(self.terminal_y_loss_weight), 1.0)
+            and np.isclose(float(self.terminal_z_loss_weight), 1.0)
+            and np.isclose(float(self.structural_z_loss_weight), 0.0)
+            and np.allclose(self.terminal_z_component_weights_np, 1.0)
+            and np.allclose(self.structural_z_component_weights_np, 0.0)
         )
 
     @property
@@ -154,14 +228,15 @@ class FBSNN(tf.Module, ABC):
             grad = tf.zeros_like(X)
         return grad
 
-    def loss_function(self, t, W, Xi, const_value=None):
+    def loss_function(self, t, W, Xi, const_value=None, return_components=False):
         t = tf.convert_to_tensor(t, dtype=tf.float32)
         W = tf.convert_to_tensor(W, dtype=tf.float32)
         Xi = tf.convert_to_tensor(Xi, dtype=tf.float32)
         if const_value is not None:
             self.const_tf.assign(tf.cast(const_value, tf.float32))
 
-        loss = tf.constant(0.0, dtype=tf.float32)
+        loss_dynamic = tf.constant(0.0, dtype=tf.float32)
+        loss_dynamic_normalized = tf.constant(0.0, dtype=tf.float32)
         X_list = []
         Y_list = []
         Z_list = []
@@ -195,7 +270,13 @@ class FBSNN(tf.Module, ABC):
             sigma1 = self.sigma_tf(t1, X1, Y1)
             Z1 = tf.squeeze(tf.matmul(tf.expand_dims(Du1, 1), sigma1), axis=1)
 
-            loss += tf.reduce_sum(tf.square(Y1 - Y1_tilde))
+            dynamic_residual_sq = tf.square(Y1 - Y1_tilde)
+            loss_dynamic += tf.reduce_sum(dynamic_residual_sq)
+            if self.dynamic_loss_dt_normalization:
+                dt_step = tf.maximum(t1 - t0, tf.constant(1.0e-8, dtype=tf.float32))
+                loss_dynamic_normalized += tf.reduce_mean(dynamic_residual_sq / dt_step)
+            else:
+                loss_dynamic_normalized += tf.reduce_mean(dynamic_residual_sq)
 
             t0 = t1
             W0 = W1
@@ -208,28 +289,108 @@ class FBSNN(tf.Module, ABC):
             Y_list.append(Y0)
             Z_list.append(Z0)
 
-        loss += tf.reduce_sum(tf.square(Y1 - self.g_tf(X1)))
+        terminal_y_residual = Y1 - self.g_tf(X1)
+        loss_terminal_y = tf.reduce_sum(tf.square(terminal_y_residual))
 
         Dg = self.Dg_tf(X1)
         Z_terminal = tf.squeeze(tf.matmul(tf.expand_dims(Dg, 1), sigma1), axis=1)
-        loss += tf.reduce_sum(tf.square(Z1 - Z_terminal))
+        terminal_z_residual = Z1 - Z_terminal
+        loss_terminal_z = tf.reduce_sum(tf.square(terminal_z_residual))
 
         X = tf.stack(X_list, axis=1)
         Y = tf.stack(Y_list, axis=1)
         Z = tf.stack(Z_list, axis=1)
+        structural_weights = tf.reshape(self.structural_z_component_weights_tf, [1, 1, self.D])
+        loss_structural_z = tf.reduce_mean(tf.square(Z) * structural_weights)
+        loss_structural_z_raw = tf.reduce_sum(tf.square(Z) * structural_weights)
 
-        return loss / tf.cast(self.N, tf.float32), X, Y, Z
+        scale = tf.cast(self.N, tf.float32)
+        if self._legacy_loss_composition:
+            loss = loss_dynamic + loss_terminal_y + loss_terminal_z + loss_structural_z_raw
+            loss_dynamic_component = loss_dynamic / scale
+            loss_terminal_y_component = loss_terminal_y / scale
+            loss_terminal_z_component = loss_terminal_z / scale
+            loss_structural_z_component = loss_structural_z_raw / scale
+            weighted_dynamic_component = loss_dynamic_component
+            weighted_terminal_y_component = loss_terminal_y_component
+            weighted_terminal_z_component = loss_terminal_z_component
+            weighted_structural_z_component = loss_structural_z_component
+            loss_scaled = loss / scale
+        else:
+            terminal_y_mse = tf.reduce_mean(tf.square(terminal_y_residual))
+            weighted_terminal_z_residual = (
+                tf.square(terminal_z_residual) * self.terminal_z_component_weights_tf
+            )
+            terminal_z_weighted_mse = tf.reduce_mean(weighted_terminal_z_residual)
+            loss_dynamic_component = loss_dynamic_normalized / scale
+            loss_terminal_y_component = terminal_y_mse
+            loss_terminal_z_component = terminal_z_weighted_mse
+            loss_structural_z_component = loss_structural_z
+            weighted_dynamic_component = self.dynamic_loss_weight * loss_dynamic_component
+            weighted_terminal_y_component = (
+                self.terminal_y_loss_weight * loss_terminal_y_component
+            )
+            weighted_terminal_z_component = (
+                self.terminal_z_loss_weight * loss_terminal_z_component
+            )
+            weighted_structural_z_component = (
+                self.structural_z_loss_weight * loss_structural_z_component
+            )
+            loss_scaled = (
+                weighted_dynamic_component
+                + weighted_terminal_y_component
+                + weighted_terminal_z_component
+                + weighted_structural_z_component
+            )
 
-    def fetch_minibatch(self):
+        if not return_components:
+            return loss_scaled, X, Y, Z
+
+        components = {
+            "loss_total": loss_scaled,
+            "loss_dynamic": loss_dynamic_component,
+            "loss_terminal_y": loss_terminal_y_component,
+            "loss_terminal_z": loss_terminal_z_component,
+            "loss_structural_z": loss_structural_z_component,
+            "loss_weighted_dynamic": weighted_dynamic_component,
+            "loss_weighted_terminal_y": weighted_terminal_y_component,
+            "loss_weighted_terminal_z": weighted_terminal_z_component,
+            "loss_weighted_structural_z": weighted_structural_z_component,
+        }
+        for i in range(self.D):
+            component_average_scale = tf.constant(1.0, dtype=tf.float32)
+            if not self._legacy_loss_composition:
+                component_average_scale = 1.0 / tf.cast(self.D, tf.float32)
+            terminal_z_component = tf.reduce_sum(tf.square(terminal_z_residual[:, i])) / scale
+            if not self._legacy_loss_composition:
+                terminal_z_component = tf.reduce_mean(tf.square(terminal_z_residual[:, i]))
+            terminal_z_weight = self.terminal_z_component_weights_tf[0, i]
+            structural_z_component = tf.reduce_sum(tf.square(Z[:, :, i])) / scale
+            if not self._legacy_loss_composition:
+                structural_z_component = tf.reduce_mean(tf.square(Z[:, :, i]))
+            structural_z_weight = self.structural_z_component_weights_tf[0, i]
+            components[f"loss_terminal_z_component_{i}"] = terminal_z_component
+            components[f"loss_weighted_terminal_z_component_{i}"] = (
+                self.terminal_z_loss_weight
+                * terminal_z_weight
+                * terminal_z_component
+                * component_average_scale
+            )
+            components[f"loss_structural_z_component_{i}"] = structural_z_component
+            components[f"loss_weighted_structural_z_component_{i}"] = (
+                self.structural_z_loss_weight
+                * structural_z_weight
+                * structural_z_component
+                * component_average_scale
+            )
+
+        return loss_scaled, X, Y, Z, components
+
+    def _sample_brownian_increments(self, dt: float) -> np.ndarray:
         M = self.M
         N = self.N
         D = self.D
-
-        Dt = np.zeros((M, N + 1, 1), dtype=np.float32)
         DW = np.zeros((M, N + 1, D), dtype=np.float32)
-        dt = float(self.T) / float(N)
-
-        Dt[:, 1:, :] = dt
         if self.use_antithetic_sampling and M > 1:
             half_M = M // 2
             DW_half = np.sqrt(dt) * np.random.normal(size=(half_M, N, D))
@@ -239,11 +400,39 @@ class FBSNN(tf.Module, ABC):
                 DW[-1, 1:, :] = np.sqrt(dt) * np.random.normal(size=(N, D))
         else:
             DW[:, 1:, :] = np.sqrt(dt) * np.random.normal(size=(M, N, D))
+        return DW
 
+    def _sample_initial_states(self) -> np.ndarray:
+        M = self.M
+        D = self.D
+        if self.same_xi_antithetic_sampling and self.use_antithetic_sampling and M > 1:
+            half_M = M // 2
+            Xi_batch = np.zeros((M, D), dtype=np.float32)
+            Xi_half = self.Xi_generator(half_M, D).astype(np.float32)
+            Xi_batch[:half_M, :] = Xi_half
+            Xi_batch[half_M : 2 * half_M, :] = Xi_half
+            if M % 2 == 1:
+                Xi_batch[-1, :] = self.Xi_generator(1, D).astype(np.float32)[0]
+            return Xi_batch
+        return self.Xi_generator(M, D).astype(np.float32)
+
+    def _build_minibatch(self, t_start: float = 0.0):
+        M = self.M
+        N = self.N
+
+        Dt = np.zeros((M, N + 1, 1), dtype=np.float32)
+        dt = float(self.T) / float(N)
+        Dt[:, 1:, :] = dt
+        DW = self._sample_brownian_increments(dt)
         t = np.cumsum(Dt, axis=1)
+        if float(t_start) != 0.0:
+            t = np.float32(t_start) + t
         W = np.cumsum(DW, axis=1)
-        Xi_batch = self.Xi_generator(M, D).astype(np.float32)
-        return t, W, Xi_batch
+        Xi_batch = self._sample_initial_states()
+        return t.astype(np.float32), W.astype(np.float32), Xi_batch
+
+    def fetch_minibatch(self):
+        return self._build_minibatch(t_start=0.0)
 
     def _get_snapshot(self):
         return [v.numpy().copy() for v in self.trainable_variables]
@@ -371,21 +560,25 @@ class FBSNN(tf.Module, ABC):
         losses = []
         losses_per_sample = []
         y0s = []
+        component_values: Dict[str, List[float]] = {}
 
         for _ in range(int(n_batches)):
             t_batch, W_batch, Xi_batch = self.fetch_minibatch()
-            loss_value, _, y_value, _ = self.loss_function(
+            loss_value, _, y_value, _, components = self.loss_function(
                 t_batch,
                 W_batch,
                 Xi_batch,
                 const_value=current_const,
+                return_components=True,
             )
             loss_value = float(loss_value.numpy())
             losses.append(loss_value)
             losses_per_sample.append(loss_value / float(self.M))
             y0s.append(list(y_value.numpy()[:, 0, 0]))
+            for key, value in components.items():
+                component_values.setdefault(key, []).append(float(value.numpy()))
 
-        return {
+        stats = {
             "const": float(current_const),
             "mean_loss": float(np.mean(losses)),
             "std_loss": float(np.std(losses)),
@@ -395,6 +588,11 @@ class FBSNN(tf.Module, ABC):
             "std_y0": float(np.std(y0s)),
             "n_batches": int(n_batches),
         }
+        for key, values in component_values.items():
+            stats[f"mean_{key}"] = float(np.mean(values))
+            stats[f"std_{key}"] = float(np.std(values))
+            stats[f"mean_{key}_per_sample"] = float(np.mean(values) / float(self.M))
+        return stats
 
     def predict(self, Xi_star, t_star, W_star, const_value=None):
         current_const = np.float32(self.const if const_value is None else const_value)
@@ -436,6 +634,18 @@ fbsde_NN = FBSNN
 
 class NN_Quadratic_Coupled(FBSNN):
     def __init__(self, Xi, T, M, N, D, layers, parameters, **kwargs):
+        for key in (
+            "dynamic_loss_dt_normalization",
+            "dynamic_loss_weight",
+            "same_xi_antithetic_sampling",
+            "terminal_y_loss_weight",
+            "terminal_z_loss_weight",
+            "terminal_z_component_weights",
+            "structural_z_loss_weight",
+            "structural_z_component_weights",
+        ):
+            if key in parameters and key not in kwargs:
+                kwargs[key] = parameters[key]
         self.mu1 = parameters["mu1"]
         self.mu2 = parameters["mu2"]
         self.c1 = parameters["c1"]
@@ -604,6 +814,7 @@ class NN_Quadratic_Coupled_Recursive(NN_Quadratic_Coupled):
         self._T_total_tf = tf.constant(self.T_total, dtype=tf.float32)
 
         super().__init__(Xi_generator, T, M, N, D, layers, parameters)
+        self._build_terminal_constants_if_needed()
 
     def _normalize_t(self, t):
         if not self.normalize_time_input:
@@ -627,29 +838,7 @@ class NN_Quadratic_Coupled_Recursive(NN_Quadratic_Coupled):
         return u, Du
 
     def fetch_minibatch(self):
-        M = self.M
-        N = self.N
-        D = self.D
-
-        Dt = np.zeros((M, N + 1, 1), dtype=np.float32)
-        DW = np.zeros((M, N + 1, D), dtype=np.float32)
-        dt = float(self.T) / float(N)
-
-        Dt[:, 1:, :] = dt
-        if self.use_antithetic_sampling and M > 1:
-            half_M = M // 2
-            DW_half = np.sqrt(dt) * np.random.normal(size=(half_M, N, D))
-            DW[:half_M, 1:, :] = DW_half
-            DW[half_M : 2 * half_M, 1:, :] = -DW_half
-            if M % 2 == 1:
-                DW[-1, 1:, :] = np.sqrt(dt) * np.random.normal(size=(N, D))
-        else:
-            DW[:, 1:, :] = np.sqrt(dt) * np.random.normal(size=(M, N, D))
-
-        t = self.t_start + np.cumsum(Dt, axis=1)
-        W = np.cumsum(DW, axis=1)
-        Xi_batch = self.Xi_generator(M, D).astype(np.float32)
-        return t, W, Xi_batch
+        return self._build_minibatch(t_start=float(self.t_start))
 
     def _build_terminal_constants_if_needed(self):
         if self.terminal_blob is None:
