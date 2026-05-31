@@ -381,7 +381,7 @@ def run_program(argv: Optional[List[str]] = None):
             f"(got {effective_coarse_curriculum_jitter_scale})"
         )
 
-    params = model_spec.build_default_params(const = effective_const)
+    params = model_spec.build_default_params(const=effective_const)
     params.update(
         {
             "same_xi_antithetic_sampling": bool(args.same_xi_antithetic_sampling),
@@ -487,7 +487,6 @@ def run_program(argv: Optional[List[str]] = None):
         "model_name": model_spec.name,
         "state_labels": model_spec.state_labels,
         "z_labels": model_spec.z_labels,
-    
     }
     save_json(run_config, os.path.join(run_root, "run_config.json"))
     print(f"[Artifacts] run directory: {run_root}")
