@@ -10,7 +10,7 @@ import numpy as np
 
 from .exact import compute_stitched_exact_bundle, save_exact_error_timeseries_csv
 from .io_utils import _as_blob_dict, save_blob_npz, save_json, save_rows_csv
-from .models import FBSNN, NN_Quadratic_Coupled, NN_Quadratic_Coupled_Recursive
+from .models import FBSNN
 from .naming import _pass_index, _pass_label, _pass_tag
 from .plotting import (
     plot_recursive_exact_comparison,
@@ -24,7 +24,6 @@ from .sampling import (
     build_stitched_rollout_inputs,
     estimate_generator_stats,
     load_evaluation_bundle,
-    make_deterministic_xi_default,
     make_empirical_generator,
     save_evaluation_bundle,
     summarize_boundary_samples,
@@ -39,6 +38,8 @@ from .schedules import (
 )
 from .tf_backend import reset_backend_state
 
+from .model_specs import ModelSpec, get_model_spec
+
 _BASE_EVAL_LOG_KEYS = {
     "mean_loss",
     "std_loss",
@@ -48,6 +49,8 @@ _BASE_EVAL_LOG_KEYS = {
     "std_y0",
 }
 
+def _resolve_model_spec(model_spec: Optional[ModelSpec]) -> ModelSpec:
+    return get_model_spec() if model_spec is None else model_spec
 
 def _prefixed_eval_diagnostics(eval_stats: Dict[str, Any]) -> Dict[str, float]:
     diagnostics = {}
@@ -86,9 +89,12 @@ def print_recursive_pass(
     print_compact_logs: bool = True,
     exclude_pass_ids_from_selection: Optional[List[int]] = None,
     coupling_const: float = 1.0,
+    model_spec: Optional[ModelSpec] = None,
 ) -> Dict[str, Any]:
     if pass_entries is None or len(pass_entries) == 0:
         raise RuntimeError("print_recursive_pass called with empty pass_entries")
+    spec = _resolve_model_spec(model_spec)
+    spec.validate_state_dim(D)
 
     pass_entries = sorted(pass_entries, key=lambda x: int(x["pass_id"]))
     os.makedirs(rec_dir, exist_ok=True)
@@ -180,7 +186,7 @@ def print_recursive_pass(
             f"blocks={len(rollout_inputs)}"
         )
     else:
-        Xi_stitched = make_deterministic_xi_default(
+        Xi_stitched = spec.deterministic_xi(
             max(1, int(eval_min_paths)),
             D,
             seed=int(eval_seed),
@@ -208,7 +214,7 @@ def print_recursive_pass(
     Xi_visual = None
     visual_rollout_inputs = None
     if exact_solution is not None and visual_path_count > 0:
-        Xi_visual = make_deterministic_xi_default(
+        Xi_visual = spec.deterministic_xi(
             visual_path_count,
             D,
             seed=visual_seed_effective,
@@ -243,6 +249,7 @@ def print_recursive_pass(
             T_total=T_total,
             rollout_inputs=rollout_inputs,
             coupling_const=float(coupling_const),
+            model_spec=spec,
         )
         stitched_by_pass[pass_id] = stitched_pred
 
@@ -313,6 +320,7 @@ def print_recursive_pass(
                     T_total=T_total,
                     rollout_inputs=visual_rollout_inputs,
                     coupling_const=float(coupling_const),
+                    model_spec=spec,
                 )
                 visual_exact_bundle = compute_stitched_exact_bundle(
                     stitched=visual_stitched,
@@ -558,9 +566,12 @@ def predict_recursive_stitched(
     T_total: float,
     rollout_inputs: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
     coupling_const: float = 1.0,
+    model_spec: Optional[ModelSpec] = None,
 ) -> Dict[str, np.ndarray]:
     if len(blocks) == 0:
         raise ValueError("blocks must contain at least one block")
+    spec = _resolve_model_spec(model_spec)
+    spec.validate_state_dim(D)
     if Xi_initial.ndim != 2 or Xi_initial.shape[1] != D:
         raise ValueError(f"Xi_initial must have shape [M, {D}]")
     if rollout_inputs is not None and len(rollout_inputs) != len(blocks):
@@ -576,7 +587,7 @@ def predict_recursive_stitched(
         blob = block_blobs[b]
         reset_backend_state()
 
-        model = NN_Quadratic_Coupled_Recursive(
+        model = spec.build_recursive_model(
             Xi_generator=make_empirical_generator(Xi_curr, jitter_scale=0.0),
             T=block["T_block"],
             M=Xi_curr.shape[0],
@@ -755,10 +766,20 @@ def run_standard_reference(
     layers,
     stage_plan,
     final_plan,
-    coupling_const=1.0
+    coupling_const=1.0,
+    model_spec: Optional[ModelSpec] = None,
 ):
     reset_backend_state()
-    model = NN_Quadratic_Coupled(Xi_generator, T, M, N, D, layers, params)
+    spec = _resolve_model_spec(model_spec)
+    model = spec.build_standard_model(
+        Xi_generator=Xi_generator,
+        T=T,
+        M=M,
+        N=N,
+        D=D,
+        layers=layers,
+        params=params,
+    )
     logs = train_with_standard_schedule(
         model=model,
         stage_plan=stage_plan,
@@ -781,14 +802,17 @@ def rollout_boundaries(
     layers,
     T_total,
     coupling_const: float = 1.0,
+    model_spec: Optional[ModelSpec] = None,
 ):
+    spec = _resolve_model_spec(model_spec)
+    spec.validate_state_dim(D)
     boundary_samples = []
     Xi_curr = Xi_generator(M_rollout, D).astype(np.float32)
     boundary_samples.append(Xi_curr.copy())
 
     for b, block in enumerate(blocks):
         reset_backend_state()
-        model = NN_Quadratic_Coupled_Recursive(
+        model = spec.build_recursive_model(
             Xi_generator=make_empirical_generator(Xi_curr, jitter_scale=0.0),
             T=block["T_block"],
             M=M_rollout,
@@ -923,9 +947,12 @@ def run_recursive_training(
     freeze_neighbor_radius: int = 1,
     coupling_const: float = 1.0,
     on_pass_end: Optional[Callable[[Dict[str, Any]], None]] = None,
+    model_spec: Optional[ModelSpec] = None,
 ):
     if int(n_passes) < 1:
         raise ValueError("n_passes must be >= 1")
+    spec = _resolve_model_spec(model_spec)
+    spec.validate_state_dim(D)
 
     blocks = build_blocks(T_total=T_total, block_size=block_size)
     validate_boundary_samples(
@@ -987,7 +1014,7 @@ def run_recursive_training(
             if int(b) not in active_blocks_set and carry_over_blobs is not None and carry_over_blobs[b] is not None:
                 blob = _as_blob_dict(carry_over_blobs[b])
                 reset_backend_state()
-                model = NN_Quadratic_Coupled_Recursive(
+                model = spec.build_recursive_model(
                     Xi_generator=generators_per_block[b],
                     T=block["T_block"],
                     M=M,
@@ -1046,7 +1073,7 @@ def run_recursive_training(
             x_mean, x_std = estimate_generator_stats(generators_per_block[b], D=D, n_samples=max(4096, M))
 
             reset_backend_state()
-            model = NN_Quadratic_Coupled_Recursive(
+            model = spec.build_recursive_model(
                 Xi_generator=generators_per_block[b],
                 T=block["T_block"],
                 M=M,
@@ -1198,6 +1225,7 @@ def run_recursive_training(
                     layers=layers,
                     T_total=T_total,
                     coupling_const=float(coupling_const),
+                    model_spec=spec,
                 )
             generators = [
                 make_empirical_generator(prev_boundary_samples[b], jitter_scale=empirical_jitter_scale)
@@ -1234,6 +1262,7 @@ def run_recursive_training(
             layers=layers,
             T_total=T_total,
             coupling_const=float(coupling_const),
+            model_spec=spec,
         )
 
         pass_results.append(
@@ -1306,7 +1335,11 @@ def run_recursive_coarse_prepass(
     curriculum_stage_scales: Optional[List[float]] = None,
     curriculum_jitter_scale: Optional[float] = None,
     coupling_const: float = 1.0,
+    model_spec: Optional[ModelSpec] = None,
 ) -> Dict[str, Any]:
+    spec = _resolve_model_spec(model_spec)
+    spec.validate_state_dim(D)
+
     coarse_M = int(prepass_M)
     if coarse_M <= 0:
         coarse_M = max(64, min(int(M), max(256, int(round(float(M) * 0.25)))))
@@ -1413,6 +1446,7 @@ def run_recursive_coarse_prepass(
             freeze_neighbor_radius=0,
             coupling_const=float(stage_const),
             on_pass_end=None,
+            model_spec=spec,
         )
 
         stage_input_boundary_samples = prepass_result.get("boundary_samples", [])

@@ -10,14 +10,15 @@ from typing import List, Optional
 
 import numpy as np
 
-from .exact import build_exact_initial_boundary_samples, build_exact_solution_functions, compute_stitched_exact_bundle, save_exact_error_timeseries_csv
+from .exact import compute_stitched_exact_bundle, save_exact_error_timeseries_csv
 from .io_utils import export_standard_parameter_blob, save_blob_npz, save_json, save_rows_csv
 from .naming import _pass_index, _pass_label
 from .plotting import plot_recursive_exact_comparison, plot_stage_logs, _PLOTTING_AVAILABLE
-from .sampling import Xi_generator_default, build_blocks, summarize_boundary_samples
+from .sampling import build_blocks, summarize_boundary_samples
 from .schedules import load_training_plan_csv, parse_float_sequence_arg, resolve_coarse_curriculum_schedule
 from .tf_backend import set_tf_seed
 from .tests import run_tests
+from .model_specs import get_model_spec
 
 
 def _parse_optional_component_weights(value: str, arg_name: str, D: int):
@@ -338,6 +339,8 @@ def run_program(argv: Optional[List[str]] = None):
     M = args.M
     N = args.N
     D = args.D
+    model_spec = get_model_spec()
+    model_spec.validate_state_dim(D)
     effective_const = 1.0 if args.const_override is None else float(args.const_override)
     terminal_z_component_weights = _parse_optional_component_weights(
         args.terminal_z_component_weights,
@@ -378,33 +381,20 @@ def run_program(argv: Optional[List[str]] = None):
             f"(got {effective_coarse_curriculum_jitter_scale})"
         )
 
-    params = {
-        "mu1": np.float32(1.0),
-        "mu2": np.float32(1.0),
-        "c1": np.float32(1.0),
-        "c2": np.float32(1.0),
-        "c3": np.float32(10.0),
-        "c4": np.float32(10.0),
-        "gamma": np.float32(1.0),
-        "d": np.float32(1.0),
-        "x_max": np.float32(10.0),
-        "v_max": np.float32(2.0),
-        "v_min": np.float32(-2.0),
-        "s1": np.float32(0.5),
-        "s2": np.float32(0.5),
-        "s3": np.float32(0.5),
-        "const": np.float32(effective_const),
-        "same_xi_antithetic_sampling": bool(args.same_xi_antithetic_sampling),
-        "dynamic_loss_dt_normalization": bool(args.dynamic_loss_dt_normalization),
-        "dynamic_loss_weight": np.float32(args.dynamic_loss_weight),
-        "terminal_y_loss_weight": np.float32(args.terminal_y_loss_weight),
-        "terminal_z_loss_weight": np.float32(args.terminal_z_loss_weight),
-        "terminal_z_component_weights": terminal_z_component_weights,
-        "structural_z_loss_weight": np.float32(args.structural_z_loss_weight),
-        "structural_z_component_weights": structural_z_component_weights,
-    }
-
-    layers = [D + 1] + 4 * [256] + [1]
+    params = model_spec.build_default_params(const=effective_const)
+    params.update(
+        {
+            "same_xi_antithetic_sampling": bool(args.same_xi_antithetic_sampling),
+            "dynamic_loss_dt_normalization": bool(args.dynamic_loss_dt_normalization),
+            "dynamic_loss_weight": np.float32(args.dynamic_loss_weight),
+            "terminal_y_loss_weight": np.float32(args.terminal_y_loss_weight),
+            "terminal_z_loss_weight": np.float32(args.terminal_z_loss_weight),
+            "terminal_z_component_weights": terminal_z_component_weights,
+            "structural_z_loss_weight": np.float32(args.structural_z_loss_weight),
+            "structural_z_component_weights": structural_z_component_weights,
+        }
+    )
+    layers = model_spec.build_layers(D)
     stage_plan = [(5000, 1e-3), (5000, 5e-4), (5000, 1e-4), (5000, 5e-5)]
     final_plan = [(5000, 1e-5), (5000, 5e-6)]
     training_plan_rules = load_training_plan_csv(args.training_plan_csv)
@@ -415,11 +405,7 @@ def run_program(argv: Optional[List[str]] = None):
             f"[TrainingPlan] loaded {len(training_plan_rules)} rules from {training_plan_effective_source}"
         )
 
-    exact_solution = build_exact_solution_functions(
-        solution_name=args.exact_solution,
-        params=params,
-        D=D,
-    )
+    exact_solution = model_spec.build_exact_solution(args.exact_solution, params, D)
     requested_selection_metric = str(args.selection_metric)
     requested_exact_regression_action = str(args.exact_regression_action)
     effective_selection_metric = requested_selection_metric
@@ -498,6 +484,9 @@ def run_program(argv: Optional[List[str]] = None):
         "structural_z_loss_weight": float(args.structural_z_loss_weight),
         "structural_z_component_weights": structural_z_component_weights,
         "plotting_available": _PLOTTING_AVAILABLE,
+        "model_name": model_spec.name,
+        "state_labels": model_spec.state_labels,
+        "z_labels": model_spec.z_labels,
     }
     save_json(run_config, os.path.join(run_root, "run_config.json"))
     print(f"[Artifacts] run directory: {run_root}")
@@ -508,7 +497,7 @@ def run_program(argv: Optional[List[str]] = None):
         os.makedirs(std_dir, exist_ok=True)
         standard_const = float(effective_const)
         model_std, logs_std = run_standard_reference(
-            Xi_generator=Xi_generator_default,
+            Xi_generator=model_spec.xi_generator,
             params=params,
             M=M,
             N=N,
@@ -518,6 +507,7 @@ def run_program(argv: Optional[List[str]] = None):
             stage_plan=stage_plan,
             final_plan=final_plan,
             coupling_const=standard_const,
+            model_spec=model_spec,
         )
 
         std_ckpt_path = os.path.join(std_dir, "model.ckpt")
@@ -620,7 +610,7 @@ def run_program(argv: Optional[List[str]] = None):
             coarse_prepass_dir = os.path.join(run_root, "coarse_prepass", "models")
             try:
                 coarse_prepass = run_recursive_coarse_prepass(
-                    Xi_generator=Xi_generator_default,
+                    Xi_generator=model_spec.xi_generator,
                     params=params,
                     M=M,
                     N_per_block=N,
@@ -643,6 +633,7 @@ def run_program(argv: Optional[List[str]] = None):
                     curriculum_stage_scales=resolved_coarse_curriculum_stage_scales,
                     curriculum_jitter_scale=float(effective_coarse_curriculum_jitter_scale),
                     coupling_const=float(recursive_const),
+                    model_spec=model_spec,
                 )
             finally:
                 np.random.set_state(np_state_before_prepass)
@@ -670,8 +661,12 @@ def run_program(argv: Optional[List[str]] = None):
             np_state_before_exact = np.random.get_state()
             np.random.seed(int(args.exact_init_seed))
             try:
-                initial_boundary_samples = build_exact_initial_boundary_samples(
-                    Xi_generator=Xi_generator_default,
+                if model_spec.build_exact_initial_boundary_samples is None:
+                    raise ValueError(
+                        f"pass1_init='exact' is not supported for model '{model_spec.name}'"
+                    )
+                initial_boundary_samples = model_spec.build_exact_initial_boundary_samples(
+                    Xi_generator=model_spec.xi_generator,
                     exact_solution=exact_solution,
                     params=params,
                     blocks=build_blocks(T_total=args.T_total, block_size=args.block_size),
@@ -736,10 +731,11 @@ def run_program(argv: Optional[List[str]] = None):
                 print_compact_logs=is_last_requested_pass,
                 exclude_pass_ids_from_selection=excluded_pass_ids_from_selection,
                 coupling_const=float(recursive_const),
+                model_spec=model_spec,
             )
 
         rec = run_recursive_training(
-            Xi_generator=Xi_generator_default,
+            Xi_generator=model_spec.xi_generator,
             params=params,
             M=M,
             N_per_block=N,
@@ -767,6 +763,7 @@ def run_program(argv: Optional[List[str]] = None):
             freeze_neighbor_radius=int(args.freeze_neighbor_radius),
             coupling_const=float(recursive_const),
             on_pass_end=_on_recursive_pass_end,
+            model_spec=model_spec,
         )
 
         pass_entries = sorted(rec.get("passes", []), key=lambda x: int(x["pass_id"]))
@@ -799,6 +796,7 @@ def run_program(argv: Optional[List[str]] = None):
                 print_compact_logs=True,
                 exclude_pass_ids_from_selection=excluded_pass_ids_from_selection,
                 coupling_const=float(recursive_const),
+                model_spec=model_spec,
             )
 
         exact_summary_by_pass = plot_summary["exact_summary_by_pass"]

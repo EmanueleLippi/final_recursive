@@ -59,6 +59,14 @@ def _make_blob(layers: List[int]) -> dict:
     return blob
 
 
+def _make_block_blob(layers: List[int], t_start: float, t_end: float, T_total: float) -> dict:
+    blob = _make_blob(layers)
+    blob["t_start"] = np.asarray(t_start, dtype=np.float32)
+    blob["t_end"] = np.asarray(t_end, dtype=np.float32)
+    blob["T_total"] = np.asarray(T_total, dtype=np.float32)
+    return blob
+
+
 def _run_case(name: str, fn: Callable[[], None]) -> bool:
     try:
         fn()
@@ -142,6 +150,82 @@ def test_rollout_inputs_are_antithetic() -> None:
         dW = W[:, 1:, :] - W[:, :-1, :]
         np.testing.assert_allclose(dW[0], -dW[2], atol=1.0e-6)
         np.testing.assert_allclose(dW[1], -dW[3], atol=1.0e-6)
+
+
+def test_model_spec_contract() -> None:
+    from .model_specs import get_model_spec
+
+    spec = get_model_spec()
+    assert spec.name == "quadratic_coupled"
+    assert spec.state_dim == 4
+    assert spec.state_labels == ("S", "H", "V", "X_state")
+    assert spec.z_labels == ("Z_S", "Z_H", "Z_V", "Z_X")
+    assert spec.build_layers(4) == [5, 256, 256, 256, 256, 1]
+
+    params = spec.build_default_params(const=0.75)
+    expected = _default_params(const=0.75)
+    assert set(params) == set(expected)
+    for key, value in expected.items():
+        np.testing.assert_allclose(params[key], value)
+
+    spec.validate_state_dim(4)
+    for action in (lambda: spec.validate_state_dim(3), lambda: spec.build_layers(3)):
+        try:
+            action()
+        except ValueError as exc:
+            assert "quadratic_coupled requires D=4" in str(exc)
+        else:
+            raise AssertionError("D != 4 should be rejected")
+
+    try:
+        get_model_spec("pascucci")
+    except ValueError as exc:
+        assert "Supported: quadratic_coupled" in str(exc)
+    else:
+        raise AssertionError("unknown model should be rejected")
+
+    assert spec.build_exact_solution("none", params, 4) is None
+    exact = spec.build_exact_solution("quadratic_coupled", params, 4)
+    assert exact is not None
+    assert exact["name"] == "quadratic_coupled"
+
+    Xi = spec.deterministic_xi(4, 4, seed=11)
+    assert Xi.shape == (4, 4)
+    assert Xi.dtype == np.float32
+
+
+def test_model_spec_params_overlay_preserves_solver_flags() -> None:
+    from .model_specs import get_model_spec
+
+    spec = get_model_spec()
+    params = spec.build_default_params(const=0.5)
+    runtime_keys = {
+        "same_xi_antithetic_sampling",
+        "dynamic_loss_dt_normalization",
+        "dynamic_loss_weight",
+        "terminal_y_loss_weight",
+        "terminal_z_loss_weight",
+        "terminal_z_component_weights",
+        "structural_z_loss_weight",
+        "structural_z_component_weights",
+    }
+    assert runtime_keys.isdisjoint(params)
+
+    overlay = {
+        "same_xi_antithetic_sampling": True,
+        "dynamic_loss_dt_normalization": True,
+        "dynamic_loss_weight": np.float32(0.7),
+        "terminal_y_loss_weight": np.float32(1.2),
+        "terminal_z_loss_weight": np.float32(2.0),
+        "terminal_z_component_weights": [1.0, 0.5, 0.0, 3.0],
+        "structural_z_loss_weight": np.float32(0.25),
+        "structural_z_component_weights": [0.0, 1.0, 0.0, 0.0],
+    }
+    params.update(overlay)
+
+    assert np.isclose(params["const"], np.float32(0.5))
+    for key, value in overlay.items():
+        assert params[key] == value
 
 
 def test_exact_path_plot_outputs() -> None:
@@ -269,6 +353,221 @@ def test_tf2_model_smoke_and_blob_roundtrip() -> None:
 
     model.close()
     model2.close()
+
+
+def test_model_spec_recursive_factory_matches_direct_constructor() -> None:
+    from .model_specs import get_model_spec
+    from .models import NN_Quadratic_Coupled_Recursive
+    from .tf_backend import reset_backend_state, set_seed
+
+    spec = get_model_spec()
+    params = _default_params()
+    layers = [5, 8, 1]
+    kwargs = {
+        "Xi_generator": Xi_generator_default,
+        "T": 0.25,
+        "M": 4,
+        "N": 2,
+        "D": 4,
+        "layers": layers,
+        "parameters": params,
+        "t_start": 0.0,
+        "t_end": 0.25,
+        "T_total": 0.25,
+        "terminal_blob": None,
+        "normalize_time_input": True,
+    }
+
+    reset_backend_state()
+    set_seed(41)
+    direct_initial_model = NN_Quadratic_Coupled_Recursive(**kwargs)
+    direct_initial = direct_initial_model.export_parameter_blob()
+    direct_initial_model.close()
+
+    reset_backend_state()
+    set_seed(41)
+    spec_initial_model = spec.build_recursive_model(**kwargs)
+    spec_initial = spec_initial_model.export_parameter_blob()
+    spec_initial_model.close()
+
+    for key in direct_initial:
+        if key.startswith(("W_", "b_")):
+            np.testing.assert_allclose(spec_initial[key], direct_initial[key], atol=1.0e-7)
+
+    blob = _make_blob(layers)
+    reset_backend_state()
+    set_seed(43)
+    direct = NN_Quadratic_Coupled_Recursive(**kwargs)
+    via_spec = spec.build_recursive_model(**kwargs)
+    direct.import_parameter_blob(blob, strict=True)
+    via_spec.import_parameter_blob(blob, strict=True)
+    t_batch, W_batch, Xi_batch = direct.fetch_minibatch()
+
+    loss_direct, X_direct, Y_direct, Z_direct = direct.loss_function(
+        t_batch,
+        W_batch,
+        Xi_batch,
+        const_value=1.0,
+    )
+    loss_spec, X_spec, Y_spec, Z_spec = via_spec.loss_function(
+        t_batch,
+        W_batch,
+        Xi_batch,
+        const_value=1.0,
+    )
+    np.testing.assert_allclose(loss_spec.numpy(), loss_direct.numpy(), rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(X_spec.numpy(), X_direct.numpy(), atol=1.0e-6)
+    np.testing.assert_allclose(Y_spec.numpy(), Y_direct.numpy(), atol=1.0e-6)
+    np.testing.assert_allclose(Z_spec.numpy(), Z_direct.numpy(), atol=1.0e-6)
+    direct.close()
+    via_spec.close()
+
+
+def test_predict_recursive_stitched_two_block_model_spec() -> None:
+    from .model_specs import get_model_spec
+    from .orchestration import predict_recursive_stitched
+    from .tf_backend import set_seed
+
+    set_seed(31)
+    spec = get_model_spec()
+    params = _default_params()
+    layers = [5, 8, 1]
+    D = 4
+    M = 4
+    N_per_block = 2
+    T_total = 0.5
+    blocks = build_blocks(T_total=T_total, block_size=0.25)
+    blobs = [
+        _make_block_blob(layers, block["t_start"], block["t_end"], T_total)
+        for block in blocks
+    ]
+    Xi = spec.deterministic_xi(M, D, seed=111)
+    rollout = build_stitched_rollout_inputs(
+        blocks=blocks,
+        M=M,
+        N_per_block=N_per_block,
+        D=D,
+        seed=321,
+    )
+
+    explicit = predict_recursive_stitched(
+        block_blobs=blobs,
+        blocks=blocks,
+        Xi_initial=Xi,
+        params=params,
+        N_per_block=N_per_block,
+        D=D,
+        layers=layers,
+        T_total=T_total,
+        rollout_inputs=rollout,
+        model_spec=spec,
+    )
+    default = predict_recursive_stitched(
+        block_blobs=blobs,
+        blocks=blocks,
+        Xi_initial=Xi,
+        params=params,
+        N_per_block=N_per_block,
+        D=D,
+        layers=layers,
+        T_total=T_total,
+        rollout_inputs=rollout,
+        model_spec=None,
+    )
+
+    for key in ("t", "X", "Y", "Z"):
+        np.testing.assert_allclose(explicit[key], default[key], atol=1.0e-6)
+    assert explicit["t"].shape == (M, 5, 1)
+    assert explicit["X"].shape == (M, 5, D)
+    assert explicit["Y"].shape == (M, 5, 1)
+    assert explicit["Z"].shape == (M, 5, D)
+    np.testing.assert_allclose(
+        explicit["t"][0, :, 0],
+        np.asarray([0.0, 0.125, 0.25, 0.375, 0.5], dtype=np.float32),
+        atol=1.0e-7,
+    )
+
+    first = predict_recursive_stitched(
+        block_blobs=[blobs[0]],
+        blocks=[blocks[0]],
+        Xi_initial=Xi,
+        params=params,
+        N_per_block=N_per_block,
+        D=D,
+        layers=layers,
+        T_total=T_total,
+        rollout_inputs=[rollout[0]],
+        model_spec=spec,
+    )
+    second = predict_recursive_stitched(
+        block_blobs=[blobs[1]],
+        blocks=[blocks[1]],
+        Xi_initial=first["X"][:, -1, :],
+        params=params,
+        N_per_block=N_per_block,
+        D=D,
+        layers=layers,
+        T_total=T_total,
+        rollout_inputs=[rollout[1]],
+        model_spec=spec,
+    )
+    np.testing.assert_allclose(explicit["X"][:, :3, :], first["X"], atol=1.0e-6)
+    np.testing.assert_allclose(second["X"][:, 0, :], first["X"][:, -1, :], atol=1.0e-6)
+    np.testing.assert_allclose(explicit["X"][:, 3:, :], second["X"][:, 1:, :], atol=1.0e-6)
+
+
+def test_recursive_coarse_prepass_model_spec_argument() -> None:
+    from . import orchestration
+    from .model_specs import get_model_spec
+
+    spec = get_model_spec()
+    calls = []
+    original_run_recursive_training = orchestration.run_recursive_training
+
+    def fake_run_recursive_training(**kwargs):
+        calls.append(kwargs)
+        assert kwargs["model_spec"] is spec
+        assert kwargs["D"] == 4
+        return {
+            "boundary_samples": [
+                np.zeros((2, 4), dtype=np.float32),
+                np.ones((2, 4), dtype=np.float32),
+            ],
+            "pass1": {
+                "blobs": [_make_blob([5, 8, 1])],
+                "logs": [{"eval_mean_loss_per_sample": 1.0}],
+                "reference_loss": 1.0,
+            },
+        }
+
+    orchestration.run_recursive_training = fake_run_recursive_training
+    try:
+        result = orchestration.run_recursive_coarse_prepass(
+            Xi_generator=spec.xi_generator,
+            params=_default_params(),
+            M=4,
+            N_per_block=2,
+            D=4,
+            T_total=0.25,
+            block_size=0.25,
+            layers=[5, 8, 1],
+            stage_plan=[(1, 1.0e-3)],
+            final_plan=[(1, 1.0e-4)],
+            output_dir="unused",
+            prepass_M=4,
+            prepass_N=2,
+            rollout_M=4,
+            curriculum_consts=[],
+            curriculum_stage_scales=[],
+            coupling_const=1.0,
+            model_spec=spec,
+        )
+    finally:
+        orchestration.run_recursive_training = original_run_recursive_training
+
+    assert len(calls) == 1
+    assert result["summary"]["n_curriculum_stages"] == 1
+    assert result["boundary_samples"][0].shape == (2, 4)
 
 
 def test_loss_improvement_flags_are_finite() -> None:
@@ -653,6 +952,8 @@ def run_tests(argv: List[str] | None = None) -> int:
     cases: List[tuple[str, Callable[[], None]]] = [
         ("numpy_math_and_schedules", test_numpy_math_and_schedules),
         ("rollout_inputs_are_antithetic", test_rollout_inputs_are_antithetic),
+        ("model_spec_contract", test_model_spec_contract),
+        ("model_spec_params_overlay_preserves_solver_flags", test_model_spec_params_overlay_preserves_solver_flags),
         ("exact_path_plot_outputs", test_exact_path_plot_outputs),
     ]
 
@@ -662,6 +963,18 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "tf2_model_smoke_and_blob_roundtrip",
         "test_tf2_model_smoke_and_blob_roundtrip",
+    ) and ok
+    ok = _run_subprocess_case(
+        "model_spec_recursive_factory_matches_direct_constructor",
+        "test_model_spec_recursive_factory_matches_direct_constructor",
+    ) and ok
+    ok = _run_subprocess_case(
+        "predict_recursive_stitched_two_block_model_spec",
+        "test_predict_recursive_stitched_two_block_model_spec",
+    ) and ok
+    ok = _run_subprocess_case(
+        "recursive_coarse_prepass_model_spec_argument",
+        "test_recursive_coarse_prepass_model_spec_argument",
     ) and ok
     ok = _run_subprocess_case(
         "loss_improvement_flags_are_finite",
