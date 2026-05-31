@@ -10,11 +10,11 @@ from typing import List, Optional
 
 import numpy as np
 
-from .exact import build_exact_initial_boundary_samples, build_exact_solution_functions, compute_stitched_exact_bundle, save_exact_error_timeseries_csv
+from .exact import compute_stitched_exact_bundle, save_exact_error_timeseries_csv
 from .io_utils import export_standard_parameter_blob, save_blob_npz, save_json, save_rows_csv
 from .naming import _pass_index, _pass_label
 from .plotting import plot_recursive_exact_comparison, plot_stage_logs, _PLOTTING_AVAILABLE
-from .sampling import Xi_generator_default, build_blocks, summarize_boundary_samples
+from .sampling import build_blocks, summarize_boundary_samples
 from .schedules import load_training_plan_csv, parse_float_sequence_arg, resolve_coarse_curriculum_schedule
 from .tf_backend import set_tf_seed
 from .tests import run_tests
@@ -395,7 +395,6 @@ def run_program(argv: Optional[List[str]] = None):
         }
     )
     layers = model_spec.build_layers(D)
-    exact_solution = model_spec.build_exact_solution(args.exact_solution, params, D)
     stage_plan = [(5000, 1e-3), (5000, 5e-4), (5000, 1e-4), (5000, 5e-5)]
     final_plan = [(5000, 1e-5), (5000, 5e-6)]
     training_plan_rules = load_training_plan_csv(args.training_plan_csv)
@@ -406,11 +405,7 @@ def run_program(argv: Optional[List[str]] = None):
             f"[TrainingPlan] loaded {len(training_plan_rules)} rules from {training_plan_effective_source}"
         )
 
-    exact_solution = build_exact_solution_functions(
-        solution_name=args.exact_solution,
-        params=params,
-        D=D,
-    )
+    exact_solution = model_spec.build_exact_solution(args.exact_solution, params, D)
     requested_selection_metric = str(args.selection_metric)
     requested_exact_regression_action = str(args.exact_regression_action)
     effective_selection_metric = requested_selection_metric
@@ -503,7 +498,7 @@ def run_program(argv: Optional[List[str]] = None):
         os.makedirs(std_dir, exist_ok=True)
         standard_const = float(effective_const)
         model_std, logs_std = run_standard_reference(
-            Xi_generator=Xi_generator_default,
+            Xi_generator=model_spec.xi_generator,
             params=params,
             M=M,
             N=N,
@@ -616,7 +611,7 @@ def run_program(argv: Optional[List[str]] = None):
             coarse_prepass_dir = os.path.join(run_root, "coarse_prepass", "models")
             try:
                 coarse_prepass = run_recursive_coarse_prepass(
-                    Xi_generator=Xi_generator_default,
+                    Xi_generator=model_spec.xi_generator,
                     params=params,
                     M=M,
                     N_per_block=N,
@@ -667,8 +662,12 @@ def run_program(argv: Optional[List[str]] = None):
             np_state_before_exact = np.random.get_state()
             np.random.seed(int(args.exact_init_seed))
             try:
-                initial_boundary_samples = build_exact_initial_boundary_samples(
-                    Xi_generator=Xi_generator_default,
+                if model_spec.build_exact_initial_boundary_samples is None:
+                    raise ValueError(
+                        f"pass1_init='exact' is not supported for model '{model_spec.name}'"
+                    )
+                initial_boundary_samples = model_spec.build_exact_initial_boundary_samples(
+                    Xi_generator=model_spec.xi_generator,
                     exact_solution=exact_solution,
                     params=params,
                     blocks=build_blocks(T_total=args.T_total, block_size=args.block_size),
@@ -737,7 +736,7 @@ def run_program(argv: Optional[List[str]] = None):
             )
 
         rec = run_recursive_training(
-            Xi_generator=Xi_generator_default,
+            Xi_generator=model_spec.xi_generator,
             params=params,
             M=M,
             N_per_block=N,
