@@ -772,6 +772,203 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
         cli.plot_stage_logs = original_plot_stage_logs
 
 
+def test_cli_uses_resolved_model_spec_for_runtime_wiring() -> None:
+    import json
+
+    from . import cli, orchestration
+    from .model_specs import ModelSpec
+    from .sampling import build_blocks
+    from .tf_backend import require_tensorflow
+
+    require_tensorflow()
+
+    calls = {
+        "params": 0,
+        "layers": 0,
+        "xi": 0,
+        "exact": 0,
+        "recursive": 0,
+        "print": 0,
+    }
+    sentinel_exact = {"name": "sentinel"}
+
+    def sentinel_build_default_params(const: float = 1.0) -> dict:
+        calls["params"] += 1
+        return {
+            "sentinel_param": np.float32(42.0),
+            "const": np.float32(const),
+        }
+
+    def sentinel_build_layers(D: int) -> list[int]:
+        calls["layers"] += 1
+        assert int(D) == 4
+        return [5, 7, 1]
+
+    def sentinel_xi_generator(M: int, D: int) -> np.ndarray:
+        calls["xi"] += 1
+        return np.full((int(M), int(D)), 3.25, dtype=np.float32)
+
+    def sentinel_deterministic_xi(M: int, D: int, seed: int = 1234) -> np.ndarray:
+        return np.full((int(M), int(D)), float(seed % 7), dtype=np.float32)
+
+    def sentinel_build_exact_solution(profile: str, params: dict, D: int):
+        calls["exact"] += 1
+        assert profile == "sentinel"
+        assert params["sentinel_param"] == np.float32(42.0)
+        assert int(D) == 4
+        return sentinel_exact
+
+    sentinel_spec = ModelSpec(
+        name="sentinel_model",
+        state_dim=4,
+        state_labels=("A", "B", "C", "D"),
+        z_labels=("ZA", "ZB", "ZC", "ZD"),
+        build_default_params=sentinel_build_default_params,
+        build_layers=sentinel_build_layers,
+        xi_generator=sentinel_xi_generator,
+        deterministic_xi=sentinel_deterministic_xi,
+        standard_model_factory=lambda **kwargs: None,
+        recursive_model_factory=lambda **kwargs: None,
+        build_exact_solution=sentinel_build_exact_solution,
+        build_exact_initial_boundary_samples=None,
+    )
+
+    # Distinctive sentinel hooks make stale benchmark wiring fail loudly.
+    def fake_run_recursive_training(**kwargs):
+        calls["recursive"] += 1
+        assert kwargs["model_spec"] is sentinel_spec
+        assert kwargs["Xi_generator"] is sentinel_xi_generator
+        xi_probe = kwargs["Xi_generator"](2, kwargs["D"])
+        np.testing.assert_allclose(xi_probe, np.full((2, 4), 3.25, dtype=np.float32))
+        assert kwargs["params"]["sentinel_param"] == np.float32(42.0)
+        assert kwargs["params"]["const"] == np.float32(0.5)
+        assert kwargs["layers"] == [5, 7, 1]
+        assert kwargs["D"] == 4
+        blocks = build_blocks(T_total=kwargs["T_total"], block_size=kwargs["block_size"])
+        logs = [
+            {
+                "pass": 1,
+                "block": 0,
+                "t_start": blocks[0]["t_start"],
+                "t_end": blocks[0]["t_end"],
+                "T_block": blocks[0]["T_block"],
+                "eval_mean_loss": 1.0,
+                "eval_std_loss": 0.0,
+                "eval_mean_loss_per_sample": 0.25,
+                "eval_std_loss_per_sample": 0.0,
+                "eval_mean_y0": 0.0,
+                "precision_target": None,
+                "refine_rounds": 0,
+            }
+        ]
+        return {
+            "blocks": blocks,
+            "passes": [
+                {
+                    "pass_id": 1,
+                    "reference_loss": 1.0,
+                    "logs": logs,
+                    "blobs": [_make_blob([5, 7, 1]) for _ in blocks],
+                    "models_dir": kwargs["output_dir"],
+                    "pass_init_mode": kwargs["pass1_init_mode"],
+                    "boundary_source": "base_xi",
+                    "is_bootstrap_pass": True,
+                    "active_set_summary": {},
+                }
+            ],
+            "boundary_samples": [
+                np.zeros((kwargs["M"], kwargs["D"]), dtype=np.float32)
+                for _ in range(len(blocks) + 1)
+            ],
+        }
+
+    def fake_print_recursive_pass(**kwargs):
+        calls["print"] += 1
+        assert kwargs["model_spec"] is sentinel_spec
+        assert kwargs["params"]["sentinel_param"] == np.float32(42.0)
+        assert kwargs["layers"] == [5, 7, 1]
+        assert kwargs["exact_solution"] is sentinel_exact
+        return {
+            "processed_pass_ids": [1],
+            "exact_summary_by_pass": {1: {"sentinel": True}},
+            "exact_summary_by_pass_index": {0: {"sentinel": True}},
+            "eval_bundle_path": str(Path(kwargs["rec_dir"]) / "evaluation_bundle.npz"),
+            "evaluation_bundle_M": 4,
+            "excluded_pass_ids_from_selection": [],
+            "excluded_pass_indices_from_selection": [],
+            "selected_pass_id": 1,
+            "selected_pass_index": 0,
+            "selected_score_metric": "loss.eval_mean_loss_per_sample",
+            "selected_score": 0.25,
+            "selected_scores_by_pass": {"1": 0.25},
+            "selected_scores_by_pass_index": {"0": 0.25},
+            "score_key": "eval_mean_loss_per_sample",
+            "pass_scores_loss": {1: 0.25},
+            "pass_scores_loss_by_index": {0: 0.25},
+        }
+
+    original_get_model_spec = cli.get_model_spec
+    original_run_recursive_training = orchestration.run_recursive_training
+    original_print_recursive_pass = orchestration.print_recursive_pass
+    cli.get_model_spec = lambda: sentinel_spec
+    orchestration.run_recursive_training = fake_run_recursive_training
+    orchestration.print_recursive_pass = fake_print_recursive_pass
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            exit_code = cli.main(
+                [
+                    "run",
+                    "--mode",
+                    "recursive",
+                    "--M",
+                    "4",
+                    "--N",
+                    "2",
+                    "--T_standard",
+                    "0.25",
+                    "--T_total",
+                    "0.25",
+                    "--block_size",
+                    "0.25",
+                    "--passes",
+                    "1",
+                    "--const_override",
+                    "0.5",
+                    "--exact_solution",
+                    "sentinel",
+                    "--visual_sample_paths",
+                    "1",
+                    "--output_dir",
+                    str(out_dir),
+                ]
+            )
+            assert exit_code == 0
+            runs = sorted(out_dir.glob("run_*"))
+            assert len(runs) == 1
+            config = json.loads((runs[0] / "run_config.json").read_text(encoding="utf-8"))
+            assert config["model_name"] == "sentinel_model"
+            assert config["state_labels"] == ["A", "B", "C", "D"]
+            assert config["z_labels"] == ["ZA", "ZB", "ZC", "ZD"]
+            assert config["layers"] == [5, 7, 1]
+            assert config["exact_solution"] == "sentinel"
+            assert config["params"]["sentinel_param"] == 42.0
+            assert config["params"]["const"] == 0.5
+            assert (runs[0] / "recursive" / "results.json").exists()
+
+        assert calls["params"] == 1
+        assert calls["layers"] == 1
+        assert calls["xi"] == 1
+        assert calls["exact"] == 1
+        assert calls["recursive"] == 1
+        assert calls["print"] >= 1
+    finally:
+        cli.get_model_spec = original_get_model_spec
+        orchestration.run_recursive_training = original_run_recursive_training
+        orchestration.print_recursive_pass = original_print_recursive_pass
+
+
 def test_loss_improvement_flags_are_finite() -> None:
     from .models import NN_Quadratic_Coupled_Recursive
     from .tf_backend import set_seed
@@ -1181,6 +1378,10 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "cli_tiny_standard_and_both_model_spec_outputs",
         "test_cli_tiny_standard_and_both_model_spec_outputs",
+    ) and ok
+    ok = _run_subprocess_case(
+        "cli_uses_resolved_model_spec_for_runtime_wiring",
+        "test_cli_uses_resolved_model_spec_for_runtime_wiring",
     ) and ok
     ok = _run_subprocess_case(
         "loss_improvement_flags_are_finite",
