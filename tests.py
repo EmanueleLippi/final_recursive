@@ -404,6 +404,86 @@ def test_pascucci_equation_fixtures() -> None:
     np.testing.assert_allclose(phi, -f_np, rtol=1.0e-6, atol=1.0e-6)
     model.close()
 
+def test_pascucci_f_mu_select_z_v_from_full_z() -> None:
+    from .model_specs import get_model_spec
+    from .models import NN_Pascucci
+    from .tf_backend import tf
+
+    spec = get_model_spec("pascucci")
+    assert spec.z_labels == ("Z_S", "Z_H", "Z_V", "Z_X")
+    z_v_index = spec.z_labels.index("Z_V")
+
+    params = spec.build_default_params(const=0.77)
+    model = NN_Pascucci(
+        Xi_generator_default,
+        0.25,
+        4,
+        2,
+        4,
+        [5, 8, 1],
+        params,
+    )
+
+    try:
+        X = np.array(
+            [
+                [1.2, 0.4, 0.2, 4.5],
+                [-0.4, -0.2, -0.1, 7.7],
+                [5.2, 1.0, 0.5, 2.2],
+                [3.1, -0.5, -0.3, 0.8],
+            ],
+            dtype=np.float32,
+        )
+        Y = np.array([[0.1], [0.2], [-0.1], [0.3]], dtype=np.float32)
+        Z = np.array(
+            [
+                [0.1, 0.2, -0.3, 0.4],
+                [0.2, -0.1, 0.4, -0.5],
+                [0.3, 0.0, 0.2, -0.1],
+                [0.4, -0.2, -0.1, 0.2],
+            ],
+            dtype=np.float32,
+        )
+        t = np.zeros((4, 1), dtype=np.float32)
+
+        psi = _pascucci_psi(X[:, [3]], float(params["d"]), float(params["x_max"]))
+        assert np.all(psi > 0.0)
+
+        t_tf = tf.convert_to_tensor(t)
+        X_tf = tf.convert_to_tensor(X)
+        Y_tf = tf.convert_to_tensor(Y)
+
+        def eval_alpha_f_mu(z_np: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            Z_tf = tf.convert_to_tensor(z_np)
+            return (
+                model.alpha_tf(t_tf, X_tf, tf.convert_to_tensor(z_np[:, [z_v_index]])).numpy(),
+                model.f_tf(t_tf, X_tf, Y_tf, Z_tf).numpy(),
+                model.mu_tf(t_tf, X_tf, Y_tf, Z_tf).numpy(),
+            )
+
+        alpha_base, f_base, mu_base = eval_alpha_f_mu(Z)
+
+        Z_non_v_changed = Z.copy()
+        Z_non_v_changed[:, 0] += 100.0
+        Z_non_v_changed[:, 1] -= 200.0
+        Z_non_v_changed[:, 3] += np.array([50.0, -60.0, 70.0, -80.0], dtype=np.float32)
+        alpha_non_v, f_non_v, mu_non_v = eval_alpha_f_mu(Z_non_v_changed)
+
+        np.testing.assert_allclose(alpha_non_v, alpha_base, rtol=1.0e-6, atol=1.0e-6)
+        np.testing.assert_allclose(f_non_v, f_base, rtol=1.0e-6, atol=1.0e-6)
+        np.testing.assert_allclose(mu_non_v, mu_base, rtol=1.0e-6, atol=1.0e-6)
+
+        Z_v_changed = Z.copy()
+        Z_v_changed[:, z_v_index] += np.array([1.25, -1.5, 2.0, -2.25], dtype=np.float32)
+        alpha_v, f_v, mu_v = eval_alpha_f_mu(Z_v_changed)
+
+        assert np.max(np.abs(alpha_v - alpha_base)) > 1.0e-4
+        assert np.max(np.abs(f_v - f_base)) > 1.0e-4
+        assert np.max(np.abs(mu_v[:, [2]] - mu_base[:, [2]])) > 1.0e-4
+        np.testing.assert_allclose(mu_v[:, [0, 1, 3]], mu_base[:, [0, 1, 3]], rtol=1.0e-6, atol=1.0e-6)
+    finally:
+        model.close()
+
 
 def test_model_spec_params_overlay_preserves_solver_flags() -> None:
     from .model_specs import get_model_spec
@@ -1740,6 +1820,10 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "pascucci_equation_fixtures",
         "test_pascucci_equation_fixtures",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_f_mu_select_z_v_from_full_z",
+        "test_pascucci_f_mu_select_z_v_from_full_z",
     ) and ok
     ok = _run_subprocess_case(
         "model_spec_recursive_factory_matches_direct_constructor",
