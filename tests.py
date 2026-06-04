@@ -218,6 +218,15 @@ def test_model_spec_contract() -> None:
     assert pascucci_params["const"] == np.float32(0.55)
     for required in ("params_S", "params_H", "l_v", "l_a", "s3", "s3h", "s3v", "s3k", "omega", "c_h", "c_con"):
         assert required in pascucci_params
+    assert pascucci_spec.build_exact_initial_boundary_samples is None
+    assert pascucci_spec.build_exact_solution("none", pascucci_params, 4) is None
+    try:
+        pascucci_spec.build_exact_solution("quadratic_coupled", pascucci_params, 4)
+    except ValueError as exc:
+        assert "pascucci" in str(exc)
+        assert "--exact_solution none" in str(exc)
+    else:
+        raise AssertionError("pascucci should reject exact profiles until an oracle exists")
 
     spec.validate_state_dim(4)
     for action in (lambda: spec.validate_state_dim(3), lambda: spec.build_layers(3)):
@@ -625,6 +634,78 @@ def test_model_spec_recursive_factory_matches_direct_constructor() -> None:
     via_spec.close()
 
 
+def test_pascucci_recursive_factory_matches_direct_constructor() -> None:
+    from .model_specs import get_model_spec
+    from .models import NN_Pascucci_Recursive
+    from .tf_backend import reset_backend_state, set_seed
+
+    spec = get_model_spec("pascucci")
+    params = spec.build_default_params(const=0.75)
+    layers = [5, 8, 1]
+    kwargs = {
+        "Xi_generator": Xi_generator_default,
+        "T": 0.25,
+        "M": 4,
+        "N": 2,
+        "D": 4,
+        "layers": layers,
+        "parameters": params,
+        "t_start": 0.0,
+        "t_end": 0.25,
+        "T_total": 0.25,
+        "terminal_blob": None,
+        "normalize_time_input": True,
+    }
+
+    reset_backend_state()
+    set_seed(51)
+    direct_initial_model = NN_Pascucci_Recursive(**kwargs)
+    direct_initial = direct_initial_model.export_parameter_blob()
+    direct_initial_model.close()
+
+    reset_backend_state()
+    set_seed(51)
+    spec_initial_model = spec.build_recursive_model(**kwargs)
+    spec_initial = spec_initial_model.export_parameter_blob()
+    spec_initial_model.close()
+
+    for key in direct_initial:
+        if key.startswith(("W_", "b_")):
+            np.testing.assert_allclose(spec_initial[key], direct_initial[key], atol=1.0e-7)
+
+    blob = _make_blob(layers)
+    reset_backend_state()
+    set_seed(53)
+    direct = NN_Pascucci_Recursive(**kwargs)
+    via_spec = spec.build_recursive_model(**kwargs)
+    direct.import_parameter_blob(blob, strict=True)
+    via_spec.import_parameter_blob(blob, strict=True)
+    t_batch, W_batch, Xi_batch = direct.fetch_minibatch()
+
+    loss_direct, X_direct, Y_direct, Z_direct = direct.loss_function(
+        t_batch,
+        W_batch,
+        Xi_batch,
+        const_value=0.75,
+    )
+    loss_spec, X_spec, Y_spec, Z_spec = via_spec.loss_function(
+        t_batch,
+        W_batch,
+        Xi_batch,
+        const_value=0.75,
+    )
+    np.testing.assert_allclose(loss_spec.numpy(), loss_direct.numpy(), rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(X_spec.numpy(), X_direct.numpy(), atol=1.0e-6)
+    np.testing.assert_allclose(Y_spec.numpy(), Y_direct.numpy(), atol=1.0e-6)
+    np.testing.assert_allclose(Z_spec.numpy(), Z_direct.numpy(), atol=1.0e-6)
+    assert X_spec.dtype.name == "float32"
+    assert Y_spec.dtype.name == "float32"
+    assert Z_spec.dtype.name == "float32"
+    assert np.isfinite(loss_spec.numpy())
+    direct.close()
+    via_spec.close()
+
+
 def test_predict_recursive_stitched_two_block_model_spec() -> None:
     from .model_specs import get_model_spec
     from .orchestration import predict_recursive_stitched
@@ -797,10 +878,11 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
     standard_calls = []
     recursive_calls = []
     print_calls = []
+    current_expected_model = {"name": "quadratic_coupled"}
 
     def fake_run_standard_reference(**kwargs):
         standard_calls.append(kwargs)
-        assert kwargs["model_spec"].name == "quadratic_coupled"
+        assert kwargs["model_spec"].name == current_expected_model["name"]
         assert kwargs["model_spec"].state_dim == kwargs["D"]
         return FakeStandardModel(), {
             "stage_logs": [
@@ -832,7 +914,7 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
 
     def fake_run_recursive_training(**kwargs):
         recursive_calls.append(kwargs)
-        assert kwargs["model_spec"].name == "quadratic_coupled"
+        assert kwargs["model_spec"].name == current_expected_model["name"]
         assert kwargs["model_spec"].state_dim == kwargs["D"]
         blocks = build_blocks(T_total=kwargs["T_total"], block_size=kwargs["block_size"])
         logs = [
@@ -919,11 +1001,15 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             cases = [
-                ("standard_default", "standard", []),
-                ("both_default", "both", []),
-                ("standard_explicit", "standard", ["--model", "quadratic_coupled"]),
+                ("standard_default", "standard", [], "quadratic_coupled"),
+                ("both_default", "both", [], "quadratic_coupled"),
+                ("standard_explicit", "standard", ["--model", "quadratic_coupled"], "quadratic_coupled"),
+                ("standard_pascucci", "standard", ["--model", "pascucci"], "pascucci"),
+                ("both_pascucci", "both", ["--model", "pascucci"], "pascucci"),
+                ("recursive_pascucci", "recursive", ["--model", "pascucci"], "pascucci"),
             ]
-            for case_name, mode, model_args in cases:
+            for case_name, mode, model_args, expected_model in cases:
+                current_expected_model["name"] = expected_model
                 out_dir = root / case_name
                 exit_code = cli.main(
                     [
@@ -955,14 +1041,18 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
                 run_root = runs[0]
                 config = json.loads((run_root / "run_config.json").read_text(encoding="utf-8"))
                 assert config["mode"] == mode
-                assert config["model_requested"] == "quadratic_coupled"
-                assert config["model_name"] == "quadratic_coupled"
+                assert config["model_requested"] == expected_model
+                assert config["model_name"] == expected_model
                 assert config["state_labels"] == ["S", "H", "V", "X_state"]
                 assert config["z_labels"] == ["Z_S", "Z_H", "Z_V", "Z_X"]
                 assert config["M"] == 4
                 assert config["N"] == 2
-                assert (run_root / "standard" / "results.json").exists()
-                assert (run_root / "standard" / "model_weights.npz").exists()
+
+                if mode in ("standard", "both"):
+                    assert (run_root / "standard" / "results.json").exists(), case_name
+                    assert (run_root / "standard" / "model_weights.npz").exists(), case_name
+                else:
+                    assert not (run_root / "standard").exists(), case_name
 
                 if mode == "standard":
                     assert not (run_root / "recursive").exists(), case_name
@@ -970,9 +1060,9 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
                     assert (run_root / "recursive" / "results.json").exists(), case_name
                     assert (run_root / "recursive" / "evaluation_bundle.npz").exists(), case_name
 
-        assert len(standard_calls) == 3
-        assert len(recursive_calls) == 1
-        assert len(print_calls) == 1
+        assert len(standard_calls) == 5
+        assert len(recursive_calls) == 3
+        assert len(print_calls) == 3
     finally:
         orchestration.run_standard_reference = original_run_standard_reference
         orchestration.run_recursive_training = original_run_recursive_training
@@ -994,7 +1084,7 @@ def test_cli_rejects_unsupported_model_argument() -> None:
                 [
                     "run",
                     "--model",
-                    "pascucci",
+                    "unsupported_model_xyz",
                     "--M",
                     "4",
                     "--N",
@@ -1010,11 +1100,49 @@ def test_cli_rejects_unsupported_model_argument() -> None:
                 ]
             )
         except ValueError as exc:
-            assert "Unknown model 'pascucci'" in str(exc)
-            assert "Supported: quadratic_coupled" in str(exc)
+            assert "Unknown model 'unsupported_model_xyz'" in str(exc)
+            assert "Supported: quadratic_coupled, pascucci" in str(exc)
             assert list(out_dir.glob("run_*")) == []
         else:
             raise AssertionError("unsupported CLI model should fail before running")
+
+
+def test_cli_rejects_pascucci_exact_profile() -> None:
+    from . import cli
+    from .tf_backend import require_tensorflow
+
+    require_tensorflow()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = Path(tmp)
+        try:
+            cli.main(
+                [
+                    "run",
+                    "--model",
+                    "pascucci",
+                    "--exact_solution",
+                    "quadratic_coupled",
+                    "--M",
+                    "4",
+                    "--N",
+                    "2",
+                    "--T_total",
+                    "0.25",
+                    "--block_size",
+                    "0.25",
+                    "--passes",
+                    "1",
+                    "--output_dir",
+                    str(out_dir),
+                ]
+            )
+        except ValueError as exc:
+            assert "pascucci does not provide an exact solution profile yet" in str(exc)
+            assert "--exact_solution none" in str(exc)
+            assert list(out_dir.glob("run_*")) == []
+        else:
+            raise AssertionError("pascucci exact profile should fail before running")
 
 
 def test_cli_uses_resolved_model_spec_for_runtime_wiring() -> None:
@@ -1618,6 +1746,10 @@ def run_tests(argv: List[str] | None = None) -> int:
         "test_model_spec_recursive_factory_matches_direct_constructor",
     ) and ok
     ok = _run_subprocess_case(
+        "pascucci_recursive_factory_matches_direct_constructor",
+        "test_pascucci_recursive_factory_matches_direct_constructor",
+    ) and ok
+    ok = _run_subprocess_case(
         "predict_recursive_stitched_two_block_model_spec",
         "test_predict_recursive_stitched_two_block_model_spec",
     ) and ok
@@ -1632,6 +1764,10 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "cli_rejects_unsupported_model_argument",
         "test_cli_rejects_unsupported_model_argument",
+    ) and ok
+    ok = _run_subprocess_case(
+        "cli_rejects_pascucci_exact_profile",
+        "test_cli_rejects_pascucci_exact_profile",
     ) and ok
     ok = _run_subprocess_case(
         "cli_uses_resolved_model_spec_for_runtime_wiring",

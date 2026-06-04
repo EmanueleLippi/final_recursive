@@ -85,6 +85,16 @@ def _build_pascucci_layers(D: int) -> list[int]:
     return [int(D) + 1] + 4 * [256] + [1]
 
 
+def _build_pascucci_exact_solution(exact_solution: str, params: dict, D: int):
+    requested = str(exact_solution or "none").strip().lower()
+    if requested in ("", "none"):
+        return None
+    raise ValueError(
+        "pascucci does not provide an exact solution profile yet; "
+        "use --exact_solution none"
+    )
+
+
 def _build_pascucci_standard_model(**kwargs: Any):
     from .models import NN_Pascucci
 
@@ -183,10 +193,10 @@ def get_model_spec(name: Optional[str] = None) -> ModelSpec:
             deterministic_xi=make_deterministic_xi_default,
             standard_model_factory=_build_pascucci_standard_model,
             recursive_model_factory=_build_pascucci_recursive_model,
-            build_exact_solution=build_exact_solution_functions,
+            build_exact_solution=_build_pascucci_exact_solution,
             build_exact_initial_boundary_samples=None,
         )
 
     raise ValueError(
-        f"Unknown model '{name}'. Supported: quadratic_coupled, pascuucci"
+        f"Unknown model '{name}'. Supported: quadratic_coupled, pascucci"
     )
