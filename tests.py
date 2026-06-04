@@ -716,13 +716,19 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
     try:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            for mode in ("standard", "both"):
-                out_dir = root / mode
+            cases = [
+                ("standard_default", "standard", []),
+                ("both_default", "both", []),
+                ("standard_explicit", "standard", ["--model", "quadratic_coupled"]),
+            ]
+            for case_name, mode, model_args in cases:
+                out_dir = root / case_name
                 exit_code = cli.main(
                     [
                         "run",
                         "--mode",
                         mode,
+                        *model_args,
                         "--M",
                         "4",
                         "--N",
@@ -747,6 +753,7 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
                 run_root = runs[0]
                 config = json.loads((run_root / "run_config.json").read_text(encoding="utf-8"))
                 assert config["mode"] == mode
+                assert config["model_requested"] == "quadratic_coupled"
                 assert config["model_name"] == "quadratic_coupled"
                 assert config["state_labels"] == ["S", "H", "V", "X_state"]
                 assert config["z_labels"] == ["Z_S", "Z_H", "Z_V", "Z_X"]
@@ -756,12 +763,12 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
                 assert (run_root / "standard" / "model_weights.npz").exists()
 
                 if mode == "standard":
-                    assert not (run_root / "recursive").exists()
+                    assert not (run_root / "recursive").exists(), case_name
                 else:
-                    assert (run_root / "recursive" / "results.json").exists()
-                    assert (run_root / "recursive" / "evaluation_bundle.npz").exists()
+                    assert (run_root / "recursive" / "results.json").exists(), case_name
+                    assert (run_root / "recursive" / "evaluation_bundle.npz").exists(), case_name
 
-        assert len(standard_calls) == 2
+        assert len(standard_calls) == 3
         assert len(recursive_calls) == 1
         assert len(print_calls) == 1
     finally:
@@ -770,6 +777,42 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
         orchestration.print_recursive_pass = original_print_recursive_pass
         cli.export_standard_parameter_blob = original_export_standard_parameter_blob
         cli.plot_stage_logs = original_plot_stage_logs
+
+
+def test_cli_rejects_unsupported_model_argument() -> None:
+    from . import cli
+    from .tf_backend import require_tensorflow
+
+    require_tensorflow()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = Path(tmp)
+        try:
+            cli.main(
+                [
+                    "run",
+                    "--model",
+                    "pascucci",
+                    "--M",
+                    "4",
+                    "--N",
+                    "2",
+                    "--T_total",
+                    "0.25",
+                    "--block_size",
+                    "0.25",
+                    "--passes",
+                    "1",
+                    "--output_dir",
+                    str(out_dir),
+                ]
+            )
+        except ValueError as exc:
+            assert "Unknown model 'pascucci'" in str(exc)
+            assert "Supported: quadratic_coupled" in str(exc)
+            assert list(out_dir.glob("run_*")) == []
+        else:
+            raise AssertionError("unsupported CLI model should fail before running")
 
 
 def test_cli_uses_resolved_model_spec_for_runtime_wiring() -> None:
@@ -910,7 +953,7 @@ def test_cli_uses_resolved_model_spec_for_runtime_wiring() -> None:
     original_get_model_spec = cli.get_model_spec
     original_run_recursive_training = orchestration.run_recursive_training
     original_print_recursive_pass = orchestration.print_recursive_pass
-    cli.get_model_spec = lambda: sentinel_spec
+    cli.get_model_spec = lambda name=None: sentinel_spec
     orchestration.run_recursive_training = fake_run_recursive_training
     orchestration.print_recursive_pass = fake_print_recursive_pass
 
@@ -949,6 +992,7 @@ def test_cli_uses_resolved_model_spec_for_runtime_wiring() -> None:
             assert len(runs) == 1
             config = json.loads((runs[0] / "run_config.json").read_text(encoding="utf-8"))
             assert config["model_name"] == "sentinel_model"
+            assert config["model_requested"] == "quadratic_coupled"
             assert config["state_labels"] == ["A", "B", "C", "D"]
             assert config["z_labels"] == ["ZA", "ZB", "ZC", "ZD"]
             assert config["layers"] == [5, 7, 1]
@@ -1378,6 +1422,10 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "cli_tiny_standard_and_both_model_spec_outputs",
         "test_cli_tiny_standard_and_both_model_spec_outputs",
+    ) and ok
+    ok = _run_subprocess_case(
+        "cli_rejects_unsupported_model_argument",
+        "test_cli_rejects_unsupported_model_argument",
     ) and ok
     ok = _run_subprocess_case(
         "cli_uses_resolved_model_spec_for_runtime_wiring",

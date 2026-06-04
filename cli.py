@@ -36,6 +36,15 @@ def _parse_optional_component_weights(value: str, arg_name: str, D: int):
 def run_program(argv: Optional[List[str]] = None):
     parser = argparse.ArgumentParser(description="Recursive time-stitching experiment (TF2 native)")
     parser.add_argument("--mode", type=str, default="recursive", choices=["standard", "recursive", "both"])
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="quadratic_coupled",
+        help=(
+            "Modello da usare via ModelSpec/factory. "
+            "Default: quadratic_coupled. Valori supportati ora: quadratic_coupled."
+        ),
+    )
     parser.add_argument("--M", type=int, default=100)
     parser.add_argument("--N", type=int, default=100, help="N steps per block")
     parser.add_argument("--D", type=int, default=4)
@@ -339,7 +348,7 @@ def run_program(argv: Optional[List[str]] = None):
     M = args.M
     N = args.N
     D = args.D
-    model_spec = get_model_spec()
+    model_spec = get_model_spec(args.model)
     model_spec.validate_state_dim(D)
     effective_const = 1.0 if args.const_override is None else float(args.const_override)
     terminal_z_component_weights = _parse_optional_component_weights(
@@ -484,6 +493,7 @@ def run_program(argv: Optional[List[str]] = None):
         "structural_z_loss_weight": float(args.structural_z_loss_weight),
         "structural_z_component_weights": structural_z_component_weights,
         "plotting_available": _PLOTTING_AVAILABLE,
+        "model_requested": str(args.model),
         "model_name": model_spec.name,
         "state_labels": model_spec.state_labels,
         "z_labels": model_spec.z_labels,
