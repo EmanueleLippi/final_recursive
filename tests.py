@@ -570,6 +570,208 @@ def test_recursive_coarse_prepass_model_spec_argument() -> None:
     assert result["boundary_samples"][0].shape == (2, 4)
 
 
+def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
+    import json
+
+    from . import cli, orchestration
+    from .sampling import build_blocks
+    from .tf_backend import require_tensorflow
+
+    require_tensorflow()
+
+    class FakeSession:
+        def close(self) -> None:
+            pass
+
+    class FakeStandardModel:
+        def __init__(self) -> None:
+            self.sess = FakeSession()
+
+        def save_model(self, path: str) -> None:
+            marker = Path(path)
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("fake checkpoint\n", encoding="utf-8")
+
+    standard_calls = []
+    recursive_calls = []
+    print_calls = []
+
+    def fake_run_standard_reference(**kwargs):
+        standard_calls.append(kwargs)
+        assert kwargs["model_spec"].name == "quadratic_coupled"
+        assert kwargs["model_spec"].state_dim == kwargs["D"]
+        return FakeStandardModel(), {
+            "stage_logs": [
+                {
+                    "phase": "curriculum",
+                    "const": 1.0,
+                    "lr": 1.0e-3,
+                    "n_iter": 1,
+                    "train_last_loss": 1.0,
+                    "eval_mean_loss": 1.0,
+                    "eval_std_loss": 0.0,
+                    "eval_mean_loss_per_sample": 0.25,
+                    "eval_std_loss_per_sample": 0.0,
+                    "eval_mean_y0": 0.0,
+                    "eval_std_y0": 0.0,
+                    "elapsed_sec": 0.0,
+                }
+            ],
+            "eval_stats": {
+                "mean_loss": 1.0,
+                "std_loss": 0.0,
+                "mean_loss_per_sample": 0.25,
+                "std_loss_per_sample": 0.0,
+                "mean_y0": 0.0,
+                "std_y0": 0.0,
+            },
+            "refine_rounds": 0,
+        }
+
+    def fake_run_recursive_training(**kwargs):
+        recursive_calls.append(kwargs)
+        assert kwargs["model_spec"].name == "quadratic_coupled"
+        assert kwargs["model_spec"].state_dim == kwargs["D"]
+        blocks = build_blocks(T_total=kwargs["T_total"], block_size=kwargs["block_size"])
+        logs = [
+            {
+                "pass": 1,
+                "block": 0,
+                "t_start": blocks[0]["t_start"],
+                "t_end": blocks[0]["t_end"],
+                "T_block": blocks[0]["T_block"],
+                "eval_mean_loss": 1.0,
+                "eval_std_loss": 0.0,
+                "eval_mean_loss_per_sample": 0.25,
+                "eval_std_loss_per_sample": 0.0,
+                "eval_mean_y0": 0.0,
+                "precision_target": None,
+                "refine_rounds": 0,
+            }
+        ]
+        return {
+            "blocks": blocks,
+            "passes": [
+                {
+                    "pass_id": 1,
+                    "reference_loss": 1.0,
+                    "logs": logs,
+                    "blobs": [_make_blob([5, 8, 1]) for _ in blocks],
+                    "models_dir": kwargs["output_dir"],
+                    "pass_init_mode": kwargs["pass1_init_mode"],
+                    "boundary_source": "base_xi",
+                    "is_bootstrap_pass": True,
+                    "active_set_summary": {},
+                }
+            ],
+            "pass1": {
+                "logs": logs,
+                "reference_loss": 1.0,
+                "blobs": [_make_blob([5, 8, 1]) for _ in blocks],
+            },
+            "boundary_samples": [
+                np.zeros((kwargs["M"], kwargs["D"]), dtype=np.float32)
+                for _ in range(len(blocks) + 1)
+            ],
+        }
+
+    def fake_print_recursive_pass(**kwargs):
+        print_calls.append(kwargs)
+        eval_bundle_path = Path(kwargs["eval_bundle_path"])
+        eval_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(
+            eval_bundle_path,
+            Xi_initial=np.zeros((4, kwargs["D"]), dtype=np.float32),
+        )
+        return {
+            "processed_pass_ids": [1],
+            "exact_summary_by_pass": {},
+            "exact_summary_by_pass_index": {},
+            "eval_bundle_path": str(eval_bundle_path),
+            "evaluation_bundle_M": 4,
+            "excluded_pass_ids_from_selection": [],
+            "excluded_pass_indices_from_selection": [],
+            "selected_pass_id": 1,
+            "selected_pass_index": 0,
+            "selected_score_metric": "loss.eval_mean_loss_per_sample",
+            "selected_score": 0.25,
+            "selected_scores_by_pass": {"1": 0.25},
+            "selected_scores_by_pass_index": {"0": 0.25},
+            "score_key": "eval_mean_loss_per_sample",
+            "pass_scores_loss": {1: 0.25},
+            "pass_scores_loss_by_index": {0: 0.25},
+        }
+
+    original_run_standard_reference = orchestration.run_standard_reference
+    original_run_recursive_training = orchestration.run_recursive_training
+    original_print_recursive_pass = orchestration.print_recursive_pass
+    original_export_standard_parameter_blob = cli.export_standard_parameter_blob
+    original_plot_stage_logs = cli.plot_stage_logs
+    orchestration.run_standard_reference = fake_run_standard_reference
+    orchestration.run_recursive_training = fake_run_recursive_training
+    orchestration.print_recursive_pass = fake_print_recursive_pass
+    cli.export_standard_parameter_blob = lambda model: _make_blob([5, 8, 1])
+    cli.plot_stage_logs = lambda *args, **kwargs: None
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for mode in ("standard", "both"):
+                out_dir = root / mode
+                exit_code = cli.main(
+                    [
+                        "run",
+                        "--mode",
+                        mode,
+                        "--M",
+                        "4",
+                        "--N",
+                        "2",
+                        "--T_standard",
+                        "0.25",
+                        "--T_total",
+                        "0.25",
+                        "--block_size",
+                        "0.25",
+                        "--passes",
+                        "1",
+                        "--visual_sample_paths",
+                        "1",
+                        "--output_dir",
+                        str(out_dir),
+                    ]
+                )
+                assert exit_code == 0
+                runs = sorted(out_dir.glob("run_*"))
+                assert len(runs) == 1
+                run_root = runs[0]
+                config = json.loads((run_root / "run_config.json").read_text(encoding="utf-8"))
+                assert config["mode"] == mode
+                assert config["model_name"] == "quadratic_coupled"
+                assert config["state_labels"] == ["S", "H", "V", "X_state"]
+                assert config["z_labels"] == ["Z_S", "Z_H", "Z_V", "Z_X"]
+                assert config["M"] == 4
+                assert config["N"] == 2
+                assert (run_root / "standard" / "results.json").exists()
+                assert (run_root / "standard" / "model_weights.npz").exists()
+
+                if mode == "standard":
+                    assert not (run_root / "recursive").exists()
+                else:
+                    assert (run_root / "recursive" / "results.json").exists()
+                    assert (run_root / "recursive" / "evaluation_bundle.npz").exists()
+
+        assert len(standard_calls) == 2
+        assert len(recursive_calls) == 1
+        assert len(print_calls) == 1
+    finally:
+        orchestration.run_standard_reference = original_run_standard_reference
+        orchestration.run_recursive_training = original_run_recursive_training
+        orchestration.print_recursive_pass = original_print_recursive_pass
+        cli.export_standard_parameter_blob = original_export_standard_parameter_blob
+        cli.plot_stage_logs = original_plot_stage_logs
+
+
 def test_loss_improvement_flags_are_finite() -> None:
     from .models import NN_Quadratic_Coupled_Recursive
     from .tf_backend import set_seed
@@ -975,6 +1177,10 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "recursive_coarse_prepass_model_spec_argument",
         "test_recursive_coarse_prepass_model_spec_argument",
+    ) and ok
+    ok = _run_subprocess_case(
+        "cli_tiny_standard_and_both_model_spec_outputs",
+        "test_cli_tiny_standard_and_both_model_spec_outputs",
     ) and ok
     ok = _run_subprocess_case(
         "loss_improvement_flags_are_finite",
