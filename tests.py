@@ -484,6 +484,126 @@ def test_pascucci_f_mu_select_z_v_from_full_z() -> None:
     finally:
         model.close()
 
+def test_pascucci_equation_shapes_dtypes_finite() -> None:
+    from .model_specs import get_model_spec
+    from .models import NN_Pascucci
+    from .tf_backend import tf
+
+    spec = get_model_spec("pascucci")
+    z_v_index = spec.z_labels.index("Z_V")
+    params = spec.build_default_params(const=0.77)
+    model = NN_Pascucci(
+        Xi_generator_default,
+        0.25,
+        4,
+        2,
+        4,
+        [5, 8, 1],
+        params,
+    )
+
+    try:
+        X = np.array(
+            [
+                [0.2, 0.1, 0.05, 0.5],
+                [-0.3, -0.2, -0.1, 1.5],
+                [0.4, 0.3, 0.2, 8.5],
+                [0.0, -0.4, 0.3, 10.5],
+            ],
+            dtype=np.float32,
+        )
+        Y = np.array([[0.1], [-0.2], [0.3], [0.0]], dtype=np.float32)
+        Z = np.array(
+            [
+                [0.1, 0.2, -0.3, 0.4],
+                [-0.2, 0.1, 0.4, -0.5],
+                [0.3, -0.1, 0.2, 0.0],
+                [0.0, 0.2, -0.1, 0.1],
+            ],
+            dtype=np.float32,
+        )
+        t = np.array([[0.0], [8.0], [20.0], [23.5]], dtype=np.float32)
+
+        t_tf = tf.convert_to_tensor(t)
+        X_tf = tf.convert_to_tensor(X)
+        Y_tf = tf.convert_to_tensor(Y)
+        Z_tf = tf.convert_to_tensor(Z)
+
+        def assert_contract(name: str, value, expected_shape: tuple[int, ...]) -> None:
+            value_np = value.numpy()
+            assert value_np.shape == expected_shape, f"{name} shape {value_np.shape}"
+            assert value_np.dtype == np.float32, f"{name} dtype {value_np.dtype}"
+            assert np.isfinite(value_np).all(), f"{name} contains non-finite values"
+
+        assert_contract("alpha_tf", model.alpha_tf(t_tf, X_tf, Z_tf[:, z_v_index : z_v_index + 1]), (4, 1))
+        assert_contract("sigmaV_tf", model.sigmaV_tf(t_tf, X_tf), (4, 1))
+        assert_contract("mu_tf", model.mu_tf(t_tf, X_tf, Y_tf, Z_tf), (4, 4))
+        assert_contract("sigma_tf", model.sigma_tf(t_tf, X_tf, Y_tf), (4, 4, 4))
+        assert_contract("f_tf", model.f_tf(t_tf, X_tf, Y_tf, Z_tf), (4, 1))
+        assert_contract("g_tf", model.g_tf(X_tf), (4, 1))
+        assert_contract("phi_tf", model.phi_tf(t_tf, X_tf, Y_tf, Z_tf), (4, 1))
+    finally:
+        model.close()
+
+
+def test_pascucci_recursive_loss_shapes_dtypes_finite() -> None:
+    from .model_specs import get_model_spec
+    from .tf_backend import reset_backend_state, set_seed
+
+    reset_backend_state()
+    set_seed(101)
+
+    spec = get_model_spec("pascucci")
+    params = spec.build_default_params(const=0.75)
+    params["same_xi_antithetic_sampling"] = True
+
+    model = spec.build_recursive_model(
+        Xi_generator=spec.xi_generator,
+        T=0.25,
+        M=4,
+        N=3,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        terminal_blob=None,
+        normalize_time_input=True,
+    )
+
+    try:
+        t_batch, W_batch, Xi_batch = model.fetch_minibatch()
+        assert t_batch.shape == (4, 4, 1)
+        assert W_batch.shape == (4, 4, 4)
+        assert Xi_batch.shape == (4, 4)
+        assert t_batch.dtype == np.float32
+        assert W_batch.dtype == np.float32
+        assert Xi_batch.dtype == np.float32
+        assert np.isfinite(t_batch).all()
+        assert np.isfinite(W_batch).all()
+        assert np.isfinite(Xi_batch).all()
+
+        loss, X, Y, Z = model.loss_function(t_batch, W_batch, Xi_batch, const_value=0.75)
+        loss_np = np.asarray(loss.numpy())
+        X_np = X.numpy()
+        Y_np = Y.numpy()
+        Z_np = Z.numpy()
+
+        assert loss_np.dtype == np.float32
+        assert X_np.shape == (4, 4, 4)
+        assert Y_np.shape == (4, 4, 1)
+        assert Z_np.shape == (4, 4, 4)
+        assert X_np.dtype == np.float32
+        assert Y_np.dtype == np.float32
+        assert Z_np.dtype == np.float32
+        assert np.isfinite(float(loss_np))
+        assert np.isfinite(X_np).all()
+        assert np.isfinite(Y_np).all()
+        assert np.isfinite(Z_np).all()
+    finally:
+        model.close()
+
 
 def test_model_spec_params_overlay_preserves_solver_flags() -> None:
     from .model_specs import get_model_spec
@@ -1824,6 +1944,14 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "pascucci_f_mu_select_z_v_from_full_z",
         "test_pascucci_f_mu_select_z_v_from_full_z",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_equation_shapes_dtypes_finite",
+        "test_pascucci_equation_shapes_dtypes_finite",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_recursive_loss_shapes_dtypes_finite",
+        "test_pascucci_recursive_loss_shapes_dtypes_finite",
     ) and ok
     ok = _run_subprocess_case(
         "model_spec_recursive_factory_matches_direct_constructor",
