@@ -632,6 +632,396 @@ class FBSNN(tf.Module, ABC):
 fbsde_NN = FBSNN
 
 
+class NN_Pascucci(FBSNN):
+    """
+    FBSNN model with Pascucci mean-field control structure.
+
+    This class preserves the existing solver contract and keeps model equations
+    explicit for future oracle fixture parity.
+    """
+
+    def __init__(self, Xi, T, M, N, D, layers, parameters, **kwargs):
+        for key in (
+            "dynamic_loss_dt_normalization",
+            "dynamic_loss_weight",
+            "same_xi_antithetic_sampling",
+            "terminal_y_loss_weight",
+            "terminal_z_loss_weight",
+            "terminal_z_component_weights",
+            "structural_z_loss_weight",
+            "structural_z_component_weights",
+        ):
+            if key in parameters and key not in kwargs:
+                kwargs[key] = parameters[key]
+
+        self.params_S = parameters["params_S"]
+        self.params_H = parameters["params_H"]
+        self.l_v = parameters["l_v"]
+        self.l_a = parameters["l_a"]
+        self.x_max = parameters["x_max"]
+        self.d = parameters["d"]
+        self.c3 = parameters["c3"]
+        self.c4 = parameters["c4"]
+        self.s3 = parameters["s3"]
+        self.s3h = parameters["s3h"]
+        self.s3v = parameters["s3v"]
+        self.s3k = parameters["s3k"]
+        self.v_max = parameters["v_max"]
+        self.v_min = parameters["v_min"]
+        self.gamma = parameters["gamma"]
+        self.omega = parameters["omega"]
+        self.c_h = parameters["c_h"]
+        self.c_con = parameters["c_con"]
+        self.const = parameters["const"]
+
+        self.params_S_tf = self._build_tf_params(self.params_S)
+        self.params_H_tf = self._build_tf_params(self.params_H)
+
+        super().__init__(Xi, T, M, N, D, layers, **kwargs)
+
+    def _build_tf_params(self, params):
+        tf_params = {}
+
+        for key in [
+            "kappa_day",
+            "kappa_night",
+            "a0_day",
+            "a0_night",
+            "sigma_day",
+            "sigma_night",
+        ]:
+            tf_params[key] = tf.constant(params[key], dtype=tf.float32)
+
+        tf_params["alpha_day"] = tf.constant(params["alpha_day"], dtype=tf.float32)
+        tf_params["alpha_night"] = tf.constant(params["alpha_night"], dtype=tf.float32)
+        tf_params["beta_day"] = tf.constant(params["beta_day"], dtype=tf.float32)
+        tf_params["beta_night"] = tf.constant(params["beta_night"], dtype=tf.float32)
+
+        k = int(np.asarray(params["alpha_day"]).shape[0])
+        tf_params["omega"] = 2.0 * np.pi * np.arange(1, k + 1, dtype=np.float32) / 24.0
+        return tf_params
+
+    def is_day_tf(self, t):
+        hour = tf.math.floormod(t, 24.0)
+        return tf.logical_and(hour >= 7.0, hour < 19.0)
+
+    def regime_switch(self, t, day_value, night_value):
+        mask = self.is_day_tf(t)
+        day_value = tf.broadcast_to(day_value, tf.shape(t))
+        night_value = tf.broadcast_to(night_value, tf.shape(t))
+        return tf.where(mask, day_value, night_value)
+
+    def mu_t_daynight_tf(self, t, params):
+        omega = tf.reshape(params["omega"], (1, -1))
+        t_exp = tf.expand_dims(t, axis=-1)
+
+        cos_part = tf.cos(omega * t_exp)
+        sin_part = tf.sin(omega * t_exp)
+
+        alpha_d = tf.reshape(params["alpha_day"], (1, 1, -1))
+        beta_d = tf.reshape(params["beta_day"], (1, 1, -1))
+        mu_d = params["a0_day"] + tf.reduce_sum(alpha_d * cos_part + beta_d * sin_part, axis=-1)
+
+        alpha_n = tf.reshape(params["alpha_night"], (1, 1, -1))
+        beta_n = tf.reshape(params["beta_night"], (1, 1, -1))
+        mu_n = params["a0_night"] + tf.reduce_sum(alpha_n * cos_part + beta_n * sin_part, axis=-1)
+
+        return self.regime_switch(t, mu_d, mu_n)
+
+    def kappa_t_tf(self, t, params):
+        return self.regime_switch(
+            t,
+            params["kappa_day"],
+            params["kappa_night"],
+        )
+
+    def sigma_t_tf(self, t, params):
+        return self.regime_switch(
+            t,
+            params["sigma_day"],
+            params["sigma_night"],
+        )
+
+    def psi(self, X_state):
+        return tf.maximum(
+            0.0,
+            tf.minimum(
+                1.0,
+                tf.minimum(X_state / self.d, (self.x_max - X_state) / self.d),
+            ),
+        )
+
+    def psi1(self, X_state):
+        return tf.maximum(0.0, tf.minimum(1.0, (X_state - self.x_max) / self.d))
+
+    def psi2(self, X_state):
+        return tf.maximum(0.0, tf.minimum(1.0, -X_state / self.d))
+
+    def psi3(self, V):
+        return tf.maximum(0.0, tf.minimum(1.0, (self.v_max - V) / self.d))
+
+    def psi4(self, V):
+        return tf.maximum(0.0, tf.minimum(1.0, (V - self.v_min) / self.d))
+
+    def h_tf(self, X_state):
+        X_mean = tf.reduce_mean(X_state, axis=0, keepdims=True)
+        return tf.where(X_state < X_mean, (X_state - X_mean) ** 2, 2.0 * (X_state - X_mean) ** 2)
+
+    def alpha_tf(self, t, X, Z_V):
+        S, H, V, X_state = tf.split(X, 4, axis=1)
+        denom = 2.0 * self.l_a * tf.maximum(self.sigmaV_tf(t, X), 1.0e-7)
+        return -(self.psi(X_state) * Z_V) / denom
+
+    def sigmaV_tf(self, t, X):
+        S, H, V, X_state = tf.split(X, 4, axis=1)
+        return (
+            self.s3 * tf.ones_like(V)
+            + self.s3h * tf.math.abs(H)
+            + self.s3v * tf.math.abs(V)
+            + self.s3k * tf.math.abs(V - tf.reduce_mean(V, axis=0, keepdims=True))
+        )
+
+    def f_tf(self, t, X, Y, Z):
+        S, H, V, X_state = tf.split(X, num_or_size_splits=4, axis=1)
+        Z_S, Z_H, Z_V, _ = tf.split(Z, num_or_size_splits=4, axis=1)
+        term1 = tf.exp(S) * (H + V)
+        term2 = self.l_v * V ** 2
+        term3 = self.l_a * self.alpha_tf(t, X, Z_V) ** 2
+        term4 = self.c_h * self.h_tf(X_state)
+        term5 = self.c_con * self.h_tf(H + V)
+        return term1 + term2 + term3 + term4 + term5
+
+    def mu_tf(self, t, X, Y, Z):
+        S, H, V, X_state = tf.split(X, 4, axis=1)
+
+        mu_S_mean = self.mu_t_daynight_tf(t, self.params_S_tf)
+        kappa_S = self.kappa_t_tf(t, self.params_S_tf)
+        dS = kappa_S * (mu_S_mean - S)
+
+        mu_H_mean = self.mu_t_daynight_tf(t, self.params_H_tf)
+        kappa_H = self.kappa_t_tf(t, self.params_H_tf)
+        dH = kappa_H * (mu_H_mean - H)
+
+        Z_S, Z_H, Z_V, _ = tf.split(Z, num_or_size_splits=4, axis=1)
+        dV = (
+            self.alpha_tf(t, X, Z_V) * self.psi(X_state)
+            + self.c3 * self.psi2(X_state) * self.psi3(V)
+            - self.c4 * self.psi1(X_state) * self.psi4(V)
+        )
+        dX = V
+        return tf.concat([dS, dH, dV, dX], axis=1)
+
+    def g_tf(self, X):
+        S, H, V, X_state = tf.split(X, 4, axis=1)
+        return -self.gamma * X_state * tf.exp(S) + 0.5 * self.omega * (X_state - tf.reduce_mean(X_state, axis=0, keepdims=True)) ** 2
+
+    def phi_tf(self, t, X, Y, Z):
+        return -self.f_tf(t, X, Y, Z)
+
+    def sigma_tf(self, t, X, Y):
+        S, H, V, X_state = tf.split(X, 4, axis=1)
+        sigma_S = self.sigma_t_tf(t, self.params_S_tf)
+        sigma_H = self.sigma_t_tf(t, self.params_H_tf)
+        sigma_V = self.sigmaV_tf(t, X)
+
+        zeros = tf.zeros_like(S)
+
+        r1 = tf.concat([sigma_S, zeros, zeros, zeros], axis=1)
+        r2 = tf.concat([zeros, sigma_H, zeros, zeros], axis=1)
+        r3 = tf.concat([zeros, zeros, sigma_V, zeros], axis=1)
+        r4 = tf.concat([zeros, zeros, zeros, zeros], axis=1)
+
+        return tf.stack([r1, r2, r3, r4], axis=1)
+
+
+class NN_Pascucci_Recursive(NN_Pascucci):
+    """
+    Recursive block model for Pascucci with existing recursive runtime behavior.
+    """
+
+    def __init__(
+        self,
+        Xi_generator,
+        T,
+        M,
+        N,
+        D,
+        layers,
+        parameters,
+        t_start,
+        t_end,
+        T_total,
+        terminal_blob=None,
+        normalize_time_input=True,
+        x_norm_mean=None,
+        x_norm_std=None,
+    ):
+        self.t_start = np.float32(t_start)
+        self.t_end = np.float32(t_end)
+        self.T_total = np.float32(T_total)
+        self.normalize_time_input = bool(normalize_time_input)
+
+        x_mean = (
+            np.zeros((1, D), dtype=np.float32)
+            if x_norm_mean is None
+            else np.asarray(x_norm_mean, dtype=np.float32).reshape(1, D)
+        )
+        x_std = (
+            np.ones((1, D), dtype=np.float32)
+            if x_norm_std is None
+            else np.asarray(x_norm_std, dtype=np.float32).reshape(1, D)
+        )
+        self.x_norm_mean_np = x_mean
+        self.x_norm_std_np = np.maximum(x_std, 1.0e-3).astype(np.float32)
+
+        self.terminal_blob = _as_blob_dict(terminal_blob)
+        self._terminal_weights_tf = None
+        self._terminal_biases_tf = None
+        self._terminal_x_mean_tf = None
+        self._terminal_x_std_tf = None
+        self._terminal_T_total_tf = None
+        self._terminal_use_time = False
+
+        self._x_norm_mean_tf = tf.constant(self.x_norm_mean_np, dtype=tf.float32)
+        self._x_norm_std_tf = tf.constant(self.x_norm_std_np, dtype=tf.float32)
+        self._T_total_tf = tf.constant(self.T_total, dtype=tf.float32)
+
+        super().__init__(Xi_generator, T, M, N, D, layers, parameters)
+        self._build_terminal_constants_if_needed()
+
+    def _normalize_t(self, t):
+        if not self.normalize_time_input:
+            return t
+        return 2.0 * (t / self._T_total_tf) - 1.0
+
+    def _normalize_x(self, X):
+        return (X - self._x_norm_mean_tf) / self._x_norm_std_tf
+
+    def net_u(self, t, X):
+        X = tf.cast(X, tf.float32)
+        t = tf.cast(t, tf.float32)
+        with tf.GradientTape() as tape:
+            tape.watch(X)
+            t_in = self._normalize_t(t)
+            X_in = self._normalize_x(X)
+            u = self.neural_net(tf.concat([t_in, X_in], 1), self.weights, self.biases)
+        Du = tape.gradient(u, X)
+        if Du is None:
+            Du = tf.zeros_like(X)
+        return u, Du
+
+    def fetch_minibatch(self):
+        return self._build_minibatch(t_start=float(self.t_start))
+
+    def _build_terminal_constants_if_needed(self):
+        if self.terminal_blob is None:
+            return
+        if self._terminal_weights_tf is not None:
+            return
+
+        n_layers = int(self.terminal_blob["n_layers"])
+        self._terminal_weights_tf = []
+        self._terminal_biases_tf = []
+        for i in range(n_layers):
+            self._terminal_weights_tf.append(
+                tf.constant(self.terminal_blob[f"W_{i}"], dtype=tf.float32)
+            )
+            self._terminal_biases_tf.append(
+                tf.constant(self.terminal_blob[f"b_{i}"], dtype=tf.float32)
+            )
+
+        self._terminal_x_mean_tf = tf.constant(
+            self.terminal_blob.get("x_norm_mean", np.zeros((1, self.D), dtype=np.float32)),
+            dtype=tf.float32,
+        )
+        self._terminal_x_std_tf = tf.constant(
+            np.maximum(
+                self.terminal_blob.get("x_norm_std", np.ones((1, self.D), dtype=np.float32)),
+                1.0e-3,
+            ),
+            dtype=tf.float32,
+        )
+        self._terminal_T_total_tf = tf.constant(
+            np.float32(self.terminal_blob.get("T_total", self.T_total)), dtype=tf.float32
+        )
+        self._terminal_use_time = bool(int(self.terminal_blob.get("normalize_time_input", 1)))
+
+    def _terminal_u(self, t_abs, X):
+        self._build_terminal_constants_if_needed()
+        t_in = t_abs
+        if self._terminal_use_time:
+            t_in = 2.0 * (t_abs / self._terminal_T_total_tf) - 1.0
+        X_in = (X - self._terminal_x_mean_tf) / self._terminal_x_std_tf
+        return self.neural_net(
+            tf.concat([t_in, X_in], 1), self._terminal_weights_tf, self._terminal_biases_tf
+        )
+
+    def g_tf(self, X):
+        if self.terminal_blob is None:
+            return super().g_tf(X)
+        t_eval = tf.ones([tf.shape(X)[0], 1], dtype=tf.float32) * tf.constant(
+            self.t_end, dtype=tf.float32
+        )
+        return self._terminal_u(t_eval, X)
+
+    def Dg_tf(self, X):
+        if self.terminal_blob is None:
+            return super().Dg_tf(X)
+        X = tf.cast(X, tf.float32)
+        with tf.GradientTape() as tape:
+            tape.watch(X)
+            value = self.g_tf(X)
+        grad = tape.gradient(value, X)
+        if grad is None:
+            grad = tf.zeros_like(X)
+        return grad
+
+    def export_parameter_blob(self) -> Dict[str, np.ndarray]:
+        values = self.get_weight_bias_arrays()
+        n_layers = len(self.weights)
+        blob = {
+            "n_layers": np.array(n_layers, dtype=np.int32),
+            "layers": np.asarray(self.layers, dtype=np.int32),
+            "t_start": np.asarray(self.t_start, dtype=np.float32),
+            "t_end": np.asarray(self.t_end, dtype=np.float32),
+            "T_total": np.asarray(self.T_total, dtype=np.float32),
+            "normalize_time_input": np.asarray(int(self.normalize_time_input), dtype=np.int32),
+            "x_norm_mean": np.asarray(self.x_norm_mean_np, dtype=np.float32),
+            "x_norm_std": np.asarray(self.x_norm_std_np, dtype=np.float32),
+        }
+        for i in range(n_layers):
+            blob[f"W_{i}"] = values[i].astype(np.float32)
+            blob[f"b_{i}"] = values[n_layers + i].astype(np.float32)
+        return blob
+
+    def import_parameter_blob(self, blob_or_path, strict=True):
+        blob = _as_blob_dict(blob_or_path)
+        if blob is None:
+            return
+        n_layers = len(self.weights)
+        if strict and int(blob["n_layers"]) != n_layers:
+            raise ValueError(
+                f"n_layers mismatch: model={n_layers}, blob={int(blob['n_layers'])}"
+            )
+        for i in range(n_layers):
+            w_key = f"W_{i}"
+            b_key = f"b_{i}"
+            if w_key in blob:
+                self.weights[i].assign(np.asarray(blob[w_key], dtype=np.float32))
+            elif strict:
+                raise KeyError(f"Missing key {w_key} in blob")
+            if b_key in blob:
+                self.biases[i].assign(np.asarray(blob[b_key], dtype=np.float32))
+            elif strict:
+                raise KeyError(f"Missing key {b_key} in blob")
+
+    def save_parameter_blob(self, path: str) -> None:
+        save_blob_npz(self.export_parameter_blob(), path)
+
+    def load_parameter_blob(self, path: str, strict=True) -> None:
+        self.import_parameter_blob(path, strict=strict)
+
+
 class NN_Quadratic_Coupled(FBSNN):
     def __init__(self, Xi, T, M, N, D, layers, parameters, **kwargs):
         for key in (

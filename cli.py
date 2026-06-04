@@ -42,7 +42,7 @@ def run_program(argv: Optional[List[str]] = None):
         default="quadratic_coupled",
         help=(
             "Modello da usare via ModelSpec/factory. "
-            "Default: quadratic_coupled. Valori supportati ora: quadratic_coupled."
+            "Default: quadratic_coupled. Valori supportati ora: quadratic_coupled, pascucci."
         ),
     )
     parser.add_argument("--M", type=int, default=100)

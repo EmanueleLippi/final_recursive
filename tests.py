@@ -41,6 +41,45 @@ def _default_params(const: float = 1.0):
     }
 
 
+def _build_default_pascucci_ou_params():
+    return {
+        "kappa_day": np.float32(0.40),
+        "kappa_night": np.float32(0.40),
+        "a0_day": np.float32(-1.0),
+        "a0_night": np.float32(-1.0),
+        "sigma_day": np.float32(0.10),
+        "sigma_night": np.float32(0.15),
+        "alpha_day": np.asarray([np.float32(0.0)], dtype=np.float32),
+        "alpha_night": np.asarray([np.float32(0.0)], dtype=np.float32),
+        "beta_day": np.asarray([np.float32(0.0)], dtype=np.float32),
+        "beta_night": np.asarray([np.float32(0.0)], dtype=np.float32),
+    }
+
+
+def _default_pascucci_params(const: float = 1.0):
+    return {
+        "l_v": np.float32(0.01),
+        "l_a": np.float32(0.01),
+        "c3": np.float32(10.0),
+        "c4": np.float32(10.0),
+        "gamma": np.float32(1.0),
+        "d": np.float32(1.0),
+        "x_max": np.float32(10.0),
+        "v_max": np.float32(2.0),
+        "v_min": np.float32(-2.0),
+        "s3": np.float32(0.01),
+        "s3h": np.float32(0.001),
+        "s3v": np.float32(0.001),
+        "s3k": np.float32(0.001),
+        "omega": np.float32(0.01),
+        "c_h": np.float32(0.0001),
+        "c_con": np.float32(0.01),
+        "const": np.float32(const),
+        "params_S": _build_default_pascucci_ou_params(),
+        "params_H": _build_default_pascucci_ou_params(),
+    }
+
+
 def _make_blob(layers: List[int]) -> dict:
     rng = np.random.RandomState(2026)
     blob = {
@@ -168,19 +207,32 @@ def test_model_spec_contract() -> None:
     for key, value in expected.items():
         np.testing.assert_allclose(params[key], value)
 
+    pascucci_spec = get_model_spec("pascucci")
+    assert pascucci_spec.name == "pascucci"
+    assert pascucci_spec.state_dim == 4
+    assert pascucci_spec.state_labels == ("S", "H", "V", "X_state")
+    assert pascucci_spec.z_labels == ("Z_S", "Z_H", "Z_V", "Z_X")
+    assert pascucci_spec.build_layers(4) == [5, 256, 256, 256, 256, 1]
+
+    pascucci_params = pascucci_spec.build_default_params(const=0.55)
+    assert pascucci_params["const"] == np.float32(0.55)
+    for required in ("params_S", "params_H", "l_v", "l_a", "s3", "s3h", "s3v", "s3k", "omega", "c_h", "c_con"):
+        assert required in pascucci_params
+
     spec.validate_state_dim(4)
     for action in (lambda: spec.validate_state_dim(3), lambda: spec.build_layers(3)):
         try:
             action()
         except ValueError as exc:
-            assert "quadratic_coupled requires D=4" in str(exc)
+            assert "D=4" in str(exc)
         else:
             raise AssertionError("D != 4 should be rejected")
 
     try:
-        get_model_spec("pascucci")
+        get_model_spec("unsupported_model_xyz")
     except ValueError as exc:
-        assert "Supported: quadratic_coupled" in str(exc)
+        assert "Supported:" in str(exc)
+        assert "quadratic_coupled" in str(exc)
     else:
         raise AssertionError("unknown model should be rejected")
 
@@ -192,6 +244,156 @@ def test_model_spec_contract() -> None:
     Xi = spec.deterministic_xi(4, 4, seed=11)
     assert Xi.shape == (4, 4)
     assert Xi.dtype == np.float32
+
+
+def _pascucci_psi(x: np.ndarray, d: float, x_max: float) -> np.ndarray:
+    return np.maximum(0.0, np.minimum(1.0, np.minimum(x / d, (x_max - x) / d))).astype(np.float32)
+
+
+def _pascucci_psi2(x: np.ndarray, d: float, x_max: float) -> np.ndarray:
+    return np.maximum(0.0, np.minimum(1.0, -x / d)).astype(np.float32)
+
+
+def _pascucci_psi1(x: np.ndarray, d: float, x_max: float) -> np.ndarray:
+    return np.maximum(0.0, np.minimum(1.0, (x - x_max) / d)).astype(np.float32)
+
+
+def _pascucci_psi3(v: np.ndarray, d: float, v_max: float) -> np.ndarray:
+    return np.maximum(0.0, np.minimum(1.0, (v_max - v) / d)).astype(np.float32)
+
+
+def _pascucci_psi4(v: np.ndarray, d: float, v_min: float) -> np.ndarray:
+    return np.maximum(0.0, np.minimum(1.0, (v - v_min) / d)).astype(np.float32)
+
+
+def _pascucci_h(x: np.ndarray) -> np.ndarray:
+    x_mean = np.mean(x, axis=0, keepdims=True)
+    return np.where(x < x_mean, (x - x_mean) ** 2, 2.0 * (x - x_mean) ** 2).astype(np.float32)
+
+
+def _pascucci_ou_mu_daynight(t: np.ndarray, params: dict) -> np.ndarray:
+    t = t.astype(np.float32)
+    omega = (2.0 * np.pi * np.arange(1, len(np.asarray(params["alpha_day"])) + 1, dtype=np.float32) / 24.0).reshape(1, -1)
+    t_exp = t.reshape(-1, 1, 1)
+    cos_part = np.cos(omega * t_exp)
+    sin_part = np.sin(omega * t_exp)
+
+    alpha_d = np.asarray(params["alpha_day"], dtype=np.float32).reshape(1, 1, -1)
+    beta_d = np.asarray(params["beta_day"], dtype=np.float32).reshape(1, 1, -1)
+    mu_d = params["a0_day"] + np.sum(alpha_d * cos_part + beta_d * sin_part, axis=-1)
+
+    alpha_n = np.asarray(params["alpha_night"], dtype=np.float32).reshape(1, 1, -1)
+    beta_n = np.asarray(params["beta_night"], dtype=np.float32).reshape(1, 1, -1)
+    mu_n = params["a0_night"] + np.sum(alpha_n * cos_part + beta_n * sin_part, axis=-1)
+
+    hour = np.mod(t, 24.0)
+    return np.where((hour >= 7.0) & (hour < 19.0), mu_d, mu_n).astype(np.float32)
+
+
+def _pascucci_sigmaV(X: np.ndarray, params: dict) -> np.ndarray:
+    H = X[:, [1]]
+    V = X[:, [2]]
+    return (
+        float(params["s3"]) * np.ones_like(V, dtype=np.float32)
+        + float(params["s3h"]) * np.abs(H)
+        + float(params["s3v"]) * np.abs(V)
+        + float(params["s3k"]) * np.abs(V - np.mean(V, axis=0, keepdims=True))
+    )
+
+
+def _pascucci_alpha(X: np.ndarray, Z_V: np.ndarray, params: dict) -> np.ndarray:
+    X_state = X[:, [3]]
+    return (
+        -( _pascucci_psi(X_state, float(params["d"]), float(params["x_max"])) * Z_V )
+        / (2.0 * float(params["l_a"]) * np.maximum(_pascucci_sigmaV(X, params), 1.0e-7))
+    ).astype(np.float32)
+
+
+def test_pascucci_equation_fixtures() -> None:
+    from .model_specs import get_model_spec
+    from .models import NN_Pascucci
+    from .tf_backend import tf
+
+    spec = get_model_spec("pascucci")
+    params = spec.build_default_params(const=0.77)
+    model = NN_Pascucci(
+        Xi_generator_default,
+        0.25,
+        4,
+        2,
+        4,
+        [5, 8, 1],
+        params,
+    )
+
+    X = np.array(
+        [
+            [1.2, 0.4, 0.2, 4.5],
+            [-0.4, -0.2, -0.1, 7.7],
+            [5.2, 1.0, 0.5, -0.2],
+            [3.1, -0.5, -0.3, 0.8],
+        ],
+        dtype=np.float32,
+    )
+    Y = np.array(
+        [[0.1], [0.2], [-0.1], [0.3]],
+        dtype=np.float32,
+    )
+    Z = np.array(
+        [[0.1, 0.2, -0.3, 0.4], [0.2, -0.1, 0.4, -0.5], [0.3, 0.0, 0.2, -0.1], [0.4, -0.2, -0.1, 0.2]],
+        dtype=np.float32,
+    )
+    t = np.zeros((4, 1), dtype=np.float32)
+
+    alpha_np = _pascucci_alpha(X, Z[:, [2]], params)
+    sigma_v_np = _pascucci_sigmaV(X, params)
+
+    alpha_tf = model.alpha_tf(tf.convert_to_tensor(t), tf.convert_to_tensor(X), tf.convert_to_tensor(Z[:, [2]])).numpy()
+    np.testing.assert_allclose(alpha_tf, alpha_np, rtol=1.0e-6, atol=1.0e-6)
+
+    sigma_tf = model.sigmaV_tf(tf.convert_to_tensor(t), tf.convert_to_tensor(X)).numpy()
+    np.testing.assert_allclose(sigma_tf, sigma_v_np, rtol=1.0e-6, atol=1.0e-6)
+
+    mu_tf = model.mu_tf(tf.convert_to_tensor(t), tf.convert_to_tensor(X), tf.convert_to_tensor(Y), tf.convert_to_tensor(Z)).numpy()
+    H = X[:, [1]]
+    V = X[:, [2]]
+    X_state = X[:, [3]]
+    mu_S_mean = _pascucci_ou_mu_daynight(np.zeros((4, 1), dtype=np.float32), params["params_S"])
+    mu_H_mean = _pascucci_ou_mu_daynight(np.zeros((4, 1), dtype=np.float32), params["params_H"])
+    kappa_day = np.array(float(params["params_S"]["kappa_day"]))
+    kappa_night = np.array(float(params["params_S"]["kappa_night"]))
+    kappa = np.where((np.mod(np.zeros((4, 1), dtype=np.float32), 24.0) >= 7.0) & (np.mod(np.zeros((4, 1), dtype=np.float32), 24.0) < 19.0), kappa_day, kappa_night)
+    dS_np = kappa * (mu_S_mean - X[:, [0]])
+
+    kappa_h = np.array(float(params["params_H"]["kappa_day"]))
+    kappa_night_h = np.array(float(params["params_H"]["kappa_night"]))
+    kappa_h_t = np.where((np.mod(np.zeros((4, 1), dtype=np.float32), 24.0) >= 7.0) & (np.mod(np.zeros((4, 1), dtype=np.float32), 24.0) < 19.0), kappa_h, kappa_night_h)
+    dH_np = kappa_h_t * (mu_H_mean - H)
+    dV_np = alpha_np * _pascucci_psi(X_state, float(params["d"]), float(params["x_max"])) + params["c3"] * _pascucci_psi2(X_state, float(params["d"]), float(params["x_max"])) * _pascucci_psi3(V, float(params["d"]), float(params["v_max"])) - params["c4"] * _pascucci_psi1(X_state, float(params["d"]), float(params["x_max"])) * _pascucci_psi4(V, float(params["d"]), float(params["v_min"]))
+    dX_np = V
+    mu_np = np.concatenate([dS_np, dH_np, dV_np, dX_np], axis=1)
+    np.testing.assert_allclose(mu_tf, mu_np, rtol=1.0e-6, atol=1.0e-6)
+
+    sigma_tf = model.sigma_tf(tf.convert_to_tensor(t), tf.convert_to_tensor(X), tf.convert_to_tensor(Y)).numpy()
+    assert sigma_tf.shape == (4, 4, 4)
+    assert np.isfinite(sigma_tf).all()
+
+    f_tf = model.f_tf(tf.convert_to_tensor(t), tf.convert_to_tensor(X), tf.convert_to_tensor(Y), tf.convert_to_tensor(Z)).numpy()
+    term1 = np.exp(X[:, [0]]) * (H + V)
+    term2 = float(params["l_v"]) * (V ** 2)
+    term3 = float(params["l_a"]) * (alpha_np ** 2)
+    term4 = float(params["c_h"]) * _pascucci_h(X_state)
+    term5 = float(params["c_con"]) * _pascucci_h(H + V)
+    f_np = term1 + term2 + term3 + term4 + term5
+    np.testing.assert_allclose(f_tf, f_np, rtol=1.0e-6, atol=1.0e-6)
+
+    g_tf = model.g_tf(tf.convert_to_tensor(X)).numpy()
+    g_np = -float(params["gamma"]) * X_state * np.exp(X[:, [0]]) + 0.5 * float(params["omega"]) * (X_state - np.mean(X_state, axis=0, keepdims=True)) ** 2
+    np.testing.assert_allclose(g_tf, g_np, rtol=1.0e-6, atol=1.0e-6)
+
+    phi = model.phi_tf(tf.convert_to_tensor(t), tf.convert_to_tensor(X), tf.convert_to_tensor(Y), tf.convert_to_tensor(Z)).numpy()
+    np.testing.assert_allclose(phi, -f_np, rtol=1.0e-6, atol=1.0e-6)
+    model.close()
 
 
 def test_model_spec_params_overlay_preserves_solver_flags() -> None:
@@ -1406,6 +1608,10 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "tf2_model_smoke_and_blob_roundtrip",
         "test_tf2_model_smoke_and_blob_roundtrip",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_equation_fixtures",
+        "test_pascucci_equation_fixtures",
     ) and ok
     ok = _run_subprocess_case(
         "model_spec_recursive_factory_matches_direct_constructor",
