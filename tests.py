@@ -819,6 +819,202 @@ def test_pascucci_loss_function_forwards_model_owned_context() -> None:
         model.close()
 
 
+def test_pascucci_runtime_moment_diagnostics_follow_loss_context() -> None:
+    from .model_specs import get_model_spec
+    from .models import NN_Pascucci_Recursive
+    from .tf_backend import reset_backend_state, set_seed, tf
+
+    class RecordingPascucci(NN_Pascucci_Recursive):
+        def __init__(self, *args, **kwargs):
+            self.built_contexts = []
+            self.diagnostic_contexts = []
+            super().__init__(*args, **kwargs)
+
+        def build_loss_context_tf(self, t, X, Y):
+            del t, Y
+            context = self.mean_field_moments_tf(X)
+            self.built_contexts.append(context)
+            return context
+
+        def loss_context_diagnostics_tf(self, loss_context):
+            self.diagnostic_contexts.append(loss_context)
+            return super().loss_context_diagnostics_tf(loss_context)
+
+    reset_backend_state()
+    set_seed(71)
+
+    spec = get_model_spec("pascucci")
+    params = spec.build_default_params(const=0.75)
+    model = RecordingPascucci(
+        Xi_generator=spec.xi_generator,
+        T=0.25,
+        M=4,
+        N=3,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        terminal_blob=None,
+        normalize_time_input=True,
+    )
+
+    try:
+        t_batch, W_batch, Xi_batch = model.fetch_minibatch()
+        result = model.loss_function(
+            t_batch,
+            W_batch,
+            Xi_batch,
+            const_value=0.75,
+            return_runtime_diagnostics=True,
+        )
+        assert len(result) == 5
+        loss, X, Y, Z, diagnostics = result
+        del loss, Y, Z
+
+        X_np = X.numpy()
+        expected = {
+            "mean_v": np.mean(X_np[:, :, [2]], axis=0),
+            "mean_q": np.mean(X_np[:, :, [3]], axis=0),
+            "mean_h_plus_v": np.mean(X_np[:, :, [1]] + X_np[:, :, [2]], axis=0),
+        }
+        assert set(diagnostics) == set(expected)
+        assert len(model.diagnostic_contexts) >= X_np.shape[1]
+        for step in range(X_np.shape[1]):
+            assert model.diagnostic_contexts[step] is model.built_contexts[step]
+        for key, expected_trace in expected.items():
+            value = diagnostics[key]
+            value_np = value.numpy() if hasattr(value, "numpy") else np.asarray(value)
+            assert value_np.shape == (X_np.shape[1], 1), (key, value_np.shape)
+            assert value_np.dtype == np.float32, (key, value_np.dtype)
+            assert np.isfinite(value_np).all(), key
+            np.testing.assert_allclose(value_np, expected_trace, rtol=1.0e-6, atol=1.0e-6)
+    finally:
+        model.close()
+
+
+def test_quadratic_runtime_moment_diagnostics_are_noop() -> None:
+    from .model_specs import get_model_spec
+    from .models import NN_Quadratic_Coupled_Recursive
+    from .tf_backend import reset_backend_state, set_seed
+
+    reset_backend_state()
+    set_seed(73)
+
+    spec = get_model_spec("quadratic_coupled")
+    params = spec.build_default_params(const=1.0)
+    model = NN_Quadratic_Coupled_Recursive(
+        Xi_generator=spec.xi_generator,
+        T=0.25,
+        M=4,
+        N=2,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        terminal_blob=None,
+        normalize_time_input=True,
+    )
+
+    try:
+        t_batch, W_batch, Xi_batch = model.fetch_minibatch()
+        loss, X, Y, Z = model.loss_function(t_batch, W_batch, Xi_batch, const_value=1.0)
+        diagnostic_result = model.loss_function(
+            t_batch,
+            W_batch,
+            Xi_batch,
+            const_value=1.0,
+            return_runtime_diagnostics=True,
+        )
+        assert len(diagnostic_result) == 5
+        loss_diag, X_diag, Y_diag, Z_diag, diagnostics = diagnostic_result
+        np.testing.assert_allclose(loss_diag.numpy(), loss.numpy(), rtol=1.0e-6, atol=1.0e-6)
+        np.testing.assert_allclose(X_diag.numpy(), X.numpy(), rtol=1.0e-6, atol=1.0e-6)
+        np.testing.assert_allclose(Y_diag.numpy(), Y.numpy(), rtol=1.0e-6, atol=1.0e-6)
+        np.testing.assert_allclose(Z_diag.numpy(), Z.numpy(), rtol=1.0e-6, atol=1.0e-6)
+        assert diagnostics == {}
+
+        pred = model.predict(Xi_batch, t_batch, W_batch, const_value=1.0)
+        pred_diag = model.predict(
+            Xi_batch,
+            t_batch,
+            W_batch,
+            const_value=1.0,
+            return_runtime_diagnostics=True,
+        )
+        assert len(pred_diag) == 4
+        for actual, expected in zip(pred_diag[:3], pred):
+            np.testing.assert_allclose(actual, expected, rtol=1.0e-6, atol=1.0e-6)
+        assert pred_diag[3] == {}
+
+        stats = model.evaluate(const_value=1.0, n_batches=1)
+        assert not any("block_end_mean" in key for key in stats)
+    finally:
+        model.close()
+
+
+def test_pascucci_evaluate_reports_block_end_moment_scalars() -> None:
+    from .model_specs import get_model_spec
+    from .models import NN_Pascucci_Recursive
+    from .tf_backend import reset_backend_state, set_seed
+
+    class DeterministicDiagnosticPascucci(NN_Pascucci_Recursive):
+        def __init__(self, *args, **kwargs):
+            self.diagnostic_call = 0
+            super().__init__(*args, **kwargs)
+
+        def loss_context_diagnostics_tf(self, loss_context):
+            del loss_context
+            self.diagnostic_call += 1
+            offset = np.float32(self.diagnostic_call)
+            return {
+                "mean_v": np.asarray([[offset]], dtype=np.float32),
+                "mean_q": np.asarray([[offset + 1.0]], dtype=np.float32),
+                "mean_h_plus_v": np.asarray([[offset + 2.0]], dtype=np.float32),
+            }
+
+    reset_backend_state()
+    set_seed(79)
+
+    spec = get_model_spec("pascucci")
+    params = spec.build_default_params(const=0.75)
+    model = DeterministicDiagnosticPascucci(
+        Xi_generator=spec.xi_generator,
+        T=0.25,
+        M=4,
+        N=1,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        terminal_blob=None,
+        normalize_time_input=True,
+    )
+
+    try:
+        stats = model.evaluate(const_value=0.75, n_batches=2)
+        expected_values = {
+            "mean_block_end_mean_v": np.mean([2.0, 4.0]),
+            "std_block_end_mean_v": np.std([2.0, 4.0]),
+            "mean_block_end_mean_q": np.mean([3.0, 5.0]),
+            "std_block_end_mean_q": np.std([3.0, 5.0]),
+            "mean_block_end_mean_h_plus_v": np.mean([4.0, 6.0]),
+            "std_block_end_mean_h_plus_v": np.std([4.0, 6.0]),
+        }
+        for key, expected in expected_values.items():
+            assert key in stats, f"{key} missing from evaluate stats: {sorted(stats)}"
+            assert isinstance(stats[key], float)
+            assert np.isfinite(stats[key])
+            np.testing.assert_allclose(stats[key], expected, rtol=1.0e-6, atol=1.0e-6)
+    finally:
+        model.close()
+
+
 def test_pascucci_f_mu_select_z_v_from_full_z() -> None:
     from .model_specs import get_model_spec
     from .models import NN_Pascucci
@@ -1412,6 +1608,369 @@ def test_predict_recursive_stitched_two_block_model_spec() -> None:
     np.testing.assert_allclose(explicit["X"][:, :3, :], first["X"], atol=1.0e-6)
     np.testing.assert_allclose(second["X"][:, 0, :], first["X"][:, -1, :], atol=1.0e-6)
     np.testing.assert_allclose(explicit["X"][:, 3:, :], second["X"][:, 1:, :], atol=1.0e-6)
+
+
+def test_prefixed_eval_diagnostics_forwards_scalar_model_moments_only() -> None:
+    from .orchestration import _prefixed_eval_diagnostics
+
+    diagnostics = _prefixed_eval_diagnostics(
+        {
+            "mean_loss": 1.0,
+            "std_loss": 0.0,
+            "mean_loss_dynamic": 0.25,
+            "std_loss_dynamic": 0.01,
+            "mean_block_end_mean_v": np.float32(1.25),
+            "std_block_end_mean_v": np.float32(0.05),
+            "mean_trace_mean_v": np.asarray([1.0, 2.0], dtype=np.float32),
+            "mean_unrelated_scalar": np.float32(0.33),
+            "std_bad": np.float32(np.inf),
+            "mean_bad": "not-a-number",
+            "terminal_mean_v": np.float32(9.0),
+        }
+    )
+
+    np.testing.assert_allclose(diagnostics["eval_mean_loss_dynamic"], 0.25)
+    np.testing.assert_allclose(diagnostics["eval_std_loss_dynamic"], 0.01)
+    np.testing.assert_allclose(diagnostics["eval_mean_block_end_mean_v"], 1.25)
+    np.testing.assert_allclose(diagnostics["eval_std_block_end_mean_v"], 0.05)
+    assert "eval_mean_loss" not in diagnostics
+    assert "eval_std_loss" not in diagnostics
+    assert "eval_mean_trace_mean_v" not in diagnostics
+    assert "eval_mean_unrelated_scalar" not in diagnostics
+    assert "eval_std_bad" not in diagnostics
+    assert "eval_mean_bad" not in diagnostics
+    assert "eval_terminal_mean_v" not in diagnostics
+
+
+def test_predict_recursive_stitched_pascucci_moment_traces() -> None:
+    from .model_specs import get_model_spec
+    from .orchestration import predict_recursive_stitched
+    from .tf_backend import set_seed
+
+    set_seed(83)
+    spec = get_model_spec("pascucci")
+    params = spec.build_default_params(const=0.75)
+    layers = [5, 8, 1]
+    D = 4
+    M = 4
+    N_per_block = 2
+    T_total = 0.5
+    blocks = build_blocks(T_total=T_total, block_size=0.25)
+    blobs = [
+        _make_block_blob(layers, block["t_start"], block["t_end"], T_total)
+        for block in blocks
+    ]
+    Xi = spec.deterministic_xi(M, D, seed=83)
+    rollout = build_stitched_rollout_inputs(
+        blocks=blocks,
+        M=M,
+        N_per_block=N_per_block,
+        D=D,
+        seed=84,
+    )
+
+    stitched = predict_recursive_stitched(
+        block_blobs=blobs,
+        blocks=blocks,
+        Xi_initial=Xi,
+        params=params,
+        N_per_block=N_per_block,
+        D=D,
+        layers=layers,
+        T_total=T_total,
+        rollout_inputs=rollout,
+        coupling_const=0.75,
+        model_spec=spec,
+    )
+
+    expected = {
+        "mean_v": np.mean(stitched["X"][:, :, [2]], axis=0),
+        "mean_q": np.mean(stitched["X"][:, :, [3]], axis=0),
+        "mean_h_plus_v": np.mean(
+            stitched["X"][:, :, [1]] + stitched["X"][:, :, [2]],
+            axis=0,
+        ),
+    }
+    for key, expected_trace in expected.items():
+        assert key in stitched, f"{key} missing from stitched keys: {sorted(stitched)}"
+        assert stitched[key].shape == (len(blocks) * N_per_block + 1, 1)
+        assert stitched[key].dtype == np.float32
+        np.testing.assert_allclose(stitched[key], expected_trace, rtol=1.0e-6, atol=1.0e-6)
+
+    quadratic_spec = get_model_spec("quadratic_coupled")
+    quadratic = predict_recursive_stitched(
+        block_blobs=blobs,
+        blocks=blocks,
+        Xi_initial=quadratic_spec.deterministic_xi(M, D, seed=83),
+        params=quadratic_spec.build_default_params(const=1.0),
+        N_per_block=N_per_block,
+        D=D,
+        layers=layers,
+        T_total=T_total,
+        rollout_inputs=rollout,
+        model_spec=quadratic_spec,
+    )
+    assert set(quadratic) == {"t", "X", "Y", "Z"}
+    for key in expected:
+        assert key not in quadratic
+
+
+def test_predict_recursive_stitched_carries_model_owned_diagnostics_without_recomputing() -> None:
+    from .orchestration import predict_recursive_stitched
+
+    class FakeSession:
+        def close(self) -> None:
+            pass
+
+    class FakeModel:
+        def __init__(self, block_idx: int, D: int) -> None:
+            self.block_idx = int(block_idx)
+            self.D = int(D)
+            self.sess = FakeSession()
+
+        def import_parameter_blob(self, blob, strict=True) -> None:
+            del blob, strict
+
+        def predict(self, Xi_star, t_star, W_star, const_value=None, return_runtime_diagnostics=False):
+            del W_star, const_value
+            assert return_runtime_diagnostics is True, (
+                "predict_recursive_stitched must request model-owned runtime diagnostics"
+            )
+            M = int(Xi_star.shape[0])
+            steps = int(t_star.shape[1])
+            X = np.zeros((M, steps, self.D), dtype=np.float32)
+            Y = np.zeros((M, steps, 1), dtype=np.float32)
+            Z = np.zeros((M, steps, self.D), dtype=np.float32)
+            start = np.float32(100 + self.block_idx * 2)
+            diagnostics = {
+                "mean_v": np.asarray([[start], [start + 1.0], [start + 2.0]], dtype=np.float32),
+                "mean_q": np.asarray([[start + 10.0], [start + 11.0], [start + 12.0]], dtype=np.float32),
+                "mean_h_plus_v": np.asarray([[start + 20.0], [start + 21.0], [start + 22.0]], dtype=np.float32),
+            }
+            return X, Y, Z, diagnostics
+
+    class FakeSpec:
+        name = "sentinel_model"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def validate_state_dim(self, D: int) -> None:
+            assert int(D) == 4
+
+        def build_recursive_model(self, **kwargs):
+            model = FakeModel(block_idx=self.calls, D=kwargs["D"])
+            self.calls += 1
+            return model
+
+    D = 4
+    M = 4
+    N_per_block = 2
+    blocks = build_blocks(T_total=0.5, block_size=0.25)
+    rollout = build_stitched_rollout_inputs(
+        blocks=blocks,
+        M=M,
+        N_per_block=N_per_block,
+        D=D,
+        seed=91,
+    )
+    stitched = predict_recursive_stitched(
+        block_blobs=[{}, {}],
+        blocks=blocks,
+        Xi_initial=np.zeros((M, D), dtype=np.float32),
+        params={},
+        N_per_block=N_per_block,
+        D=D,
+        layers=[5, 8, 1],
+        T_total=0.5,
+        rollout_inputs=rollout,
+        model_spec=FakeSpec(),
+    )
+
+    np.testing.assert_allclose(
+        stitched["mean_v"],
+        np.asarray([[100.0], [101.0], [102.0], [103.0], [104.0]], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        stitched["mean_q"],
+        np.asarray([[110.0], [111.0], [112.0], [113.0], [114.0]], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        stitched["mean_h_plus_v"],
+        np.asarray([[120.0], [121.0], [122.0], [123.0], [124.0]], dtype=np.float32),
+    )
+    assert np.all(stitched["X"] == 0.0)
+
+
+def test_predict_recursive_stitched_accepts_legacy_three_value_predict() -> None:
+    from .orchestration import predict_recursive_stitched
+
+    class FakeSession:
+        def close(self) -> None:
+            pass
+
+    class LegacyModel:
+        def __init__(self, block_idx: int, D: int) -> None:
+            self.block_idx = int(block_idx)
+            self.D = int(D)
+            self.sess = FakeSession()
+
+        def import_parameter_blob(self, blob, strict=True) -> None:
+            del blob, strict
+
+        def predict(self, Xi_star, t_star, W_star, const_value=None):
+            del W_star
+            assert np.isclose(float(const_value), 1.0)
+            M = int(Xi_star.shape[0])
+            steps = int(t_star.shape[1])
+            X = np.tile(Xi_star[:, None, :], (1, steps, 1)).astype(np.float32)
+            X = X + np.float32(self.block_idx)
+            Y = np.zeros((M, steps, 1), dtype=np.float32)
+            Z = np.zeros((M, steps, self.D), dtype=np.float32)
+            return X, Y, Z
+
+    class LegacySpec:
+        name = "legacy_sentinel"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def validate_state_dim(self, D: int) -> None:
+            assert int(D) == 4
+
+        def build_recursive_model(self, **kwargs):
+            model = LegacyModel(block_idx=self.calls, D=kwargs["D"])
+            self.calls += 1
+            return model
+
+    D = 4
+    M = 4
+    N_per_block = 2
+    blocks = build_blocks(T_total=0.5, block_size=0.25)
+    rollout = build_stitched_rollout_inputs(
+        blocks=blocks,
+        M=M,
+        N_per_block=N_per_block,
+        D=D,
+        seed=93,
+    )
+    spec = LegacySpec()
+    stitched = predict_recursive_stitched(
+        block_blobs=[{}, {}],
+        blocks=blocks,
+        Xi_initial=np.zeros((M, D), dtype=np.float32),
+        params={},
+        N_per_block=N_per_block,
+        D=D,
+        layers=[5, 8, 1],
+        T_total=0.5,
+        rollout_inputs=rollout,
+        model_spec=spec,
+    )
+
+    assert spec.calls == 2
+    assert set(stitched) == {"t", "X", "Y", "Z"}
+    assert stitched["t"].shape == (M, 5, 1)
+    assert stitched["X"].shape == (M, 5, D)
+    assert stitched["Y"].shape == (M, 5, 1)
+    assert stitched["Z"].shape == (M, 5, D)
+
+
+def test_print_recursive_pass_saves_stitched_moment_traces() -> None:
+    from . import orchestration
+    from .model_specs import get_model_spec
+
+    spec = get_model_spec("pascucci")
+    params = spec.build_default_params(const=0.75)
+    layers = [5, 8, 1]
+    D = 4
+    blocks = [{"idx": 0, "t_start": 0.0, "t_end": 0.25, "T_block": 0.25}]
+    logs = [
+        {
+            "pass": 1,
+            "block": 0,
+            "t_start": 0.0,
+            "t_end": 0.25,
+            "T_block": 0.25,
+            "eval_mean_loss": 1.0,
+            "eval_std_loss": 0.0,
+            "eval_mean_loss_per_sample": 0.25,
+            "eval_std_loss_per_sample": 0.0,
+            "eval_mean_y0": 0.0,
+            "precision_target": None,
+            "refine_rounds": 0,
+        }
+    ]
+
+    def fake_predict_recursive_stitched(**kwargs):
+        M = int(kwargs["Xi_initial"].shape[0])
+        t = np.tile(
+            np.asarray([0.0, 0.125, 0.25], dtype=np.float32).reshape(1, 3, 1),
+            (M, 1, 1),
+        )
+        X = np.zeros((M, 3, D), dtype=np.float32)
+        X[:, :, 1] = np.asarray([0.5, 0.25, 0.0], dtype=np.float32)
+        X[:, :, 2] = np.asarray([0.1, 0.2, 0.3], dtype=np.float32)
+        X[:, :, 3] = np.asarray([4.0, 4.5, 5.0], dtype=np.float32)
+        return {
+            "t": t,
+            "X": X,
+            "Y": np.zeros((M, 3, 1), dtype=np.float32),
+            "Z": np.zeros((M, 3, D), dtype=np.float32),
+            "mean_v": np.asarray([[0.1], [0.2], [0.3]], dtype=np.float32),
+            "mean_q": np.asarray([[4.0], [4.5], [5.0]], dtype=np.float32),
+            "mean_h_plus_v": np.asarray([[0.6], [0.45], [0.3]], dtype=np.float32),
+        }
+
+    original_predict = orchestration.predict_recursive_stitched
+    original_plot_logs = orchestration.plot_recursive_pass_logs_multi
+    original_plot_stitched = orchestration.plot_recursive_stitched_predictions
+    original_plot_convergence = orchestration.plot_recursive_stitched_y_convergence
+    orchestration.predict_recursive_stitched = fake_predict_recursive_stitched
+    orchestration.plot_recursive_pass_logs_multi = lambda *args, **kwargs: None
+    orchestration.plot_recursive_stitched_predictions = lambda *args, **kwargs: None
+    orchestration.plot_recursive_stitched_y_convergence = lambda *args, **kwargs: None
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            rec_dir = Path(tmp)
+            orchestration.print_recursive_pass(
+                pass_entries=[{"pass_id": 1, "logs": logs, "blobs": [_make_blob(layers)]}],
+                blocks=blocks,
+                rec_dir=str(rec_dir),
+                params=params,
+                N_per_block=2,
+                D=D,
+                layers=layers,
+                T_total=0.25,
+                exact_solution=None,
+                selection_metric="loss",
+                eval_bundle_path=str(rec_dir / "evaluation_bundle.npz"),
+                eval_seed=101,
+                eval_min_paths=4,
+                sample_paths=0,
+                print_compact_logs=False,
+                model_spec=spec,
+            )
+            for filename in (
+                "stitched_predictions_pass00.npz",
+                "stitched_predictions_final.npz",
+            ):
+                path = rec_dir / filename
+                assert path.exists(), filename
+                with np.load(path) as data:
+                    keys = set(data.files)
+                    assert {"t", "X", "Y", "Z"}.issubset(keys)
+                    for key in ("mean_v", "mean_q", "mean_h_plus_v"):
+                        assert key in keys, f"{key} missing from {filename}: {sorted(keys)}"
+                        assert data[key].shape == (3, 1)
+                    assert "block_params" not in keys
+                    assert not any(key.startswith(("params_", "weights_")) for key in keys)
+    finally:
+        orchestration.predict_recursive_stitched = original_predict
+        orchestration.plot_recursive_pass_logs_multi = original_plot_logs
+        orchestration.plot_recursive_stitched_predictions = original_plot_stitched
+        orchestration.plot_recursive_stitched_y_convergence = original_plot_convergence
 
 
 def test_recursive_coarse_prepass_model_spec_argument() -> None:
@@ -2126,6 +2685,14 @@ def test_recursive_visual_bundle_acceptance() -> None:
         assert (tmp_path / "visual_stitched_predictions_pass00.npz").exists()
         assert (tmp_path / "visual_stitched_predictions_final.npz").exists()
         assert (tmp_path / "exact_metrics_final.json").exists()
+        for filename in (
+            "stitched_predictions_pass00.npz",
+            "stitched_predictions_final.npz",
+            "visual_stitched_predictions_pass00.npz",
+            "visual_stitched_predictions_final.npz",
+        ):
+            with np.load(tmp_path / filename) as data:
+                assert set(data.files) == {"t", "X", "Y", "Z"}
         if _PLOTTING_AVAILABLE:
             expected_plots = [
                 "recursive_stitched_Y_exact_pass00.png",
@@ -2377,6 +2944,18 @@ def run_tests(argv: List[str] | None = None) -> int:
         "test_pascucci_loss_function_forwards_model_owned_context",
     ) and ok
     ok = _run_subprocess_case(
+        "pascucci_runtime_moment_diagnostics_follow_loss_context",
+        "test_pascucci_runtime_moment_diagnostics_follow_loss_context",
+    ) and ok
+    ok = _run_subprocess_case(
+        "quadratic_runtime_moment_diagnostics_are_noop",
+        "test_quadratic_runtime_moment_diagnostics_are_noop",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_evaluate_reports_block_end_moment_scalars",
+        "test_pascucci_evaluate_reports_block_end_moment_scalars",
+    ) and ok
+    ok = _run_subprocess_case(
         "pascucci_f_mu_select_z_v_from_full_z",
         "test_pascucci_f_mu_select_z_v_from_full_z",
     ) and ok
@@ -2399,6 +2978,26 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "predict_recursive_stitched_two_block_model_spec",
         "test_predict_recursive_stitched_two_block_model_spec",
+    ) and ok
+    ok = _run_subprocess_case(
+        "prefixed_eval_diagnostics_forwards_scalar_model_moments_only",
+        "test_prefixed_eval_diagnostics_forwards_scalar_model_moments_only",
+    ) and ok
+    ok = _run_subprocess_case(
+        "predict_recursive_stitched_pascucci_moment_traces",
+        "test_predict_recursive_stitched_pascucci_moment_traces",
+    ) and ok
+    ok = _run_subprocess_case(
+        "predict_recursive_stitched_carries_model_owned_diagnostics_without_recomputing",
+        "test_predict_recursive_stitched_carries_model_owned_diagnostics_without_recomputing",
+    ) and ok
+    ok = _run_subprocess_case(
+        "predict_recursive_stitched_accepts_legacy_three_value_predict",
+        "test_predict_recursive_stitched_accepts_legacy_three_value_predict",
+    ) and ok
+    ok = _run_subprocess_case(
+        "print_recursive_pass_saves_stitched_moment_traces",
+        "test_print_recursive_pass_saves_stitched_moment_traces",
     ) and ok
     ok = _run_subprocess_case(
         "recursive_coarse_prepass_model_spec_argument",
