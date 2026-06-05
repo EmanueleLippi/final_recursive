@@ -639,6 +639,186 @@ def test_pascucci_equations_accept_explicit_mean_field_moments() -> None:
         model.close()
 
 
+def test_quadratic_loss_context_hook_is_noop() -> None:
+    from .model_specs import get_model_spec
+    from .models import NN_Quadratic_Coupled_Recursive
+    from .tf_backend import reset_backend_state, set_seed, tf
+
+    class RecordingQuadratic(NN_Quadratic_Coupled_Recursive):
+        def __init__(self, *args, **kwargs):
+            self.sigma_contexts = []
+            self.mu_contexts = []
+            self.phi_contexts = []
+            self.g_contexts = []
+            self.dg_contexts = []
+            super().__init__(*args, **kwargs)
+
+        def sigma_tf(self, t, X, Y, moment_state=None):
+            self.sigma_contexts.append(moment_state)
+            return super().sigma_tf(t, X, Y, moment_state=moment_state)
+
+        def mu_tf(self, t, X, Y, Z, moment_state=None):
+            self.mu_contexts.append(moment_state)
+            return super().mu_tf(t, X, Y, Z, moment_state=moment_state)
+
+        def phi_tf(self, t, X, Y, Z, moment_state=None):
+            self.phi_contexts.append(moment_state)
+            return super().phi_tf(t, X, Y, Z, moment_state=moment_state)
+
+        def g_tf(self, X, moment_state=None):
+            self.g_contexts.append(moment_state)
+            return super().g_tf(X, moment_state=moment_state)
+
+        def Dg_tf(self, X, moment_state=None):
+            self.dg_contexts.append(moment_state)
+            return super().Dg_tf(X, moment_state=moment_state)
+
+    reset_backend_state()
+    set_seed(61)
+
+    spec = get_model_spec("quadratic_coupled")
+    params = spec.build_default_params(const=1.0)
+    model = RecordingQuadratic(
+        Xi_generator=spec.xi_generator,
+        T=0.25,
+        M=4,
+        N=2,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        terminal_blob=None,
+        normalize_time_input=True,
+    )
+
+    try:
+        t_batch, W_batch, Xi_batch = model.fetch_minibatch()
+        t0 = tf.convert_to_tensor(t_batch[:, 0, :])
+        X0 = tf.convert_to_tensor(Xi_batch)
+        Y0, _ = model.net_u(t0, X0)
+
+        assert hasattr(model, "build_loss_context_tf")
+        assert model.build_loss_context_tf(t0, X0, Y0) is None
+        loss, X, Y, Z = model.loss_function(
+            t_batch,
+            W_batch,
+            Xi_batch,
+            const_value=1.0,
+        )
+        del loss, X, Y, Z
+        for name, contexts in (
+            ("sigma_tf", model.sigma_contexts),
+            ("mu_tf", model.mu_contexts),
+            ("phi_tf", model.phi_contexts),
+            ("g_tf", model.g_contexts),
+            ("Dg_tf", model.dg_contexts),
+        ):
+            assert contexts, f"{name} was not exercised"
+            assert all(context is None for context in contexts), (
+                f"{name} received a non-null runtime context"
+            )
+    finally:
+        model.close()
+
+
+def test_pascucci_loss_function_forwards_model_owned_context() -> None:
+    from .model_specs import get_model_spec
+    from .models import NN_Pascucci_Recursive
+    from .tf_backend import reset_backend_state, set_seed, tf
+
+    class RecordingPascucci(NN_Pascucci_Recursive):
+        def __init__(self, *args, **kwargs):
+            self.context_states = []
+            self.built_contexts = []
+            self.sigma_contexts = []
+            self.mu_contexts = []
+            self.phi_contexts = []
+            self.g_contexts = []
+            self.dg_contexts = []
+            super().__init__(*args, **kwargs)
+
+        def build_loss_context_tf(self, t, X, Y):
+            del t, Y
+            self.context_states.append(tf.identity(tf.cast(X, tf.float32)))
+            context = self.mean_field_moments_tf(X)
+            self.built_contexts.append(context)
+            return context
+
+        def sigma_tf(self, t, X, Y, moment_state=None):
+            self.sigma_contexts.append(moment_state)
+            return super().sigma_tf(t, X, Y, moment_state=moment_state)
+
+        def mu_tf(self, t, X, Y, Z, moment_state=None):
+            self.mu_contexts.append(moment_state)
+            return super().mu_tf(t, X, Y, Z, moment_state=moment_state)
+
+        def phi_tf(self, t, X, Y, Z, moment_state=None):
+            self.phi_contexts.append(moment_state)
+            return super().phi_tf(t, X, Y, Z, moment_state=moment_state)
+
+        def g_tf(self, X, moment_state=None):
+            self.g_contexts.append(moment_state)
+            return super().g_tf(X, moment_state=moment_state)
+
+        def Dg_tf(self, X, moment_state=None):
+            self.dg_contexts.append(moment_state)
+            return tf.zeros_like(tf.cast(X, tf.float32))
+
+    reset_backend_state()
+    set_seed(67)
+
+    spec = get_model_spec("pascucci")
+    params = spec.build_default_params(const=0.75)
+    model = RecordingPascucci(
+        Xi_generator=spec.xi_generator,
+        T=0.25,
+        M=4,
+        N=3,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        terminal_blob=None,
+        normalize_time_input=True,
+    )
+
+    try:
+        t_batch, W_batch, Xi_batch = model.fetch_minibatch()
+        _, X, _, _ = model.loss_function(t_batch, W_batch, Xi_batch, const_value=0.75)
+        X_np = X.numpy()
+
+        assert len(model.context_states) >= X_np.shape[1]
+        for step, context_state in enumerate(model.context_states[: X_np.shape[1]]):
+            np.testing.assert_allclose(
+                context_state.numpy(),
+                X_np[:, step, :],
+                rtol=1.0e-6,
+                atol=1.0e-6,
+            )
+
+        terminal_context = model.built_contexts[X_np.shape[1] - 1]
+        assert model.g_contexts[-1] is terminal_context
+        assert model.dg_contexts[-1] is terminal_context
+
+        for name, contexts in (
+            ("sigma_tf", model.sigma_contexts),
+            ("mu_tf", model.mu_contexts),
+            ("phi_tf", model.phi_contexts),
+            ("g_tf", model.g_contexts),
+            ("Dg_tf", model.dg_contexts),
+        ):
+            assert contexts, f"{name} did not receive any runtime context"
+            assert all(context is not None for context in contexts), (
+                f"{name} received an implicit moment context"
+            )
+    finally:
+        model.close()
+
+
 def test_pascucci_f_mu_select_z_v_from_full_z() -> None:
     from .model_specs import get_model_spec
     from .models import NN_Pascucci
@@ -2187,6 +2367,14 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "pascucci_equations_accept_explicit_mean_field_moments",
         "test_pascucci_equations_accept_explicit_mean_field_moments",
+    ) and ok
+    ok = _run_subprocess_case(
+        "quadratic_loss_context_hook_is_noop",
+        "test_quadratic_loss_context_hook_is_noop",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_loss_function_forwards_model_owned_context",
+        "test_pascucci_loss_function_forwards_model_owned_context",
     ) and ok
     ok = _run_subprocess_case(
         "pascucci_f_mu_select_z_v_from_full_z",
