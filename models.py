@@ -226,11 +226,15 @@ class FBSNN(tf.Module, ABC):
             Du = tf.zeros_like(X)
         return u, Du
 
-    def Dg_tf(self, X):
+    def build_loss_context_tf(self, t, X, Y):
+        del t, X, Y
+        return None
+
+    def Dg_tf(self, X, moment_state=None):
         X = tf.cast(X, tf.float32)
         with tf.GradientTape() as tape:
             tape.watch(X)
-            value = self.g_tf(X)
+            value = self.g_tf(X, moment_state=moment_state)
         grad = tape.gradient(value, X)
         if grad is None:
             grad = tf.zeros_like(X)
@@ -253,7 +257,8 @@ class FBSNN(tf.Module, ABC):
         W0 = W[:, 0, :]
         X0 = Xi
         Y0, Du0 = self.net_u(t0, X0)
-        sigma0 = self.sigma_tf(t0, X0, Y0)
+        loss_context0 = self.build_loss_context_tf(t0, X0, Y0)
+        sigma0 = self.sigma_tf(t0, X0, Y0, moment_state=loss_context0)
         Z0 = tf.squeeze(tf.matmul(tf.expand_dims(Du0, 1), sigma0), axis=1)
 
         X_list.append(X0)
@@ -266,16 +271,21 @@ class FBSNN(tf.Module, ABC):
 
             dW = W1 - W0
             sigma_dW = tf.squeeze(tf.matmul(sigma0, tf.expand_dims(dW, -1)), axis=-1)
-            X1 = X0 + self.mu_tf(t0, X0, Y0, Z0) * (t1 - t0) + sigma_dW
+            X1 = (
+                X0
+                + self.mu_tf(t0, X0, Y0, Z0, moment_state=loss_context0) * (t1 - t0)
+                + sigma_dW
+            )
 
             Y1_tilde = (
                 Y0
-                + self.phi_tf(t0, X0, Y0, Z0) * (t1 - t0)
+                + self.phi_tf(t0, X0, Y0, Z0, moment_state=loss_context0) * (t1 - t0)
                 + tf.reduce_sum(Z0 * dW, axis=1, keepdims=True)
             )
 
             Y1, Du1 = self.net_u(t1, X1)
-            sigma1 = self.sigma_tf(t1, X1, Y1)
+            loss_context1 = self.build_loss_context_tf(t1, X1, Y1)
+            sigma1 = self.sigma_tf(t1, X1, Y1, moment_state=loss_context1)
             Z1 = tf.squeeze(tf.matmul(tf.expand_dims(Du1, 1), sigma1), axis=1)
 
             dynamic_residual_sq = tf.square(Y1 - Y1_tilde)
@@ -296,11 +306,12 @@ class FBSNN(tf.Module, ABC):
             X_list.append(X0)
             Y_list.append(Y0)
             Z_list.append(Z0)
+            loss_context0 = loss_context1
 
-        terminal_y_residual = Y1 - self.g_tf(X1)
+        terminal_y_residual = Y1 - self.g_tf(X1, moment_state=loss_context0)
         loss_terminal_y = tf.reduce_sum(tf.square(terminal_y_residual))
 
-        Dg = self.Dg_tf(X1)
+        Dg = self.Dg_tf(X1, moment_state=loss_context0)
         Z_terminal = tf.squeeze(tf.matmul(tf.expand_dims(Dg, 1), sigma1), axis=1)
         terminal_z_residual = Z1 - Z_terminal
         loss_terminal_z = tf.reduce_sum(tf.square(terminal_z_residual))
@@ -709,6 +720,10 @@ class NN_Pascucci(FBSNN):
         tf_params["omega"] = 2.0 * np.pi * np.arange(1, k + 1, dtype=np.float32) / 24.0
         return tf_params
 
+    def build_loss_context_tf(self, t, X, Y):
+        del t, Y
+        return self.mean_field_moments_tf(X)
+
     def is_day_tf(self, t):
         hour = tf.math.floormod(t, 24.0)
         return tf.logical_and(hour >= 7.0, hour < 19.0)
@@ -992,13 +1007,13 @@ class NN_Pascucci_Recursive(NN_Pascucci):
         )
         return self._terminal_u(t_eval, X)
 
-    def Dg_tf(self, X):
+    def Dg_tf(self, X, moment_state=None):
         if self.terminal_blob is None:
-            return super().Dg_tf(X)
+            return super().Dg_tf(X, moment_state=moment_state)
         X = tf.cast(X, tf.float32)
         with tf.GradientTape() as tape:
             tape.watch(X)
-            value = self.g_tf(X)
+            value = self.g_tf(X, moment_state=moment_state)
         grad = tape.gradient(value, X)
         if grad is None:
             grad = tf.zeros_like(X)
@@ -1104,7 +1119,8 @@ class NN_Quadratic_Coupled(FBSNN):
         exp_S = tf.exp(-S)
         return -0.5 * V * self.psi(-exp_S * Z_S / (gamma * s1))
 
-    def mu_tf(self, t, X, Y, Z):
+    def mu_tf(self, t, X, Y, Z, moment_state=None):
+        del moment_state
         S, H, V, X_state = tf.split(X, num_or_size_splits=4, axis=1)
         mu1 = tf.cast(self.mu1, tf.float32)
         mu2 = tf.cast(self.mu2, tf.float32)
@@ -1125,13 +1141,15 @@ class NN_Quadratic_Coupled(FBSNN):
         dX = V
         return tf.concat([dS, dH, dV, dX], axis=1)
 
-    def g_tf(self, X):
+    def g_tf(self, X, moment_state=None):
+        del moment_state
         S, H, V, X_state = tf.split(X, num_or_size_splits=4, axis=1)
         gamma = tf.cast(self.gamma, tf.float32)
         exp_S = tf.exp(S)
         return -gamma * exp_S * X_state + V ** 2 + V * X_state
 
-    def phi_tf(self, t, X, Y, Z):
+    def phi_tf(self, t, X, Y, Z, moment_state=None):
+        del moment_state
         S, H, V, X_state = tf.split(X, num_or_size_splits=4, axis=1)
         Z_S, Z_H, Z_V, _ = tf.split(Z, num_or_size_splits=4, axis=1)
 
@@ -1159,7 +1177,8 @@ class NN_Quadratic_Coupled(FBSNN):
 
         return term1 + term2 + term3 + term4 + term5
 
-    def sigma_tf(self, t, X, Y):
+    def sigma_tf(self, t, X, Y, moment_state=None):
+        del moment_state
         S, H, V, X_state = tf.split(X, num_or_size_splits=4, axis=1)
         s1 = tf.cast(self.s1, tf.float32)
         s2 = tf.cast(self.s2, tf.float32)
@@ -1301,21 +1320,21 @@ class NN_Quadratic_Coupled_Recursive(NN_Quadratic_Coupled):
             tf.concat([t_in, X_in], 1), self._terminal_weights_tf, self._terminal_biases_tf
         )
 
-    def g_tf(self, X):
+    def g_tf(self, X, moment_state=None):
         if self.terminal_blob is None:
-            return super().g_tf(X)
+            return super().g_tf(X, moment_state=moment_state)
         t_eval = tf.ones([tf.shape(X)[0], 1], dtype=tf.float32) * tf.constant(
             self.t_end, dtype=tf.float32
         )
         return self._terminal_u(t_eval, X)
 
-    def Dg_tf(self, X):
+    def Dg_tf(self, X, moment_state=None):
         if self.terminal_blob is None:
-            return super().Dg_tf(X)
+            return super().Dg_tf(X, moment_state=moment_state)
         X = tf.cast(X, tf.float32)
         with tf.GradientTape() as tape:
             tape.watch(X)
-            value = self.g_tf(X)
+            value = self.g_tf(X, moment_state=moment_state)
         grad = tape.gradient(value, X)
         if grad is None:
             grad = tf.zeros_like(X)
