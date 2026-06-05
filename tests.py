@@ -280,6 +280,10 @@ def _pascucci_h(x: np.ndarray) -> np.ndarray:
     return np.where(x < x_mean, (x - x_mean) ** 2, 2.0 * (x - x_mean) ** 2).astype(np.float32)
 
 
+def _pascucci_h_with_mean(x: np.ndarray, x_mean: np.ndarray) -> np.ndarray:
+    return np.where(x < x_mean, (x - x_mean) ** 2, 2.0 * (x - x_mean) ** 2).astype(np.float32)
+
+
 def _pascucci_ou_mu_daynight(t: np.ndarray, params: dict) -> np.ndarray:
     t = t.astype(np.float32)
     omega = (2.0 * np.pi * np.arange(1, len(np.asarray(params["alpha_day"])) + 1, dtype=np.float32) / 24.0).reshape(1, -1)
@@ -403,6 +407,237 @@ def test_pascucci_equation_fixtures() -> None:
     phi = model.phi_tf(tf.convert_to_tensor(t), tf.convert_to_tensor(X), tf.convert_to_tensor(Y), tf.convert_to_tensor(Z)).numpy()
     np.testing.assert_allclose(phi, -f_np, rtol=1.0e-6, atol=1.0e-6)
     model.close()
+
+
+def test_model_spec_mean_field_moment_names() -> None:
+    from .model_specs import get_model_spec
+
+    assert get_model_spec("quadratic_coupled").moment_names == ()
+    assert get_model_spec("pascucci").moment_names == (
+        "mean_v",
+        "mean_q",
+        "mean_h_plus_v",
+    )
+
+
+def test_pascucci_mean_field_moments_contract() -> None:
+    from .model_specs import get_model_spec
+    from .models import NN_Pascucci, PascucciMeanFieldMoments
+    from .tf_backend import tf
+
+    spec = get_model_spec("pascucci")
+    params = spec.build_default_params(const=0.77)
+    model = NN_Pascucci(
+        Xi_generator_default,
+        0.25,
+        4,
+        2,
+        4,
+        [5, 8, 1],
+        params,
+    )
+
+    try:
+        X = np.array(
+            [
+                [1.2, 0.4, 0.2, 4.5],
+                [-0.4, -0.2, -0.1, 7.7],
+                [5.2, 1.0, 0.5, 2.2],
+                [3.1, -0.5, -0.3, 0.8],
+            ],
+            dtype=np.float32,
+        )
+        moments = model.mean_field_moments_tf(tf.convert_to_tensor(X))
+
+        assert isinstance(moments, PascucciMeanFieldMoments)
+        for name in ("mean_v", "mean_q", "mean_h_plus_v"):
+            value_np = getattr(moments, name).numpy()
+            assert value_np.shape == (1, 1), f"{name} shape {value_np.shape}"
+            assert value_np.dtype == np.float32, f"{name} dtype {value_np.dtype}"
+            assert np.isfinite(value_np).all(), f"{name} contains non-finite values"
+
+        np.testing.assert_allclose(moments.mean_v.numpy(), np.mean(X[:, [2]], axis=0, keepdims=True))
+        np.testing.assert_allclose(moments.mean_q.numpy(), np.mean(X[:, [3]], axis=0, keepdims=True))
+        np.testing.assert_allclose(
+            moments.mean_h_plus_v.numpy(),
+            np.mean(X[:, [1]] + X[:, [2]], axis=0, keepdims=True),
+        )
+    finally:
+        model.close()
+
+
+def test_pascucci_equations_accept_explicit_mean_field_moments() -> None:
+    from .model_specs import get_model_spec
+    from .models import NN_Pascucci, PascucciMeanFieldMoments
+    from .tf_backend import tf
+
+    spec = get_model_spec("pascucci")
+    z_v_index = spec.z_labels.index("Z_V")
+    params = spec.build_default_params(const=0.77)
+    model = NN_Pascucci(
+        Xi_generator_default,
+        0.25,
+        4,
+        2,
+        4,
+        [5, 8, 1],
+        params,
+    )
+
+    try:
+        X = np.array(
+            [
+                [1.2, 0.4, 0.2, 4.5],
+                [-0.4, -0.2, -0.1, 7.7],
+                [5.2, 1.0, 0.5, 2.2],
+                [3.1, -0.5, -0.3, 0.8],
+            ],
+            dtype=np.float32,
+        )
+        Y = np.array([[0.1], [0.2], [-0.1], [0.3]], dtype=np.float32)
+        Z = np.array(
+            [
+                [0.1, 0.2, -0.3, 0.4],
+                [0.2, -0.1, 0.4, -0.5],
+                [0.3, 0.0, 0.2, -0.1],
+                [0.4, -0.2, -0.1, 0.2],
+            ],
+            dtype=np.float32,
+        )
+        t = np.zeros((4, 1), dtype=np.float32)
+
+        t_tf = tf.convert_to_tensor(t)
+        X_tf = tf.convert_to_tensor(X)
+        Y_tf = tf.convert_to_tensor(Y)
+        Z_tf = tf.convert_to_tensor(Z)
+
+        fallback_moments = model.mean_field_moments_tf(X_tf)
+        custom_moments = PascucciMeanFieldMoments(
+            mean_v=tf.constant([[1.25]], dtype=tf.float32),
+            mean_q=tf.constant([[3.0]], dtype=tf.float32),
+            mean_h_plus_v=tf.constant([[0.75]], dtype=tf.float32),
+        )
+
+        np.testing.assert_allclose(
+            model.sigmaV_tf(t_tf, X_tf, moment_state=fallback_moments).numpy(),
+            model.sigmaV_tf(t_tf, X_tf).numpy(),
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+        np.testing.assert_allclose(
+            model.sigma_tf(t_tf, X_tf, Y_tf, moment_state=fallback_moments).numpy(),
+            model.sigma_tf(t_tf, X_tf, Y_tf).numpy(),
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+        np.testing.assert_allclose(
+            model.f_tf(t_tf, X_tf, Y_tf, Z_tf, moment_state=fallback_moments).numpy(),
+            model.f_tf(t_tf, X_tf, Y_tf, Z_tf).numpy(),
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+        np.testing.assert_allclose(
+            model.g_tf(X_tf, moment_state=fallback_moments).numpy(),
+            model.g_tf(X_tf).numpy(),
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+
+        S, H, V, Q = X[:, [0]], X[:, [1]], X[:, [2]], X[:, [3]]
+        mean_v = custom_moments.mean_v.numpy()
+        mean_q = custom_moments.mean_q.numpy()
+        mean_h_plus_v = custom_moments.mean_h_plus_v.numpy()
+
+        sigma_custom_np = (
+            float(params["s3"]) * np.ones_like(V, dtype=np.float32)
+            + float(params["s3h"]) * np.abs(H)
+            + float(params["s3v"]) * np.abs(V)
+            + float(params["s3k"]) * np.abs(V - mean_v)
+        )
+        alpha_custom_np = (
+            -(_pascucci_psi(Q, float(params["d"]), float(params["x_max"])) * Z[:, [z_v_index]])
+            / (2.0 * float(params["l_a"]) * np.maximum(sigma_custom_np, 1.0e-7))
+        ).astype(np.float32)
+        f_custom_np = (
+            np.exp(S) * (H + V)
+            + float(params["l_v"]) * V ** 2
+            + float(params["l_a"]) * alpha_custom_np ** 2
+            + float(params["c_h"]) * _pascucci_h_with_mean(Q, mean_q)
+            + float(params["c_con"]) * _pascucci_h_with_mean(H + V, mean_h_plus_v)
+        ).astype(np.float32)
+        g_custom_np = (
+            -float(params["gamma"]) * Q * np.exp(S)
+            + 0.5 * float(params["omega"]) * (Q - mean_q) ** 2
+        ).astype(np.float32)
+        mu_S_mean = _pascucci_ou_mu_daynight(t, params["params_S"])
+        mu_H_mean = _pascucci_ou_mu_daynight(t, params["params_H"])
+        kappa_S = float(params["params_S"]["kappa_night"])
+        kappa_H = float(params["params_H"]["kappa_night"])
+        dS_np = kappa_S * (mu_S_mean - S)
+        dH_np = kappa_H * (mu_H_mean - H)
+        dV_np = (
+            alpha_custom_np * _pascucci_psi(Q, float(params["d"]), float(params["x_max"]))
+            + float(params["c3"]) * _pascucci_psi2(Q, float(params["d"]), float(params["x_max"])) * _pascucci_psi3(V, float(params["d"]), float(params["v_max"]))
+            - float(params["c4"]) * _pascucci_psi1(Q, float(params["d"]), float(params["x_max"])) * _pascucci_psi4(V, float(params["d"]), float(params["v_min"]))
+        )
+        mu_custom_np = np.concatenate([dS_np, dH_np, dV_np, V], axis=1).astype(np.float32)
+
+        np.testing.assert_allclose(
+            model.alpha_tf(
+                t_tf,
+                X_tf,
+                Z_tf[:, z_v_index : z_v_index + 1],
+                moment_state=custom_moments,
+            ).numpy(),
+            alpha_custom_np,
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+        np.testing.assert_allclose(
+            model.sigmaV_tf(t_tf, X_tf, moment_state=custom_moments).numpy(),
+            sigma_custom_np,
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+        sigma_custom_tf = model.sigma_tf(t_tf, X_tf, Y_tf, moment_state=custom_moments).numpy()
+        np.testing.assert_allclose(
+            sigma_custom_tf[:, 2, 2:3],
+            sigma_custom_np,
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+        assert np.max(np.abs(sigma_custom_tf - model.sigma_tf(t_tf, X_tf, Y_tf).numpy())) > 1.0e-6
+        np.testing.assert_allclose(
+            model.f_tf(t_tf, X_tf, Y_tf, Z_tf, moment_state=custom_moments).numpy(),
+            f_custom_np,
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+        np.testing.assert_allclose(
+            model.mu_tf(t_tf, X_tf, Y_tf, Z_tf, moment_state=custom_moments).numpy(),
+            mu_custom_np,
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+        np.testing.assert_allclose(
+            model.g_tf(X_tf, moment_state=custom_moments).numpy(),
+            g_custom_np,
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+        np.testing.assert_allclose(
+            model.phi_tf(t_tf, X_tf, Y_tf, Z_tf, moment_state=custom_moments).numpy(),
+            -f_custom_np,
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+
+        assert np.max(np.abs(sigma_custom_np - model.sigmaV_tf(t_tf, X_tf).numpy())) > 1.0e-6
+        assert np.max(np.abs(f_custom_np - model.f_tf(t_tf, X_tf, Y_tf, Z_tf).numpy())) > 1.0e-6
+        assert np.max(np.abs(g_custom_np - model.g_tf(X_tf).numpy())) > 1.0e-6
+    finally:
+        model.close()
+
 
 def test_pascucci_f_mu_select_z_v_from_full_z() -> None:
     from .model_specs import get_model_spec
@@ -1940,6 +2175,18 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "pascucci_equation_fixtures",
         "test_pascucci_equation_fixtures",
+    ) and ok
+    ok = _run_subprocess_case(
+        "model_spec_mean_field_moment_names",
+        "test_model_spec_mean_field_moment_names",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_mean_field_moments_contract",
+        "test_pascucci_mean_field_moments_contract",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_equations_accept_explicit_mean_field_moments",
+        "test_pascucci_equations_accept_explicit_mean_field_moments",
     ) and ok
     ok = _run_subprocess_case(
         "pascucci_f_mu_select_z_v_from_full_z",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import time
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional
@@ -12,6 +13,13 @@ from .io_utils import _as_blob_dict, save_blob_npz
 from .tf_backend import assert_modern_tensorflow, tf
 
 assert_modern_tensorflow()
+
+
+@dataclass(frozen=True)
+class PascucciMeanFieldMoments:
+    mean_v: object
+    mean_q: object
+    mean_h_plus_v: object
 
 
 class _SessionShim:
@@ -609,21 +617,21 @@ class FBSNN(tf.Module, ABC):
         return [v.numpy().astype(np.float32) for v in (self.weights + self.biases)]
 
     @abstractmethod
-    def phi_tf(self, t, X, Y, Z):
+    def phi_tf(self, t, X, Y, Z, moment_state=None):
         pass
 
     @abstractmethod
-    def g_tf(self, X):
+    def g_tf(self, X, moment_state=None):
         pass
 
     @abstractmethod
-    def mu_tf(self, t, X, Y, Z):
+    def mu_tf(self, t, X, Y, Z, moment_state=None):
         M = tf.shape(X)[0]
         D = tf.shape(X)[1]
         return tf.zeros([M, D], dtype=tf.float32)
 
     @abstractmethod
-    def sigma_tf(self, t, X, Y):
+    def sigma_tf(self, t, X, Y, moment_state=None):
         M = tf.shape(X)[0]
         D = tf.shape(X)[1]
         return tf.linalg.diag(tf.ones([M, D], dtype=tf.float32))
@@ -763,36 +771,58 @@ class NN_Pascucci(FBSNN):
     def psi4(self, V):
         return tf.maximum(0.0, tf.minimum(1.0, (V - self.v_min) / self.d))
 
-    def h_tf(self, X_state):
-        X_mean = tf.reduce_mean(X_state, axis=0, keepdims=True)
-        return tf.where(X_state < X_mean, (X_state - X_mean) ** 2, 2.0 * (X_state - X_mean) ** 2)
+    def mean_field_moments_tf(self, X):
+        _, H, V, X_state = tf.split(tf.cast(X, tf.float32), num_or_size_splits=4, axis=1)
+        return PascucciMeanFieldMoments(
+            mean_v=tf.reduce_mean(V, axis=0, keepdims=True),
+            mean_q=tf.reduce_mean(X_state, axis=0, keepdims=True),
+            mean_h_plus_v=tf.reduce_mean(H + V, axis=0, keepdims=True),
+        )
 
-    def alpha_tf(self, t, X, Z_V):
-        S, H, V, X_state = tf.split(X, 4, axis=1)
-        denom = 2.0 * self.l_a * tf.maximum(self.sigmaV_tf(t, X), 1.0e-7)
+    def _mean_field_moments_or_default(self, X, moment_state=None):
+        return moment_state if moment_state is not None else self.mean_field_moments_tf(X)
+
+    def h_tf(self, X_state, mean_value=None):
+        if mean_value is None:
+            mean_value = tf.reduce_mean(X_state, axis=0, keepdims=True)
+        return tf.where(
+            X_state < mean_value,
+            (X_state - mean_value) ** 2,
+            2.0 * (X_state - mean_value) ** 2,
+        )
+
+    def alpha_tf(self, t, X, Z_V, moment_state=None):
+        _, _, _, X_state = tf.split(tf.cast(X, tf.float32), num_or_size_splits=4, axis=1)
+        denom = 2.0 * self.l_a * tf.maximum(
+            self.sigmaV_tf(t, X, moment_state=moment_state),
+            1.0e-7,
+        )
         return -(self.psi(X_state) * Z_V) / denom
 
-    def sigmaV_tf(self, t, X):
-        S, H, V, X_state = tf.split(X, 4, axis=1)
+    def sigmaV_tf(self, t, X, moment_state=None):
+        _, H, V, _ = tf.split(tf.cast(X, tf.float32), num_or_size_splits=4, axis=1)
+        moments = self._mean_field_moments_or_default(X, moment_state)
         return (
             self.s3 * tf.ones_like(V)
             + self.s3h * tf.math.abs(H)
             + self.s3v * tf.math.abs(V)
-            + self.s3k * tf.math.abs(V - tf.reduce_mean(V, axis=0, keepdims=True))
+            + self.s3k * tf.math.abs(V - moments.mean_v)
         )
 
-    def f_tf(self, t, X, Y, Z):
-        S, H, V, X_state = tf.split(X, num_or_size_splits=4, axis=1)
-        Z_S, Z_H, Z_V, _ = tf.split(Z, num_or_size_splits=4, axis=1)
+    def f_tf(self, t, X, Y, Z, moment_state=None):
+        S, H, V, X_state = tf.split(tf.cast(X, tf.float32), num_or_size_splits=4, axis=1)
+        _, _, Z_V, _ = tf.split(tf.cast(Z, tf.float32), num_or_size_splits=4, axis=1)
+        moments = self._mean_field_moments_or_default(X, moment_state)
         term1 = tf.exp(S) * (H + V)
         term2 = self.l_v * V ** 2
-        term3 = self.l_a * self.alpha_tf(t, X, Z_V) ** 2
-        term4 = self.c_h * self.h_tf(X_state)
-        term5 = self.c_con * self.h_tf(H + V)
+        term3 = self.l_a * self.alpha_tf(t, X, Z_V, moment_state=moments) ** 2
+        term4 = self.c_h * self.h_tf(X_state, moments.mean_q)
+        term5 = self.c_con * self.h_tf(H + V, moments.mean_h_plus_v)
         return term1 + term2 + term3 + term4 + term5
 
-    def mu_tf(self, t, X, Y, Z):
-        S, H, V, X_state = tf.split(X, 4, axis=1)
+    def mu_tf(self, t, X, Y, Z, moment_state=None):
+        S, H, V, X_state = tf.split(tf.cast(X, tf.float32), 4, axis=1)
+        moments = self._mean_field_moments_or_default(X, moment_state)
 
         mu_S_mean = self.mu_t_daynight_tf(t, self.params_S_tf)
         kappa_S = self.kappa_t_tf(t, self.params_S_tf)
@@ -802,37 +832,35 @@ class NN_Pascucci(FBSNN):
         kappa_H = self.kappa_t_tf(t, self.params_H_tf)
         dH = kappa_H * (mu_H_mean - H)
 
-        Z_S, Z_H, Z_V, _ = tf.split(Z, num_or_size_splits=4, axis=1)
+        _, _, Z_V, _ = tf.split(tf.cast(Z, tf.float32), num_or_size_splits=4, axis=1)
         dV = (
-            self.alpha_tf(t, X, Z_V) * self.psi(X_state)
+            self.alpha_tf(t, X, Z_V, moment_state=moments) * self.psi(X_state)
             + self.c3 * self.psi2(X_state) * self.psi3(V)
             - self.c4 * self.psi1(X_state) * self.psi4(V)
         )
         dX = V
         return tf.concat([dS, dH, dV, dX], axis=1)
 
-    def g_tf(self, X):
-        S, H, V, X_state = tf.split(X, 4, axis=1)
-        return -self.gamma * X_state * tf.exp(S) + 0.5 * self.omega * (X_state - tf.reduce_mean(X_state, axis=0, keepdims=True)) ** 2
+    def g_tf(self, X, moment_state=None):
+        S, _, _, X_state = tf.split(tf.cast(X, tf.float32), 4, axis=1)
+        moments = self._mean_field_moments_or_default(X, moment_state)
+        return -self.gamma * X_state * tf.exp(S) + 0.5 * self.omega * (X_state - moments.mean_q) ** 2
 
-    def phi_tf(self, t, X, Y, Z):
-        return -self.f_tf(t, X, Y, Z)
+    def phi_tf(self, t, X, Y, Z, moment_state=None):
+        return -self.f_tf(t, X, Y, Z, moment_state=moment_state)
 
-    def sigma_tf(self, t, X, Y):
-        S, H, V, X_state = tf.split(X, 4, axis=1)
+    def sigma_tf(self, t, X, Y, moment_state=None):
+        S, _, _, _ = tf.split(tf.cast(X, tf.float32), 4, axis=1)
         sigma_S = self.sigma_t_tf(t, self.params_S_tf)
         sigma_H = self.sigma_t_tf(t, self.params_H_tf)
-        sigma_V = self.sigmaV_tf(t, X)
+        sigma_V = self.sigmaV_tf(t, X, moment_state=moment_state)
 
         zeros = tf.zeros_like(S)
-
         r1 = tf.concat([sigma_S, zeros, zeros, zeros], axis=1)
         r2 = tf.concat([zeros, sigma_H, zeros, zeros], axis=1)
         r3 = tf.concat([zeros, zeros, sigma_V, zeros], axis=1)
         r4 = tf.concat([zeros, zeros, zeros, zeros], axis=1)
-
         return tf.stack([r1, r2, r3, r4], axis=1)
-
 
 class NN_Pascucci_Recursive(NN_Pascucci):
     """
@@ -956,9 +984,9 @@ class NN_Pascucci_Recursive(NN_Pascucci):
             tf.concat([t_in, X_in], 1), self._terminal_weights_tf, self._terminal_biases_tf
         )
 
-    def g_tf(self, X):
+    def g_tf(self, X, moment_state=None):
         if self.terminal_blob is None:
-            return super().g_tf(X)
+            return super().g_tf(X, moment_state=moment_state)
         t_eval = tf.ones([tf.shape(X)[0], 1], dtype=tf.float32) * tf.constant(
             self.t_end, dtype=tf.float32
         )
