@@ -129,6 +129,7 @@ class ModelSpec:
     recursive_model_factory: Callable[..., Any]
     build_exact_solution: Callable[..., Optional[dict]]
     build_exact_initial_boundary_samples: Optional[Callable[..., list[np.ndarray]]] = None
+    moment_names: tuple[str, ...] = ()
 
     def validate_state_dim(self, D: int) -> None:
         if int(D) != int(self.state_dim):
@@ -195,6 +196,7 @@ def get_model_spec(name: Optional[str] = None) -> ModelSpec:
             recursive_model_factory=_build_pascucci_recursive_model,
             build_exact_solution=_build_pascucci_exact_solution,
             build_exact_initial_boundary_samples=None,
+            moment_names=("mean_v", "mean_q", "mean_h_plus_v"),
         )
 
     raise ValueError(
