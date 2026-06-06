@@ -75,11 +75,24 @@ def load_evaluation_bundle(
     n_blocks_expected: int,
     N_per_block_expected: int,
     D_expected: int,
+    blocks_expected: Optional[List[Dict[str, float]]] = None,
+    T_total_expected: Optional[float] = None,
 ) -> Tuple[np.ndarray, List[Tuple[np.ndarray, np.ndarray]]]:
     with np.load(path, allow_pickle=False) as data:
+        files = set(data.files)
         Xi = np.asarray(data["Xi_initial"], dtype=np.float32)
         t_bundle = np.asarray(data["t_bundle"], dtype=np.float32)
         W_bundle = np.asarray(data["W_bundle"], dtype=np.float32)
+        saved_t_start = (
+            np.asarray(data["block_t_start"], dtype=np.float32)
+            if "block_t_start" in files
+            else None
+        )
+        saved_t_end = (
+            np.asarray(data["block_t_end"], dtype=np.float32)
+            if "block_t_end" in files
+            else None
+        )
 
     if Xi.ndim != 2 or Xi.shape[1] != int(D_expected):
         raise ValueError(
@@ -108,10 +121,38 @@ def load_evaluation_bundle(
             f"Xi={Xi.shape[0]}, t_bundle={t_bundle.shape[1]}, W_bundle={W_bundle.shape[1]}"
         )
 
+    if blocks_expected is not None:
+        expected_start = np.asarray(
+            [float(b["t_start"]) for b in blocks_expected],
+            dtype=np.float32,
+        )
+        expected_end = np.asarray(
+            [float(b["t_end"]) for b in blocks_expected],
+            dtype=np.float32,
+        )
+        if saved_t_start is None or saved_t_end is None:
+            raise ValueError("Evaluation bundle metadata mismatch: missing block_t_start/block_t_end")
+        if saved_t_start.shape != expected_start.shape or not np.allclose(
+            saved_t_start, expected_start, rtol=0.0, atol=1.0e-6
+        ):
+            raise ValueError("Evaluation bundle metadata mismatch: block_t_start differs")
+        if saved_t_end.shape != expected_end.shape or not np.allclose(
+            saved_t_end, expected_end, rtol=0.0, atol=1.0e-6
+        ):
+            raise ValueError("Evaluation bundle metadata mismatch: block_t_end differs")
+
+    if T_total_expected is not None and saved_t_end is not None and saved_t_end.size > 0:
+        if not np.isclose(float(saved_t_end[-1]), float(T_total_expected), rtol=0.0, atol=1.0e-6):
+            raise ValueError(
+                "Evaluation bundle metadata mismatch: "
+                f"T_total differs, got {float(saved_t_end[-1])}, expected {float(T_total_expected)}"
+            )
+
     rollout_inputs = []
     for i in range(int(n_blocks_expected)):
         rollout_inputs.append((t_bundle[i], W_bundle[i]))
     return Xi, rollout_inputs
+
 
 def Xi_generator_default(M, D):
     assert D == 4

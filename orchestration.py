@@ -192,6 +192,8 @@ def print_recursive_pass(
             n_blocks_expected=len(blocks),
             N_per_block_expected=N_per_block,
             D_expected=D,
+            blocks_expected=blocks,
+            T_total_expected=T_total,
         )
         print(
             f"[EvalBundle] loaded path={eval_bundle_path}, M={Xi_stitched.shape[0]}, "

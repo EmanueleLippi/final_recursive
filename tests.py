@@ -106,6 +106,28 @@ def _make_block_blob(layers: List[int], t_start: float, t_end: float, T_total: f
     return blob
 
 
+def _fixed_validation_batch(
+    *,
+    M: int = 4,
+    N: int = 2,
+    D: int = 4,
+    T: float = 0.25,
+    t_start: float = 0.0,
+    seed: int = 123,
+    v_shift: float = 0.0,
+):
+    blocks = [{"idx": 0, "t_start": float(t_start), "t_end": float(t_start + T), "T_block": float(T)}]
+    rollout = build_stitched_rollout_inputs(blocks, M=int(M), N_per_block=int(N), D=int(D), seed=int(seed))
+    t_batch, W_batch = rollout[0]
+    grid = np.linspace(0.0, 1.0, int(M), dtype=np.float32)
+    Xi = np.zeros((int(M), int(D)), dtype=np.float32)
+    Xi[:, 0] = 0.5 + 0.1 * grid
+    Xi[:, 1] = -0.2 + 0.05 * grid
+    Xi[:, 2] = np.float32(v_shift) + 0.2 + 0.03 * grid
+    Xi[:, 3] = 3.0 + grid
+    return t_batch.astype(np.float32), W_batch.astype(np.float32), Xi.astype(np.float32)
+
+
 def _run_case(name: str, fn: Callable[[], None]) -> bool:
     try:
         fn()
@@ -189,6 +211,60 @@ def test_rollout_inputs_are_antithetic() -> None:
         dW = W[:, 1:, :] - W[:, :-1, :]
         np.testing.assert_allclose(dW[0], -dW[2], atol=1.0e-6)
         np.testing.assert_allclose(dW[1], -dW[3], atol=1.0e-6)
+
+
+def test_evaluation_bundle_rejects_block_metadata_mismatch() -> None:
+    from .sampling import load_evaluation_bundle, save_evaluation_bundle
+
+    saved_blocks = build_blocks(T_total=0.5, block_size=0.25)
+    shifted_blocks = [
+        {
+            "idx": int(block["idx"]),
+            "t_start": float(block["t_start"]) + 0.125,
+            "t_end": float(block["t_end"]) + 0.125,
+            "T_block": float(block["T_block"]),
+        }
+        for block in saved_blocks
+    ]
+    Xi = np.zeros((4, 4), dtype=np.float32)
+    rollout = build_stitched_rollout_inputs(
+        blocks=saved_blocks,
+        M=Xi.shape[0],
+        N_per_block=2,
+        D=4,
+        seed=123,
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "evaluation_bundle.npz"
+        save_evaluation_bundle(
+            path=str(path),
+            Xi_initial=Xi,
+            rollout_inputs=rollout,
+            blocks=saved_blocks,
+        )
+        loaded_xi, loaded_rollout = load_evaluation_bundle(
+            path=str(path),
+            n_blocks_expected=len(saved_blocks),
+            N_per_block_expected=2,
+            D_expected=4,
+        )
+        np.testing.assert_allclose(loaded_xi, Xi)
+        assert len(loaded_rollout) == len(saved_blocks)
+        try:
+            load_evaluation_bundle(
+                path=str(path),
+                n_blocks_expected=len(shifted_blocks),
+                N_per_block_expected=2,
+                D_expected=4,
+                blocks_expected=shifted_blocks,
+                T_total_expected=0.625,
+            )
+        except ValueError as exc:
+            message = str(exc).lower()
+            assert "block" in message or "t_total" in message or "metadata" in message
+        else:
+            raise AssertionError("mismatched evaluation bundle metadata should be rejected")
 
 
 def test_model_spec_contract() -> None:
@@ -1011,6 +1087,207 @@ def test_pascucci_evaluate_reports_block_end_moment_scalars() -> None:
             assert isinstance(stats[key], float)
             assert np.isfinite(stats[key])
             np.testing.assert_allclose(stats[key], expected, rtol=1.0e-6, atol=1.0e-6)
+    finally:
+        model.close()
+
+
+def test_pascucci_fixed_eval_bundle_recomputes_moments_deterministically() -> None:
+    from .model_specs import get_model_spec
+    from .models import NN_Pascucci_Recursive
+    from .tf_backend import reset_backend_state, set_seed
+
+    reset_backend_state()
+    set_seed(81)
+
+    spec = get_model_spec("pascucci")
+    params = spec.build_default_params(const=0.75)
+    model = NN_Pascucci_Recursive(
+        Xi_generator=spec.xi_generator,
+        T=0.25,
+        M=4,
+        N=2,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        terminal_blob=None,
+        normalize_time_input=True,
+    )
+
+    try:
+        fixed_batch = _fixed_validation_batch(M=4, N=2, D=4, T=0.25, seed=81)
+        _, X, _, _, diagnostics = model.loss_function(
+            fixed_batch[0],
+            fixed_batch[1],
+            fixed_batch[2],
+            const_value=0.75,
+            return_runtime_diagnostics=True,
+        )
+        X_np = X.numpy()
+        expected_block_end = {
+            "mean_block_end_mean_v": float(np.mean(X_np[:, -1, [2]])),
+            "mean_block_end_mean_q": float(np.mean(X_np[:, -1, [3]])),
+            "mean_block_end_mean_h_plus_v": float(
+                np.mean(X_np[:, -1, [1]] + X_np[:, -1, [2]])
+            ),
+        }
+        for key, trace in diagnostics.items():
+            trace_np = trace.numpy() if hasattr(trace, "numpy") else np.asarray(trace)
+            np.testing.assert_allclose(
+                trace_np[-1],
+                expected_block_end[f"mean_block_end_{key}"],
+                rtol=1.0e-6,
+                atol=1.0e-6,
+            )
+
+        first = model.evaluate(
+            const_value=0.75,
+            n_batches=1,
+            evaluation_batches=[fixed_batch],
+            moment_policy="fixed_eval_recompute",
+        )
+        np.random.seed(999)
+        _ = np.random.normal(size=128)
+        set_seed(999)
+        second = model.evaluate(
+            const_value=0.75,
+            n_batches=1,
+            evaluation_batches=[fixed_batch],
+            moment_policy="fixed_eval_recompute",
+        )
+
+        assert first["moment_policy"] == "fixed_eval_recompute"
+        assert first["evaluation_batches"] == 1
+        for key in (
+            "mean_loss",
+            "std_loss",
+            "mean_loss_per_sample",
+            "std_loss_per_sample",
+            "mean_y0",
+            "std_y0",
+            *expected_block_end.keys(),
+        ):
+            assert key in first, f"{key} missing from fixed eval stats: {sorted(first)}"
+            assert key in second
+            np.testing.assert_allclose(first[key], second[key], rtol=1.0e-7, atol=1.0e-7)
+        for key, expected in expected_block_end.items():
+            np.testing.assert_allclose(first[key], expected, rtol=1.0e-6, atol=1.0e-6)
+    finally:
+        model.close()
+
+
+def test_pascucci_fixed_eval_does_not_reuse_prior_live_batch_context() -> None:
+    from .model_specs import get_model_spec
+    from .models import NN_Pascucci_Recursive
+    from .tf_backend import reset_backend_state, set_seed
+
+    class RecordingPascucci(NN_Pascucci_Recursive):
+        def __init__(self, *args, **kwargs):
+            self.context_snapshots = []
+            super().__init__(*args, **kwargs)
+
+        def build_loss_context_tf(self, t, X, Y):
+            context = super().build_loss_context_tf(t, X, Y)
+            self.context_snapshots.append(
+                {
+                    "t": float(np.mean(t.numpy())),
+                    "mean_v": float(context.mean_v.numpy()[0, 0]),
+                    "mean_q": float(context.mean_q.numpy()[0, 0]),
+                    "mean_h_plus_v": float(context.mean_h_plus_v.numpy()[0, 0]),
+                }
+            )
+            return context
+
+    reset_backend_state()
+    set_seed(82)
+
+    spec = get_model_spec("pascucci")
+    params = spec.build_default_params(const=0.75)
+    model = RecordingPascucci(
+        Xi_generator=spec.xi_generator,
+        T=0.25,
+        M=4,
+        N=2,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        terminal_blob=None,
+        normalize_time_input=True,
+    )
+
+    try:
+        train_batch = _fixed_validation_batch(M=4, N=2, D=4, T=0.25, seed=82, v_shift=0.0)
+        eval_batch = _fixed_validation_batch(M=4, N=2, D=4, T=0.25, seed=83, v_shift=5.0)
+
+        model.loss_function(
+            train_batch[0],
+            train_batch[1],
+            train_batch[2],
+            const_value=0.75,
+        )
+        first_train_context = dict(model.context_snapshots[0])
+        model.context_snapshots.clear()
+
+        stats = model.evaluate(
+            const_value=0.75,
+            n_batches=1,
+            evaluation_batches=[eval_batch],
+            moment_policy="fixed_eval_recompute",
+        )
+        del stats
+        assert model.context_snapshots, "fixed evaluation did not build any moment context"
+        first_eval_context = model.context_snapshots[0]
+
+        expected_train_mean_v = float(np.mean(train_batch[2][:, 2]))
+        expected_eval_mean_v = float(np.mean(eval_batch[2][:, 2]))
+        np.testing.assert_allclose(first_train_context["mean_v"], expected_train_mean_v)
+        np.testing.assert_allclose(first_eval_context["mean_v"], expected_eval_mean_v)
+        assert abs(first_eval_context["mean_v"] - first_train_context["mean_v"]) > 1.0
+    finally:
+        model.close()
+
+
+def test_quadratic_fixed_eval_bundle_keeps_moment_policy_noop() -> None:
+    from .model_specs import get_model_spec
+    from .models import NN_Quadratic_Coupled_Recursive
+    from .tf_backend import reset_backend_state, set_seed
+
+    reset_backend_state()
+    set_seed(84)
+
+    spec = get_model_spec("quadratic_coupled")
+    params = spec.build_default_params(const=1.0)
+    model = NN_Quadratic_Coupled_Recursive(
+        Xi_generator=spec.xi_generator,
+        T=0.25,
+        M=4,
+        N=2,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        terminal_blob=None,
+        normalize_time_input=True,
+    )
+
+    try:
+        fixed_batch = _fixed_validation_batch(M=4, N=2, D=4, T=0.25, seed=84)
+        stats = model.evaluate(
+            const_value=1.0,
+            n_batches=1,
+            evaluation_batches=[fixed_batch],
+            moment_policy="fixed_eval_recompute",
+        )
+        assert stats["moment_policy"] == "fixed_eval_recompute"
+        assert stats["evaluation_batches"] == 1
+        assert not any("block_end_mean" in key for key in stats)
     finally:
         model.close()
 
@@ -1973,6 +2250,130 @@ def test_print_recursive_pass_saves_stitched_moment_traces() -> None:
         orchestration.plot_recursive_stitched_y_convergence = original_plot_convergence
 
 
+def test_print_recursive_pass_rejects_mismatched_eval_bundle_metadata() -> None:
+    from . import orchestration
+    from .model_specs import get_model_spec
+    from .sampling import save_evaluation_bundle
+
+    spec = get_model_spec("pascucci")
+    params = spec.build_default_params(const=0.75)
+    layers = [5, 8, 1]
+    D = 4
+    saved_blocks = build_blocks(T_total=0.5, block_size=0.25)
+    shifted_blocks = [
+        {
+            "idx": int(block["idx"]),
+            "t_start": float(block["t_start"]) + 0.125,
+            "t_end": float(block["t_end"]) + 0.125,
+            "T_block": float(block["T_block"]),
+        }
+        for block in saved_blocks
+    ]
+    logs = [
+        {
+            "pass": 1,
+            "block": int(block["idx"]),
+            "t_start": float(block["t_start"]),
+            "t_end": float(block["t_end"]),
+            "T_block": float(block["T_block"]),
+            "eval_mean_loss": 1.0,
+            "eval_std_loss": 0.0,
+            "eval_mean_loss_per_sample": 0.25,
+            "eval_std_loss_per_sample": 0.0,
+            "eval_mean_y0": 0.0,
+            "precision_target": None,
+            "refine_rounds": 0,
+        }
+        for block in shifted_blocks
+    ]
+
+    predict_calls = []
+
+    def fake_predict_recursive_stitched(**kwargs):
+        predict_calls.append(kwargs)
+        M = int(kwargs["Xi_initial"].shape[0])
+        steps = len(shifted_blocks) * 2 + 1
+        t = np.tile(
+            np.linspace(0.125, 0.625, steps, dtype=np.float32).reshape(1, steps, 1),
+            (M, 1, 1),
+        )
+        return {
+            "t": t,
+            "X": np.zeros((M, steps, D), dtype=np.float32),
+            "Y": np.zeros((M, steps, 1), dtype=np.float32),
+            "Z": np.zeros((M, steps, D), dtype=np.float32),
+        }
+
+    original_predict = orchestration.predict_recursive_stitched
+    original_plot_logs = orchestration.plot_recursive_pass_logs_multi
+    original_plot_stitched = orchestration.plot_recursive_stitched_predictions
+    original_plot_convergence = orchestration.plot_recursive_stitched_y_convergence
+    orchestration.predict_recursive_stitched = fake_predict_recursive_stitched
+    orchestration.plot_recursive_pass_logs_multi = lambda *args, **kwargs: None
+    orchestration.plot_recursive_stitched_predictions = lambda *args, **kwargs: None
+    orchestration.plot_recursive_stitched_y_convergence = lambda *args, **kwargs: None
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            rec_dir = Path(tmp)
+            bundle_path = rec_dir / "evaluation_bundle.npz"
+            Xi = spec.deterministic_xi(4, D, seed=87)
+            rollout = build_stitched_rollout_inputs(
+                blocks=saved_blocks,
+                M=Xi.shape[0],
+                N_per_block=2,
+                D=D,
+                seed=87,
+            )
+            save_evaluation_bundle(
+                path=str(bundle_path),
+                Xi_initial=Xi,
+                rollout_inputs=rollout,
+                blocks=saved_blocks,
+            )
+
+            try:
+                orchestration.print_recursive_pass(
+                    pass_entries=[
+                        {
+                            "pass_id": 1,
+                            "logs": logs,
+                            "blobs": [
+                                _make_block_blob(layers, block["t_start"], block["t_end"], 0.625)
+                                for block in shifted_blocks
+                            ],
+                        }
+                    ],
+                    blocks=shifted_blocks,
+                    rec_dir=str(rec_dir),
+                    params=params,
+                    N_per_block=2,
+                    D=D,
+                    layers=layers,
+                    T_total=0.625,
+                    exact_solution=None,
+                    selection_metric="loss",
+                    eval_bundle_path=str(bundle_path),
+                    eval_seed=87,
+                    eval_min_paths=4,
+                    sample_paths=0,
+                    print_compact_logs=False,
+                    model_spec=spec,
+                )
+            except ValueError as exc:
+                message = str(exc).lower()
+                assert "evaluation bundle" in message
+                assert "block" in message or "t_total" in message or "metadata" in message
+            else:
+                raise AssertionError("print_recursive_pass should reject a stale evaluation bundle")
+            assert predict_calls == []
+    finally:
+        orchestration.predict_recursive_stitched = original_predict
+        orchestration.plot_recursive_pass_logs_multi = original_plot_logs
+        orchestration.plot_recursive_stitched_predictions = original_plot_stitched
+        orchestration.plot_recursive_stitched_y_convergence = original_plot_convergence
+
+
 def test_recursive_coarse_prepass_model_spec_argument() -> None:
     from . import orchestration
     from .model_specs import get_model_spec
@@ -2907,6 +3308,7 @@ def run_tests(argv: List[str] | None = None) -> int:
     cases: List[tuple[str, Callable[[], None]]] = [
         ("numpy_math_and_schedules", test_numpy_math_and_schedules),
         ("rollout_inputs_are_antithetic", test_rollout_inputs_are_antithetic),
+        ("evaluation_bundle_rejects_block_metadata_mismatch", test_evaluation_bundle_rejects_block_metadata_mismatch),
         ("model_spec_contract", test_model_spec_contract),
         ("model_spec_params_overlay_preserves_solver_flags", test_model_spec_params_overlay_preserves_solver_flags),
         ("exact_path_plot_outputs", test_exact_path_plot_outputs),
@@ -2956,6 +3358,18 @@ def run_tests(argv: List[str] | None = None) -> int:
         "test_pascucci_evaluate_reports_block_end_moment_scalars",
     ) and ok
     ok = _run_subprocess_case(
+        "pascucci_fixed_eval_bundle_recomputes_moments_deterministically",
+        "test_pascucci_fixed_eval_bundle_recomputes_moments_deterministically",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_fixed_eval_does_not_reuse_prior_live_batch_context",
+        "test_pascucci_fixed_eval_does_not_reuse_prior_live_batch_context",
+    ) and ok
+    ok = _run_subprocess_case(
+        "quadratic_fixed_eval_bundle_keeps_moment_policy_noop",
+        "test_quadratic_fixed_eval_bundle_keeps_moment_policy_noop",
+    ) and ok
+    ok = _run_subprocess_case(
         "pascucci_f_mu_select_z_v_from_full_z",
         "test_pascucci_f_mu_select_z_v_from_full_z",
     ) and ok
@@ -2998,6 +3412,10 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "print_recursive_pass_saves_stitched_moment_traces",
         "test_print_recursive_pass_saves_stitched_moment_traces",
+    ) and ok
+    ok = _run_subprocess_case(
+        "print_recursive_pass_rejects_mismatched_eval_bundle_metadata",
+        "test_print_recursive_pass_rejects_mismatched_eval_bundle_metadata",
     ) and ok
     ok = _run_subprocess_case(
         "recursive_coarse_prepass_model_spec_argument",
