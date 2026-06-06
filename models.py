@@ -616,17 +616,32 @@ class FBSNN(tf.Module, ABC):
             "stopped_early": bool(stopped_early),
         }
 
-    def evaluate(self, const_value=None, n_batches=5):
+    def evaluate(
+        self,
+        const_value=None,
+        n_batches=5,
+        evaluation_batches=None,
+        moment_policy="batch_current",
+    ):
         current_const = np.float32(self.const if const_value is None else const_value)
         self._set_const(current_const)
+
+        if evaluation_batches is None:
+            batches = [self.fetch_minibatch() for _ in range(int(n_batches))]
+            evaluation_batch_count = 0
+        else:
+            batches = list(evaluation_batches)
+            if len(batches) == 0:
+                raise ValueError("evaluation_batches must contain at least one batch")
+            evaluation_batch_count = len(batches)
+
         losses = []
         losses_per_sample = []
         y0s = []
         component_values: Dict[str, List[float]] = {}
-        runtime_diagnostic_values: Dict[str, List[float]] = {}
+        runtime_diagnostics_values: Dict[str, List[float]] = {}
 
-        for _ in range(int(n_batches)):
-            t_batch, W_batch, Xi_batch = self.fetch_minibatch()
+        for t_batch, W_batch, Xi_batch in batches:
             loss_value, _, y_value, _, components, runtime_diagnostics = self.loss_function(
                 t_batch,
                 W_batch,
@@ -639,8 +654,10 @@ class FBSNN(tf.Module, ABC):
             losses.append(loss_value)
             losses_per_sample.append(loss_value / float(self.M))
             y0s.append(list(y_value.numpy()[:, 0, 0]))
+
             for key, value in components.items():
                 component_values.setdefault(key, []).append(float(value.numpy()))
+
             for key, value in runtime_diagnostics.items():
                 value_np = value.numpy() if hasattr(value, "numpy") else np.asarray(value)
                 value_np = np.asarray(value_np, dtype=np.float32)
@@ -649,8 +666,7 @@ class FBSNN(tf.Module, ABC):
                 block_end = np.asarray(value_np[-1], dtype=np.float32)
                 scalar = float(np.mean(block_end))
                 if np.isfinite(scalar):
-                    runtime_diagnostic_values.setdefault(f"block_end_{key}", []).append(scalar)
-
+                    runtime_diagnostics_values.setdefault(f"block_end_{key}", []).append(scalar)
         stats = {
             "const": float(current_const),
             "mean_loss": float(np.mean(losses)),
@@ -659,15 +675,19 @@ class FBSNN(tf.Module, ABC):
             "std_loss_per_sample": float(np.std(losses_per_sample)),
             "mean_y0": float(np.mean(y0s)),
             "std_y0": float(np.std(y0s)),
-            "n_batches": int(n_batches),
+            "n_batches": int(len(batches)),
+            "moment_policy": str(moment_policy or "batch_current"),
+            "evaluation_batches": int(evaluation_batch_count),
         }
         for key, values in component_values.items():
             stats[f"mean_{key}"] = float(np.mean(values))
             stats[f"std_{key}"] = float(np.std(values))
             stats[f"mean_{key}_per_sample"] = float(np.mean(values) / float(self.M))
-        for key, values in runtime_diagnostic_values.items():
+
+        for key, values in runtime_diagnostics_values.items():
             stats[f"mean_{key}"] = float(np.mean(values))
             stats[f"std_{key}"] = float(np.std(values))
+
         return stats
 
     def predict(self, Xi_star, t_star, W_star, const_value=None, return_runtime_diagnostics=False):
