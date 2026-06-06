@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -55,14 +56,25 @@ def _resolve_model_spec(model_spec: Optional[ModelSpec]) -> ModelSpec:
 def _prefixed_eval_diagnostics(eval_stats: Dict[str, Any]) -> Dict[str, float]:
     diagnostics = {}
     for key, value in eval_stats.items():
-        if key in _BASE_EVAL_LOG_KEYS:
+        key_str = str(key)
+        if key_str in _BASE_EVAL_LOG_KEYS:
             continue
-        if not (str(key).startswith("mean_loss_") or str(key).startswith("std_loss_")):
+        if not (
+            key_str.startswith("mean_loss_")
+            or key_str.startswith("std_loss_")
+            or key_str.startswith("mean_block_end_")
+            or key_str.startswith("std_block_end_")
+        ):
             continue
         try:
-            diagnostics[f"eval_{key}"] = float(value)
+            value_array = np.asarray(value)
+            if value_array.shape != ():
+                continue
+            scalar = float(value_array)
         except (TypeError, ValueError):
             continue
+        if np.isfinite(scalar):
+            diagnostics[f"eval_{key_str}"] = scalar
     return diagnostics
 
 
@@ -253,12 +265,9 @@ def print_recursive_pass(
         )
         stitched_by_pass[pass_id] = stitched_pred
 
-        np.savez(
+        save_blob_npz(
+            stitched_pred,
             os.path.join(rec_dir, f"stitched_predictions_{pass_tag}.npz"),
-            t=stitched_pred["t"],
-            X=stitched_pred["X"],
-            Y=stitched_pred["Y"],
-            Z=stitched_pred["Z"],
         )
         plot_recursive_stitched_predictions(
             stitched=stitched_pred,
@@ -328,12 +337,9 @@ def print_recursive_pass(
                 )
                 visual_stitched_by_pass[pass_id] = visual_stitched
                 visual_exact_bundle_by_pass[pass_id] = visual_exact_bundle
-                np.savez(
+                save_blob_npz(
+                    visual_stitched,
                     os.path.join(rec_dir, f"visual_stitched_predictions_{pass_tag}.npz"),
-                    t=visual_stitched["t"],
-                    X=visual_stitched["X"],
-                    Y=visual_stitched["Y"],
-                    Z=visual_stitched["Z"],
                 )
                 plot_recursive_exact_comparison(
                     stitched=visual_stitched,
@@ -392,12 +398,9 @@ def print_recursive_pass(
     selected_exact_bundle = exact_bundle_by_pass.get(selected_pass_id, None)
     selected_visual_stitched = visual_stitched_by_pass.get(selected_pass_id, None)
     selected_visual_exact_bundle = visual_exact_bundle_by_pass.get(selected_pass_id, None)
-    np.savez(
+    save_blob_npz(
+        selected_stitched,
         os.path.join(rec_dir, "stitched_predictions_final.npz"),
-        t=selected_stitched["t"],
-        X=selected_stitched["X"],
-        Y=selected_stitched["Y"],
-        Z=selected_stitched["Z"],
     )
     plot_recursive_stitched_predictions(
         stitched=selected_stitched,
@@ -431,12 +434,9 @@ def print_recursive_pass(
             include_error_plots=True,
         )
         if selected_visual_stitched is not None and selected_visual_exact_bundle is not None:
-            np.savez(
+            save_blob_npz(
+                selected_visual_stitched,
                 os.path.join(rec_dir, "visual_stitched_predictions_final.npz"),
-                t=selected_visual_stitched["t"],
-                X=selected_visual_stitched["X"],
-                Y=selected_visual_stitched["Y"],
-                Z=selected_visual_stitched["Z"],
             )
             plot_recursive_exact_comparison(
                 stitched=selected_visual_stitched,
@@ -555,6 +555,45 @@ def resolve_pass_selection(
         {str(k): float(v) for k, v in scores.items()},
     )
 
+def _predict_accepts_runtime_diagnostics(model: FBSNN) -> bool:
+    try:
+        signature = inspect.signature(model.predict)
+    except (TypeError, ValueError):
+        return True
+    parameters = list(signature.parameters.values())
+    return (
+        "return_runtime_diagnostics" in signature.parameters
+        or any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters)
+    )
+
+def _predict_with_optional_runtime_diagnostics(
+    model: FBSNN,
+    Xi_star: np.ndarray,
+    t_star: np.ndarray,
+    W_star: np.ndarray,
+    coupling_const: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
+    predict_kwargs = {"const_value": float(coupling_const)}
+    if _predict_accepts_runtime_diagnostics(model):
+        predict_kwargs["return_runtime_diagnostics"] = True
+
+    result = model.predict(Xi_star, t_star, W_star, **predict_kwargs)
+    if not isinstance(result, (tuple, list)):
+        raise ValueError("model.predict must return a tuple/list with X, Y, Z")
+    if len(result) == 4:
+        X, Y, Z, runtime_diagnostics = result
+        if runtime_diagnostics is None:
+            runtime_diagnostics = {}
+        else:
+            runtime_diagnostics = dict(runtime_diagnostics)
+        return X, Y, Z, runtime_diagnostics
+    if len(result) == 3:
+        X, Y, Z = result
+        return X, Y, Z, {}
+    raise ValueError(
+        "model.predict must return either (X, Y, Z) or (X, Y, Z, runtime_diagnostics)"
+    )
+
 def predict_recursive_stitched(
     block_blobs: List[Dict[str, np.ndarray]],
     blocks: List[Dict[str, float]],
@@ -582,6 +621,7 @@ def predict_recursive_stitched(
     X_segments = []
     Y_segments = []
     Z_segments = []
+    diagnostic_segments = {}
 
     for b, block in enumerate(blocks):
         blob = block_blobs[b]
@@ -610,8 +650,12 @@ def predict_recursive_stitched(
                 t_b, W_b, _ = model.fetch_minibatch()
             else:
                 t_b, W_b = rollout_inputs[b]
-            X_b, Y_b, Z_b = model.predict(
-                Xi_curr, t_b, W_b, const_value=float(coupling_const)
+            X_b, Y_b, Z_b, runtime_diagnostics_b = _predict_with_optional_runtime_diagnostics(
+                model,
+                Xi_curr,
+                t_b,
+                W_b,
+                float(coupling_const),
             )
 
             start_idx = 0 if b == 0 else 1
@@ -619,17 +663,34 @@ def predict_recursive_stitched(
             X_segments.append(X_b[:, start_idx:, :].astype(np.float32))
             Y_segments.append(Y_b[:, start_idx:, :].astype(np.float32))
             Z_segments.append(Z_b[:, start_idx:, :].astype(np.float32))
+            for key, value in runtime_diagnostics_b.items():
+                value_np = np.asarray(value, dtype=np.float32)
+                if value_np.ndim == 0:
+                    value_np = value_np.reshape(1, 1)
+                elif value_np.ndim == 1:
+                    value_np = value_np.reshape(-1, 1)
+                if value_np.shape[0] != t_b.shape[1]:
+                    raise ValueError(
+                        f"runtime diagnostic '{key}' must have {t_b.shape[1]} time steps, "
+                        f"got {value_np.shape[0]}"
+                    )
+                diagnostic_segments.setdefault(str(key), []).append(
+                    value_np[start_idx:, ...].astype(np.float32)
+                )
 
             Xi_curr = X_b[:, -1, :].astype(np.float32)
         finally:
             model.sess.close()
 
-    return {
+    stitched = {
         "t": np.concatenate(t_segments, axis=1),
         "X": np.concatenate(X_segments, axis=1),
         "Y": np.concatenate(Y_segments, axis=1),
         "Z": np.concatenate(Z_segments, axis=1),
     }
+    for key, segments in diagnostic_segments.items():
+        stitched[key] = np.concatenate(segments, axis=0).astype(np.float32)
+    return stitched
 
 def train_with_standard_schedule(
     model: FBSNN,

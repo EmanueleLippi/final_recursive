@@ -230,6 +230,25 @@ class FBSNN(tf.Module, ABC):
         del t, X, Y
         return None
 
+    def loss_context_diagnostics_tf(self, loss_context):
+        del loss_context
+        return {}
+
+    def _append_runtime_diagnostics_tf(self, diagnostics_by_key, loss_context):
+        diagnostics = self.loss_context_diagnostics_tf(loss_context)
+        if not diagnostics:
+            return
+        for key, value in diagnostics.items():
+            value = tf.reshape(tf.cast(value, tf.float32), [1, -1])
+            diagnostics_by_key.setdefault(str(key), []).append(value)
+
+    def _stack_runtime_diagnostics_tf(self, diagnostics_by_key):
+        return {
+            key: tf.concat(values, axis=0)
+            for key, values in diagnostics_by_key.items()
+            if len(values) > 0
+        }
+
     def Dg_tf(self, X, moment_state=None):
         X = tf.cast(X, tf.float32)
         with tf.GradientTape() as tape:
@@ -240,7 +259,15 @@ class FBSNN(tf.Module, ABC):
             grad = tf.zeros_like(X)
         return grad
 
-    def loss_function(self, t, W, Xi, const_value=None, return_components=False):
+    def loss_function(
+        self,
+        t,
+        W,
+        Xi,
+        const_value=None,
+        return_components=False,
+        return_runtime_diagnostics=False,
+    ):
         t = tf.convert_to_tensor(t, dtype=tf.float32)
         W = tf.convert_to_tensor(W, dtype=tf.float32)
         Xi = tf.convert_to_tensor(Xi, dtype=tf.float32)
@@ -253,11 +280,15 @@ class FBSNN(tf.Module, ABC):
         Y_list = []
         Z_list = []
 
+        runtime_diagnostics_by_key = {}
+
         t0 = t[:, 0, :]
         W0 = W[:, 0, :]
         X0 = Xi
         Y0, Du0 = self.net_u(t0, X0)
         loss_context0 = self.build_loss_context_tf(t0, X0, Y0)
+        if return_runtime_diagnostics:
+            self._append_runtime_diagnostics_tf(runtime_diagnostics_by_key, loss_context0)
         sigma0 = self.sigma_tf(t0, X0, Y0, moment_state=loss_context0)
         Z0 = tf.squeeze(tf.matmul(tf.expand_dims(Du0, 1), sigma0), axis=1)
 
@@ -285,6 +316,8 @@ class FBSNN(tf.Module, ABC):
 
             Y1, Du1 = self.net_u(t1, X1)
             loss_context1 = self.build_loss_context_tf(t1, X1, Y1)
+            if return_runtime_diagnostics:
+                self._append_runtime_diagnostics_tf(runtime_diagnostics_by_key, loss_context1)
             sigma1 = self.sigma_tf(t1, X1, Y1, moment_state=loss_context1)
             Z1 = tf.squeeze(tf.matmul(tf.expand_dims(Du1, 1), sigma1), axis=1)
 
@@ -362,7 +395,15 @@ class FBSNN(tf.Module, ABC):
                 + weighted_structural_z_component
             )
 
+        runtime_diagnostics = (
+            self._stack_runtime_diagnostics_tf(runtime_diagnostics_by_key)
+            if return_runtime_diagnostics
+            else None
+        )
+
         if not return_components:
+            if return_runtime_diagnostics:
+                return loss_scaled, X, Y, Z, runtime_diagnostics
             return loss_scaled, X, Y, Z
 
         components = {
@@ -403,6 +444,8 @@ class FBSNN(tf.Module, ABC):
                 * component_average_scale
             )
 
+        if return_runtime_diagnostics:
+            return loss_scaled, X, Y, Z, components, runtime_diagnostics
         return loss_scaled, X, Y, Z, components
 
     def _sample_brownian_increments(self, dt: float) -> np.ndarray:
@@ -580,15 +623,17 @@ class FBSNN(tf.Module, ABC):
         losses_per_sample = []
         y0s = []
         component_values: Dict[str, List[float]] = {}
+        runtime_diagnostic_values: Dict[str, List[float]] = {}
 
         for _ in range(int(n_batches)):
             t_batch, W_batch, Xi_batch = self.fetch_minibatch()
-            loss_value, _, y_value, _, components = self.loss_function(
+            loss_value, _, y_value, _, components, runtime_diagnostics = self.loss_function(
                 t_batch,
                 W_batch,
                 Xi_batch,
                 const_value=current_const,
                 return_components=True,
+                return_runtime_diagnostics=True,
             )
             loss_value = float(loss_value.numpy())
             losses.append(loss_value)
@@ -596,6 +641,15 @@ class FBSNN(tf.Module, ABC):
             y0s.append(list(y_value.numpy()[:, 0, 0]))
             for key, value in components.items():
                 component_values.setdefault(key, []).append(float(value.numpy()))
+            for key, value in runtime_diagnostics.items():
+                value_np = value.numpy() if hasattr(value, "numpy") else np.asarray(value)
+                value_np = np.asarray(value_np, dtype=np.float32)
+                if value_np.size == 0:
+                    continue
+                block_end = np.asarray(value_np[-1], dtype=np.float32)
+                scalar = float(np.mean(block_end))
+                if np.isfinite(scalar):
+                    runtime_diagnostic_values.setdefault(f"block_end_{key}", []).append(scalar)
 
         stats = {
             "const": float(current_const),
@@ -611,11 +665,31 @@ class FBSNN(tf.Module, ABC):
             stats[f"mean_{key}"] = float(np.mean(values))
             stats[f"std_{key}"] = float(np.std(values))
             stats[f"mean_{key}_per_sample"] = float(np.mean(values) / float(self.M))
+        for key, values in runtime_diagnostic_values.items():
+            stats[f"mean_{key}"] = float(np.mean(values))
+            stats[f"std_{key}"] = float(np.std(values))
         return stats
 
-    def predict(self, Xi_star, t_star, W_star, const_value=None):
+    def predict(self, Xi_star, t_star, W_star, const_value=None, return_runtime_diagnostics=False):
         current_const = np.float32(self.const if const_value is None else const_value)
         self._set_const(current_const)
+        if return_runtime_diagnostics:
+            _, X_star, Y_star, Z_star, runtime_diagnostics = self.loss_function(
+                t_star,
+                W_star,
+                Xi_star,
+                const_value=current_const,
+                return_runtime_diagnostics=True,
+            )
+            return (
+                X_star.numpy(),
+                Y_star.numpy(),
+                Z_star.numpy(),
+                {
+                    key: value.numpy().astype(np.float32)
+                    for key, value in runtime_diagnostics.items()
+                },
+            )
         _, X_star, Y_star, Z_star = self.loss_function(
             t_star,
             W_star,
@@ -723,6 +797,15 @@ class NN_Pascucci(FBSNN):
     def build_loss_context_tf(self, t, X, Y):
         del t, Y
         return self.mean_field_moments_tf(X)
+
+    def loss_context_diagnostics_tf(self, loss_context):
+        if loss_context is None:
+            return {}
+        return {
+            "mean_v": loss_context.mean_v,
+            "mean_q": loss_context.mean_q,
+            "mean_h_plus_v": loss_context.mean_h_plus_v,
+        }
 
     def is_day_tf(self, t):
         hour = tf.math.floormod(t, 24.0)
