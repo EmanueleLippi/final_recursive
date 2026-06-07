@@ -515,6 +515,35 @@ def _periodic_mean_np(t: np.ndarray, a0: float, alpha, beta) -> np.ndarray:
     return mean
 
 
+def _pascucci_test_design_matrix(values: np.ndarray, t: np.ndarray, K: int) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    t = np.asarray(t, dtype=np.float64)
+    day = _is_day_np(t).astype(np.float64)
+    night = 1.0 - day
+    columns = [-values * day, -values * night, day, night]
+    for k in range(1, int(K) + 1):
+        omega = 2.0 * np.pi * float(k) / 24.0
+        cos = np.cos(omega * t)
+        sin = np.sin(omega * t)
+        columns.extend([cos * day, cos * night, sin * day, sin * night])
+    return np.column_stack(columns)
+
+
+def _expected_ou_regression_sigmas(series: np.ndarray, *, K: int, dt: float, start_hour: float) -> tuple[float, float]:
+    series = np.asarray(series, dtype=np.float64)
+    Y = series[1:] - series[:-1]
+    t = float(start_hour) + np.arange(Y.shape[0], dtype=np.float64) * float(dt)
+    X = _pascucci_test_design_matrix(series[:-1], t, int(K))
+    theta, *_ = np.linalg.lstsq(X, Y, rcond=None)
+    residuals = Y - X @ theta
+    p_regime = 2 + 2 * int(K)
+    day = _is_day_np(t)
+    night = ~day
+    sigma_day = np.sqrt(np.sum(residuals[day] ** 2) / (int(np.sum(day)) - p_regime) / float(dt))
+    sigma_night = np.sqrt(np.sum(residuals[night] ** 2) / (int(np.sum(night)) - p_regime) / float(dt))
+    return float(sigma_day), float(sigma_night)
+
+
 def _simulate_piecewise_ou_series(
     *,
     n_points: int,
@@ -720,7 +749,15 @@ def test_pascucci_calibrate_ou_variable_recovers_daynight_drift_dt_scaling() -> 
             seed=314159,
         )
         noisy_params = calibrate_OU_variable(noisy_series, K=0, dt=dt, start_hour=0.0)
+        expected_sigma_day, expected_sigma_night = _expected_ou_regression_sigmas(
+            noisy_series,
+            K=0,
+            dt=dt,
+            start_hour=0.0,
+        )
         recovered_sigmas[dt] = (float(noisy_params["sigma_day"]), float(noisy_params["sigma_night"]))
+        np.testing.assert_allclose(noisy_params["sigma_day"], expected_sigma_day, rtol=1.0e-12, atol=1.0e-12)
+        np.testing.assert_allclose(noisy_params["sigma_night"], expected_sigma_night, rtol=1.0e-12, atol=1.0e-12)
         np.testing.assert_allclose(noisy_params["sigma_day"], 0.04, rtol=0.08, atol=0.004)
         np.testing.assert_allclose(noisy_params["sigma_night"], 0.07, rtol=0.08, atol=0.004)
     np.testing.assert_allclose(recovered_sigmas[0.5], recovered_sigmas[1.0], rtol=0.08, atol=0.004)
@@ -758,8 +795,42 @@ def test_pascucci_calibrate_ou_variable_rejects_degenerate_inputs() -> None:
     from .pascucci_calibration import calibrate_OU_variable
 
     invalid_cases = [
-        ("too few regression rows", np.linspace(0.0, 1.0, 8), {"K": 1, "dt": 3.0, "start_hour": 4.0}),
-        ("missing night regime", np.linspace(0.0, 1.0, 8), {"K": 0, "dt": 1.0, "start_hour": 7.0}),
+        (
+            "too few regression rows",
+            np.linspace(0.0, 1.0, 8),
+            {"K": 1, "dt": 3.0, "start_hour": 4.0},
+            ("underdetermined",),
+        ),
+        (
+            "insufficient per-regime residual dof",
+            _simulate_piecewise_ou_series(n_points=13, dt=1.0, start_hour=1.0),
+            {"K": 2, "dt": 1.0, "start_hour": 1.0},
+            ("residual degrees of freedom",),
+        ),
+        (
+            "missing night regime",
+            np.linspace(0.0, 1.0, 8),
+            {"K": 0, "dt": 1.0, "start_hour": 7.0},
+            ("night",),
+        ),
+        (
+            "ill-conditioned regression",
+            1.0 + 1.0e-10 * np.sin(np.arange(240, dtype=np.float64)),
+            {"K": 0, "dt": 1.0, "start_hour": 0.0},
+            ("ill-conditioned", "condition"),
+        ),
+        (
+            "tiny non-identifiable kappa",
+            _simulate_piecewise_ou_series(
+                n_points=240,
+                dt=1.0,
+                start_hour=0.0,
+                kappa_day=1.0e-5,
+                kappa_night=1.0e-5,
+            ),
+            {"K": 0, "dt": 1.0, "start_hour": 0.0, "kappa_min": 1.0e-4},
+            ("mean-reverting", "kappa"),
+        ),
         (
             "anti mean reverting kappa",
             _simulate_piecewise_ou_series(
@@ -770,13 +841,16 @@ def test_pascucci_calibrate_ou_variable_rejects_degenerate_inputs() -> None:
                 kappa_night=-0.10,
             ),
             {"K": 0, "dt": 1.0, "start_hour": 0.0},
+            ("mean-reverting", "ill-conditioned", "condition"),
         ),
     ]
-    for label, series, kwargs in invalid_cases:
+    for label, series, kwargs, expected_tokens in invalid_cases:
         try:
             calibrate_OU_variable(series, **kwargs)
         except ValueError as exc:
-            assert str(exc).strip(), label
+            message = str(exc).lower()
+            assert message.strip(), label
+            assert any(token in message for token in expected_tokens), (label, message)
         else:
             raise AssertionError(f"calibrate_OU_variable should reject {label}")
 
