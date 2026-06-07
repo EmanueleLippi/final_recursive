@@ -7,8 +7,10 @@ import os
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 from typing import Callable, List
+from xml.sax.saxutils import escape
 
 import numpy as np
 
@@ -329,6 +331,595 @@ def test_model_spec_contract() -> None:
     Xi = spec.deterministic_xi(4, 4, seed=11)
     assert Xi.shape == (4, 4)
     assert Xi.dtype == np.float32
+
+
+PASCUCCI_CALIBRATION_TDD_CONTRACTS = {
+    "pascucci_prepare_H_hourly_mean_net_power_and_scale": {
+        "type": "unit",
+        "target": "pascucci_data.prepare_H",
+        "purpose": "Protect historical H ingestion: hourly mean net power, not energy sum.",
+        "expected": "1D float array with truncated full blocks and mul_factor applied.",
+        "failure": "Catches unit-scale drift, tail handling drift, or net-power sign swap.",
+    },
+    "pascucci_prepare_H_missing_columns_raise": {
+        "type": "negative-unit",
+        "target": "pascucci_data.prepare_H",
+        "purpose": "Fail closed when required home-load CSV columns are missing.",
+        "expected": "ValueError naming the missing required columns.",
+        "failure": "Catches silent acceptance of malformed load/production files.",
+    },
+    "pascucci_prepare_S_xlsx_hourly_mean_comma_decimal_and_no_log": {
+        "type": "unit",
+        "target": "pascucci_data.prepare_S",
+        "purpose": "Protect price ingestion: comma decimals, hourly averaging, no log transform.",
+        "expected": "1D float array of linear prices after mul_factor, not log prices.",
+        "failure": "Catches locale parsing errors, double-log risk, and scale drift.",
+    },
+    "pascucci_prepare_S_missing_or_non_numeric_values_raise": {
+        "type": "negative-unit",
+        "target": "pascucci_data.prepare_S",
+        "purpose": "Fail closed on missing price column or non-numeric price cells.",
+        "expected": "ValueError for missing columns and ValueError for invalid numeric cells.",
+        "failure": "Catches silent bad-price ingestion before OU calibration.",
+    },
+    "pascucci_calibrate_ou_variable_recovers_daynight_drift_dt_scaling": {
+        "type": "oracle-unit",
+        "target": "pascucci_calibration.calibrate_OU_variable",
+        "purpose": "Protect continuous-time OU parameter recovery and the dt scaling fix.",
+        "expected": "Known kappa/a0 recovered and continuous-time sigma normalized by sqrt(dt).",
+        "failure": "Catches recurrence of the historical dt scaling bug.",
+    },
+    "pascucci_calibrate_ou_variable_start_hour_controls_phase": {
+        "type": "oracle-unit",
+        "target": "pascucci_calibration.calibrate_OU_variable",
+        "purpose": "Make physical 24h clock phase explicit through start_hour.",
+        "expected": "Shifted synthetic series recovers parameters only with matching start_hour.",
+        "failure": "Catches hidden reset of day/night and Fourier phase at block boundaries.",
+    },
+    "pascucci_calibrate_ou_variable_rejects_degenerate_inputs": {
+        "type": "negative-unit",
+        "target": "pascucci_calibration.calibrate_OU_variable",
+        "purpose": "Fail fast on underdetermined, missing-regime, or non-mean-reverting fits.",
+        "expected": "ValueError for too few rows, missing regimes, and kappa <= kappa_min.",
+        "failure": "Catches singular OLS, NaN sigma, and anti-mean-reverting drift.",
+    },
+    "pascucci_calibration_output_contract_shapes": {
+        "type": "unit",
+        "target": "pascucci_calibration.calibrate_OU_variable/validate_ou_params schema",
+        "purpose": "Freeze params_S/params_H schema consumed by the Pascucci model abstraction.",
+        "expected": "10 exact keys; validate_ou_params returns None; Fourier arrays shape (K,); finite scalars; sigma >= 0.",
+        "failure": "Catches schema drift before malformed params reach the model layer.",
+    },
+    "pascucci_calibrate_inputs_log_price_guard_and_parity": {
+        "type": "regression-unit",
+        "target": "pascucci_calibration.calibrate_pascucci_ou_inputs",
+        "purpose": "Make prepare_S no-log and log-price calibration guard explicit.",
+        "expected": "S <= 0 rejected; positive S path equals direct np.log(S) calibration.",
+        "failure": "Catches double-log/no-log mistakes in Pascucci price calibration.",
+    },
+    "quadratic_spec_unaffected_by_pascucci_calibration_import": {
+        "type": "regression-unit",
+        "target": "model_specs.get_model_spec plus Pascucci calibration imports",
+        "purpose": "Protect frozen quadratic_coupled baseline from calibration module side effects.",
+        "expected": "Quadratic metadata, params, deterministic Xi, and RNG stream unchanged.",
+        "failure": "Catches hidden import-time coupling to the benchmark path.",
+    },
+}
+
+
+def _assert_pascucci_tdd_contract(name: str) -> None:
+    contract = PASCUCCI_CALIBRATION_TDD_CONTRACTS[name]
+    for key in ("type", "target", "purpose", "expected", "failure"):
+        value = str(contract.get(key, "")).strip()
+        assert value, f"{name} missing TDD contract field {key}"
+
+
+def _write_rows_csv(path: Path, fieldnames: List[str], rows: List[dict]) -> None:
+    import csv
+
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _xlsx_col_name(index: int) -> str:
+    index = int(index)
+    name = ""
+    while index >= 0:
+        name = chr(ord("A") + (index % 26)) + name
+        index = index // 26 - 1
+    return name
+
+
+def _write_minimal_xlsx(path: Path, headers: List[str], rows: List[List[object]]) -> None:
+    xml_rows = []
+    all_rows = [headers] + rows
+    for row_idx, row in enumerate(all_rows, start=1):
+        cells = []
+        for col_idx, value in enumerate(row):
+            ref = f"{_xlsx_col_name(col_idx)}{row_idx}"
+            text = escape(str(value))
+            cells.append(f'<c r="{ref}" t="inlineStr"><is><t>{text}</t></is></c>')
+        xml_rows.append(f'<row r="{row_idx}">' + "".join(cells) + "</row>")
+
+    last_ref = f"{_xlsx_col_name(len(all_rows[0]) - 1)}{len(all_rows)}"
+    worksheet = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f'<dimension ref="A1:{last_ref}"/>'
+        "<sheetData>"
+        + "".join(xml_rows)
+        + "</sheetData></worksheet>"
+    )
+    workbook = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>'
+    )
+    workbook_rels = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+        'Target="worksheets/sheet1.xml"/></Relationships>'
+    )
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="xl/workbook.xml"/></Relationships>'
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        "</Types>"
+    )
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", root_rels)
+        archive.writestr("xl/workbook.xml", workbook)
+        archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        archive.writestr("xl/worksheets/sheet1.xml", worksheet)
+
+
+def _is_day_np(t: np.ndarray) -> np.ndarray:
+    hour = np.mod(np.asarray(t, dtype=np.float64), 24.0)
+    return (hour >= 7.0) & (hour < 19.0)
+
+
+def _as_harmonic_coeffs(values) -> np.ndarray:
+    if values is None:
+        return np.zeros(0, dtype=np.float64)
+    return np.asarray(values, dtype=np.float64).reshape(-1)
+
+
+def _periodic_mean_np(t: np.ndarray, a0: float, alpha, beta) -> np.ndarray:
+    t = np.asarray(t, dtype=np.float64)
+    alpha_arr = _as_harmonic_coeffs(alpha)
+    beta_arr = _as_harmonic_coeffs(beta)
+    if alpha_arr.shape != beta_arr.shape:
+        raise ValueError("alpha and beta test coefficients must have the same length")
+    mean = np.full_like(t, float(a0), dtype=np.float64)
+    for idx, (alpha_k, beta_k) in enumerate(zip(alpha_arr, beta_arr), start=1):
+        omega = 2.0 * np.pi * float(idx) / 24.0
+        mean += float(alpha_k) * np.cos(omega * t)
+        mean += float(beta_k) * np.sin(omega * t)
+    return mean
+
+
+def _simulate_piecewise_ou_series(
+    *,
+    n_points: int,
+    dt: float,
+    start_hour: float = 0.0,
+    kappa_day: float = 0.30,
+    kappa_night: float = 0.15,
+    a0_day: float = 1.20,
+    a0_night: float = -0.80,
+    alpha_day=None,
+    alpha_night=None,
+    beta_day=None,
+    beta_night=None,
+    sigma_day: float = 0.0,
+    sigma_night: float = 0.0,
+    seed: int | None = None,
+    x0: float = 0.35,
+) -> np.ndarray:
+    alpha_day_arr = _as_harmonic_coeffs(alpha_day)
+    alpha_night_arr = _as_harmonic_coeffs(alpha_night)
+    beta_day_arr = np.zeros_like(alpha_day_arr) if beta_day is None else _as_harmonic_coeffs(beta_day)
+    beta_night_arr = np.zeros_like(alpha_night_arr) if beta_night is None else _as_harmonic_coeffs(beta_night)
+    if alpha_day_arr.shape != beta_day_arr.shape:
+        raise ValueError("alpha_day and beta_day test coefficients must have the same length")
+    if alpha_night_arr.shape != beta_night_arr.shape:
+        raise ValueError("alpha_night and beta_night test coefficients must have the same length")
+    rng = np.random.RandomState(seed) if seed is not None else None
+    values = np.zeros(int(n_points), dtype=np.float64)
+    values[0] = float(x0)
+    for i in range(int(n_points) - 1):
+        t = float(start_hour) + float(i) * float(dt)
+        if _is_day_np(np.asarray([t]))[0]:
+            kappa = float(kappa_day)
+            a0 = float(a0_day)
+            alpha = alpha_day_arr
+            beta = beta_day_arr
+            sigma = float(sigma_day)
+        else:
+            kappa = float(kappa_night)
+            a0 = float(a0_night)
+            alpha = alpha_night_arr
+            beta = beta_night_arr
+            sigma = float(sigma_night)
+        diffusion = 0.0
+        if sigma != 0.0:
+            if rng is None:
+                raise ValueError("seed is required for noisy synthetic OU test series")
+            diffusion = sigma * np.sqrt(float(dt)) * rng.normal()
+        mu = _periodic_mean_np(np.asarray([t]), a0, alpha, beta)[0]
+        values[i + 1] = values[i] + kappa * (mu - values[i]) * float(dt) + diffusion
+    return values.astype(np.float64)
+
+
+def _assert_ou_params_close_to_piecewise_truth(
+    params: dict,
+    *,
+    kappa_day: float = 0.30,
+    kappa_night: float = 0.15,
+    a0_day: float = 1.20,
+    a0_night: float = -0.80,
+    alpha_day=None,
+    alpha_night=None,
+    beta_day=None,
+    beta_night=None,
+    atol: float = 1.0e-8,
+) -> None:
+    alpha_day_arr = _as_harmonic_coeffs(alpha_day)
+    alpha_night_arr = _as_harmonic_coeffs(alpha_night)
+    beta_day_arr = np.zeros_like(alpha_day_arr) if beta_day is None else _as_harmonic_coeffs(beta_day)
+    beta_night_arr = np.zeros_like(alpha_night_arr) if beta_night is None else _as_harmonic_coeffs(beta_night)
+    np.testing.assert_allclose(params["kappa_day"], kappa_day, rtol=1.0e-7, atol=atol)
+    np.testing.assert_allclose(params["kappa_night"], kappa_night, rtol=1.0e-7, atol=atol)
+    np.testing.assert_allclose(params["a0_day"], a0_day, rtol=1.0e-7, atol=atol)
+    np.testing.assert_allclose(params["a0_night"], a0_night, rtol=1.0e-7, atol=atol)
+    np.testing.assert_allclose(params["alpha_day"], alpha_day_arr, atol=atol)
+    np.testing.assert_allclose(params["alpha_night"], alpha_night_arr, atol=atol)
+    np.testing.assert_allclose(params["beta_day"], beta_day_arr, atol=atol)
+    np.testing.assert_allclose(params["beta_night"], beta_night_arr, atol=atol)
+    assert float(params["sigma_day"]) <= 1.0e-8
+    assert float(params["sigma_night"]) <= 1.0e-8
+
+
+def test_pascucci_tdd_contract_metadata() -> None:
+    expected_names = {
+        "pascucci_prepare_H_hourly_mean_net_power_and_scale",
+        "pascucci_prepare_H_missing_columns_raise",
+        "pascucci_prepare_S_xlsx_hourly_mean_comma_decimal_and_no_log",
+        "pascucci_prepare_S_missing_or_non_numeric_values_raise",
+        "pascucci_calibrate_ou_variable_recovers_daynight_drift_dt_scaling",
+        "pascucci_calibrate_ou_variable_start_hour_controls_phase",
+        "pascucci_calibrate_ou_variable_rejects_degenerate_inputs",
+        "pascucci_calibration_output_contract_shapes",
+        "pascucci_calibrate_inputs_log_price_guard_and_parity",
+        "quadratic_spec_unaffected_by_pascucci_calibration_import",
+    }
+    assert set(PASCUCCI_CALIBRATION_TDD_CONTRACTS) == expected_names
+    for name in expected_names:
+        _assert_pascucci_tdd_contract(name)
+
+
+def test_pascucci_prepare_H_hourly_mean_net_power_and_scale() -> None:
+    _assert_pascucci_tdd_contract("pascucci_prepare_H_hourly_mean_net_power_and_scale")
+    from .pascucci_data import prepare_H
+
+    consumo = np.asarray([100, 120, 140, 160, 200, 220, 240, 260, 900, 901, 902], dtype=np.float64)
+    produzione = np.asarray([10, 20, 30, 40, 50, 60, 70, 80, 1, 2, 3], dtype=np.float64)
+    rows = [
+        {"Consumo (W)": str(c), "Produzione (W)": str(p)}
+        for c, p in zip(consumo, produzione)
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "home.csv"
+        _write_rows_csv(path, ["Consumo (W)", "Produzione (W)"], rows)
+        prepared = prepare_H(str(path), n=4, mul_factor=0.001)
+
+    expected = np.asarray(
+        [
+            np.mean((consumo - produzione)[:4]),
+            np.mean((consumo - produzione)[4:8]),
+        ],
+        dtype=np.float64,
+    ) * 0.001
+    assert prepared.shape == (2,)
+    assert np.all(np.isfinite(prepared))
+    np.testing.assert_allclose(prepared, expected, rtol=0.0, atol=1.0e-12)
+
+
+def test_pascucci_prepare_H_missing_columns_raise() -> None:
+    _assert_pascucci_tdd_contract("pascucci_prepare_H_missing_columns_raise")
+    from .pascucci_data import prepare_H
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "bad_home.csv"
+        _write_rows_csv(path, ["Consumo (W)"], [{"Consumo (W)": "1.0"}])
+        try:
+            prepare_H(str(path), n=1, mul_factor=1.0)
+        except ValueError as exc:
+            message = str(exc)
+            assert "Produzione (W)" in message
+        else:
+            raise AssertionError("prepare_H should reject missing Produzione (W)")
+
+
+def test_pascucci_prepare_S_xlsx_hourly_mean_comma_decimal_and_no_log() -> None:
+    _assert_pascucci_tdd_contract("pascucci_prepare_S_xlsx_hourly_mean_comma_decimal_and_no_log")
+    from .pascucci_data import prepare_S
+
+    values = ["10,0", "20,0", "30,0", "40,0", "50,0", "60,0", "999,0"]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "prices.xlsx"
+        _write_minimal_xlsx(path, ["Data", "Ora", "€/MWh"], [["d", i, value] for i, value in enumerate(values)])
+        prepared = prepare_S(str(path), n=3, mul_factor=0.01)
+
+    expected = np.asarray([0.2, 0.5], dtype=np.float64)
+    assert prepared.shape == (2,)
+    assert np.all(np.isfinite(prepared))
+    np.testing.assert_allclose(prepared, expected, rtol=0.0, atol=1.0e-12)
+
+
+def test_pascucci_prepare_S_missing_or_non_numeric_values_raise() -> None:
+    _assert_pascucci_tdd_contract("pascucci_prepare_S_missing_or_non_numeric_values_raise")
+    from .pascucci_data import prepare_S
+
+    with tempfile.TemporaryDirectory() as tmp:
+        missing_path = Path(tmp) / "missing_price.xlsx"
+        _write_minimal_xlsx(missing_path, ["Data", "Ora"], [["d", "1"]])
+        try:
+            prepare_S(str(missing_path), n=1, mul_factor=1.0)
+        except ValueError as exc:
+            assert "€/MWh" in str(exc)
+        else:
+            raise AssertionError("prepare_S should reject missing €/MWh")
+
+        bad_value_path = Path(tmp) / "bad_price.xlsx"
+        _write_minimal_xlsx(bad_value_path, ["Data", "Ora", "€/MWh"], [["d", "1", "not-a-number"]])
+        try:
+            prepare_S(str(bad_value_path), n=1, mul_factor=1.0)
+        except ValueError as exc:
+            message = str(exc)
+            assert "€/MWh" in message
+            assert "numeric" in message.lower() or "not-a-number" in message
+        else:
+            raise AssertionError("prepare_S should reject non-numeric price values")
+
+
+def test_pascucci_calibrate_ou_variable_recovers_daynight_drift_dt_scaling() -> None:
+    _assert_pascucci_tdd_contract("pascucci_calibrate_ou_variable_recovers_daynight_drift_dt_scaling")
+    from .pascucci_calibration import calibrate_OU_variable
+
+    for dt in (1.0, 0.5):
+        series = _simulate_piecewise_ou_series(n_points=240, dt=dt, start_hour=0.0)
+        params = calibrate_OU_variable(series, K=0, dt=dt, start_hour=0.0)
+        _assert_ou_params_close_to_piecewise_truth(params)
+
+    recovered_sigmas = {}
+    for dt, n_points in ((1.0, 6000), (0.5, 6000)):
+        noisy_series = _simulate_piecewise_ou_series(
+            n_points=n_points,
+            dt=dt,
+            start_hour=0.0,
+            sigma_day=0.04,
+            sigma_night=0.07,
+            seed=314159,
+        )
+        noisy_params = calibrate_OU_variable(noisy_series, K=0, dt=dt, start_hour=0.0)
+        recovered_sigmas[dt] = (float(noisy_params["sigma_day"]), float(noisy_params["sigma_night"]))
+        np.testing.assert_allclose(noisy_params["sigma_day"], 0.04, rtol=0.08, atol=0.004)
+        np.testing.assert_allclose(noisy_params["sigma_night"], 0.07, rtol=0.08, atol=0.004)
+    np.testing.assert_allclose(recovered_sigmas[0.5], recovered_sigmas[1.0], rtol=0.08, atol=0.004)
+
+
+def test_pascucci_calibrate_ou_variable_start_hour_controls_phase() -> None:
+    _assert_pascucci_tdd_contract("pascucci_calibrate_ou_variable_start_hour_controls_phase")
+    from .pascucci_calibration import calibrate_OU_variable
+
+    harmonic_truth = {
+        "alpha_day": np.asarray([0.20], dtype=np.float64),
+        "alpha_night": np.asarray([-0.15], dtype=np.float64),
+        "beta_day": np.asarray([0.10], dtype=np.float64),
+        "beta_night": np.asarray([-0.05], dtype=np.float64),
+    }
+    series = _simulate_piecewise_ou_series(n_points=240, dt=1.0, start_hour=6.0, **harmonic_truth)
+    correct_phase = calibrate_OU_variable(series, K=1, dt=1.0, start_hour=6.0)
+    _assert_ou_params_close_to_piecewise_truth(correct_phase, **harmonic_truth)
+
+    wrong_phase = calibrate_OU_variable(series, K=1, dt=1.0, start_hour=0.0)
+    mismatch_terms = [
+        abs(float(wrong_phase["kappa_day"]) - 0.30),
+        abs(float(wrong_phase["kappa_night"]) - 0.15),
+        abs(float(wrong_phase["a0_day"]) - 1.20),
+        abs(float(wrong_phase["a0_night"]) + 0.80),
+    ]
+    for key, expected in harmonic_truth.items():
+        mismatch_terms.extend(np.abs(np.asarray(wrong_phase[key], dtype=np.float64) - expected).reshape(-1))
+    mismatch = max(float(value) for value in mismatch_terms)
+    assert mismatch > 1.0e-3, "wrong start_hour should not silently recover the oracle"
+
+
+def test_pascucci_calibrate_ou_variable_rejects_degenerate_inputs() -> None:
+    _assert_pascucci_tdd_contract("pascucci_calibrate_ou_variable_rejects_degenerate_inputs")
+    from .pascucci_calibration import calibrate_OU_variable
+
+    invalid_cases = [
+        ("too few regression rows", np.linspace(0.0, 1.0, 8), {"K": 1, "dt": 3.0, "start_hour": 4.0}),
+        ("missing night regime", np.linspace(0.0, 1.0, 8), {"K": 0, "dt": 1.0, "start_hour": 7.0}),
+        (
+            "anti mean reverting kappa",
+            _simulate_piecewise_ou_series(
+                n_points=240,
+                dt=1.0,
+                start_hour=0.0,
+                kappa_day=-0.20,
+                kappa_night=-0.10,
+            ),
+            {"K": 0, "dt": 1.0, "start_hour": 0.0},
+        ),
+    ]
+    for label, series, kwargs in invalid_cases:
+        try:
+            calibrate_OU_variable(series, **kwargs)
+        except ValueError as exc:
+            assert str(exc).strip(), label
+        else:
+            raise AssertionError(f"calibrate_OU_variable should reject {label}")
+
+
+def test_pascucci_calibration_output_contract_shapes() -> None:
+    _assert_pascucci_tdd_contract("pascucci_calibration_output_contract_shapes")
+    from .pascucci_calibration import calibrate_OU_variable, validate_ou_params
+
+    K = 2
+    series = _simulate_piecewise_ou_series(n_points=240, dt=1.0, start_hour=0.0)
+    params = calibrate_OU_variable(series, K=K, dt=1.0, start_hour=0.0)
+    params_snapshot = {key: np.asarray(value).copy() for key, value in params.items()}
+    assert validate_ou_params(params, K=K) is None
+
+    expected_keys = {
+        "kappa_day",
+        "kappa_night",
+        "a0_day",
+        "a0_night",
+        "alpha_day",
+        "alpha_night",
+        "beta_day",
+        "beta_night",
+        "sigma_day",
+        "sigma_night",
+    }
+    assert set(params) == expected_keys
+    for key, value in params_snapshot.items():
+        np.testing.assert_allclose(params[key], value)
+    for key in ("alpha_day", "alpha_night", "beta_day", "beta_night"):
+        value = np.asarray(params[key])
+        assert value.shape == (K,), f"{key} shape {value.shape}"
+        assert np.all(np.isfinite(value)), key
+    for key in expected_keys - {"alpha_day", "alpha_night", "beta_day", "beta_night"}:
+        assert np.asarray(params[key]).shape == (), key
+        assert np.isfinite(float(params[key])), key
+    assert float(params["sigma_day"]) >= 0.0
+    assert float(params["sigma_night"]) >= 0.0
+
+    bad_params = dict(params)
+    bad_params["alpha_day"] = np.asarray([0.0], dtype=np.float32)
+    try:
+        validate_ou_params(bad_params, K=K)
+    except ValueError as exc:
+        assert "alpha_day" in str(exc) or "K" in str(exc)
+    else:
+        raise AssertionError("validate_ou_params should reject wrong harmonic length")
+
+    bad_params = dict(params)
+    bad_params.pop("sigma_day")
+    try:
+        validate_ou_params(bad_params, K=K)
+    except ValueError as exc:
+        assert "sigma_day" in str(exc)
+    else:
+        raise AssertionError("validate_ou_params should reject missing sigma_day")
+
+    bad_params = dict(params)
+    bad_params["beta_night"] = np.asarray([0.0, np.nan], dtype=np.float32)
+    try:
+        validate_ou_params(bad_params, K=K)
+    except ValueError as exc:
+        assert "beta_night" in str(exc) or "finite" in str(exc).lower()
+    else:
+        raise AssertionError("validate_ou_params should reject NaN harmonic coefficients")
+
+    bad_params = dict(params)
+    bad_params["sigma_night"] = np.float32(-1.0)
+    try:
+        validate_ou_params(bad_params, K=K)
+    except ValueError as exc:
+        assert "sigma_night" in str(exc) or "non-negative" in str(exc).lower()
+    else:
+        raise AssertionError("validate_ou_params should reject negative sigma")
+
+
+def test_pascucci_calibrate_inputs_log_price_guard_and_parity() -> None:
+    _assert_pascucci_tdd_contract("pascucci_calibrate_inputs_log_price_guard_and_parity")
+    from .pascucci_calibration import calibrate_OU_variable, calibrate_pascucci_ou_inputs
+
+    H_series = _simulate_piecewise_ou_series(n_points=240, dt=1.0, start_hour=0.0)
+    log_S_series = _simulate_piecewise_ou_series(
+        n_points=240,
+        dt=1.0,
+        start_hour=0.0,
+        x0=0.15,
+        a0_day=0.25,
+        a0_night=-0.10,
+    )
+    S_prices = np.exp(log_S_series)
+    bundle = calibrate_pascucci_ou_inputs(H_series, S_prices, K=0, dt=1.0, start_hour=0.0, log_price=True)
+    assert set(bundle) == {"params_H", "params_S"}
+    direct_log_params = calibrate_OU_variable(np.log(S_prices), K=0, dt=1.0, start_hour=0.0)
+    for key, value in direct_log_params.items():
+        np.testing.assert_allclose(bundle["params_S"][key], value, rtol=1.0e-7, atol=1.0e-8)
+
+    bad_prices = S_prices.copy()
+    bad_prices[3] = 0.0
+    try:
+        calibrate_pascucci_ou_inputs(H_series, bad_prices, K=0, dt=1.0, start_hour=0.0, log_price=True)
+    except ValueError as exc:
+        assert "positive" in str(exc).lower() or "log" in str(exc).lower()
+    else:
+        raise AssertionError("log_price=True should reject non-positive prices")
+
+
+def test_quadratic_spec_unaffected_by_pascucci_calibration_import() -> None:
+    _assert_pascucci_tdd_contract("quadratic_spec_unaffected_by_pascucci_calibration_import")
+    from .model_specs import get_model_spec
+
+    spec_before = get_model_spec("quadratic_coupled")
+    params_before = spec_before.build_default_params(const=0.75)
+    layers_before = spec_before.build_layers(4)
+    xi_before = spec_before.deterministic_xi(4, 4, seed=2026)
+    for module_name in ("final_recursive.pascucci_calibration", "final_recursive.pascucci_data"):
+        sys.modules.pop(module_name, None)
+    np.random.seed(2468)
+    expected_random_before = np.random.random(4)
+    expected_random_after_import = np.random.random(4)
+    np.random.seed(2468)
+    random_before = np.random.random(4)
+
+    import importlib
+
+    importlib.import_module("final_recursive.pascucci_calibration")
+    importlib.import_module("final_recursive.pascucci_data")
+
+    spec_after = get_model_spec("quadratic_coupled")
+    params_after = spec_after.build_default_params(const=0.75)
+    layers_after = spec_after.build_layers(4)
+    xi_after = spec_after.deterministic_xi(4, 4, seed=2026)
+    random_after = np.random.random(4)
+
+    assert spec_after.name == spec_before.name == "quadratic_coupled"
+    assert spec_after.state_labels == spec_before.state_labels
+    assert spec_after.z_labels == spec_before.z_labels
+    assert layers_after == layers_before
+    assert set(params_after) == set(params_before)
+    for key in params_before:
+        np.testing.assert_allclose(params_after[key], params_before[key])
+    np.testing.assert_allclose(xi_after, xi_before)
+    np.testing.assert_allclose(random_before, expected_random_before)
+    np.testing.assert_allclose(random_after, expected_random_after_import)
 
 
 def _pascucci_psi(x: np.ndarray, d: float, x_max: float) -> np.ndarray:
@@ -3310,6 +3901,41 @@ def run_tests(argv: List[str] | None = None) -> int:
         ("rollout_inputs_are_antithetic", test_rollout_inputs_are_antithetic),
         ("evaluation_bundle_rejects_block_metadata_mismatch", test_evaluation_bundle_rejects_block_metadata_mismatch),
         ("model_spec_contract", test_model_spec_contract),
+        ("pascucci_tdd_contract_metadata", test_pascucci_tdd_contract_metadata),
+        ("pascucci_prepare_H_hourly_mean_net_power_and_scale", test_pascucci_prepare_H_hourly_mean_net_power_and_scale),
+        ("pascucci_prepare_H_missing_columns_raise", test_pascucci_prepare_H_missing_columns_raise),
+        (
+            "pascucci_prepare_S_xlsx_hourly_mean_comma_decimal_and_no_log",
+            test_pascucci_prepare_S_xlsx_hourly_mean_comma_decimal_and_no_log,
+        ),
+        (
+            "pascucci_prepare_S_missing_or_non_numeric_values_raise",
+            test_pascucci_prepare_S_missing_or_non_numeric_values_raise,
+        ),
+        (
+            "pascucci_calibrate_ou_variable_recovers_daynight_drift_dt_scaling",
+            test_pascucci_calibrate_ou_variable_recovers_daynight_drift_dt_scaling,
+        ),
+        (
+            "pascucci_calibrate_ou_variable_start_hour_controls_phase",
+            test_pascucci_calibrate_ou_variable_start_hour_controls_phase,
+        ),
+        (
+            "pascucci_calibrate_ou_variable_rejects_degenerate_inputs",
+            test_pascucci_calibrate_ou_variable_rejects_degenerate_inputs,
+        ),
+        (
+            "pascucci_calibration_output_contract_shapes",
+            test_pascucci_calibration_output_contract_shapes,
+        ),
+        (
+            "pascucci_calibrate_inputs_log_price_guard_and_parity",
+            test_pascucci_calibrate_inputs_log_price_guard_and_parity,
+        ),
+        (
+            "quadratic_spec_unaffected_by_pascucci_calibration_import",
+            test_quadratic_spec_unaffected_by_pascucci_calibration_import,
+        ),
         ("model_spec_params_overlay_preserves_solver_flags", test_model_spec_params_overlay_preserves_solver_flags),
         ("exact_path_plot_outputs", test_exact_path_plot_outputs),
     ]
