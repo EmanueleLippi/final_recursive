@@ -245,3 +245,102 @@ def calibrate_pascucci_ou_inputs(
     params_H = calibrate_OU_variable(H, K=K, dt=dt, start_hour=start_hour)
     params_S = calibrate_OU_variable(S_for_calibration, K=K, dt=dt, start_hour=start_hour)
     return {"params_H": params_H, "params_S": params_S}
+
+def _to_json_native(value):
+    if isinstance(value, dict):
+        return {str(key): _to_json_native(child) for key, child in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_json_native(child) for child in value]
+    if isinstance(value, np.ndarray):
+        return [_to_json_native(child) for child in value.tolist()]
+    if isinstance(value, np.floating):
+        scalar = float(value)
+        if not np.isfinite(scalar):
+            raise ValueError("metadata contains non-finite float")
+        return scalar
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, float):
+        if not np.isfinite(value):
+            raise ValueError("metadata contains non-finite float")
+        return float(value)
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    return str(value)
+
+
+def serialize_ou_params(params, K: int) -> Dict[str, object]:
+    """Return a JSON-native copy of one Pascucci OU parameter dictionary."""
+
+    K_int, _ = _validate_k_dt(K, 1.0)
+    validate_ou_params(params, K_int)
+    serialized: Dict[str, object] = {
+        "kappa_day": float(params["kappa_day"]),
+        "kappa_night": float(params["kappa_night"]),
+        "a0_day": float(params["a0_day"]),
+        "a0_night": float(params["a0_night"]),
+        "alpha_day": [float(x) for x in np.asarray(params["alpha_day"], dtype=np.float64).reshape(-1)],
+        "alpha_night": [float(x) for x in np.asarray(params["alpha_night"], dtype=np.float64).reshape(-1)],
+        "beta_day": [float(x) for x in np.asarray(params["beta_day"], dtype=np.float64).reshape(-1)],
+        "beta_night": [float(x) for x in np.asarray(params["beta_night"], dtype=np.float64).reshape(-1)],
+        "sigma_day": float(params["sigma_day"]),
+        "sigma_night": float(params["sigma_night"]),
+    }
+    validate_ou_params(serialized, K_int)
+    return serialized
+
+
+def build_pascucci_calibration_config(
+    calibration,
+    *,
+    K: int,
+    dt: float = 1.0,
+    start_hour: float = 0.0,
+    log_price: bool = True,
+    H_metadata=None,
+    S_metadata=None,
+) -> Dict[str, object]:
+    """Build a JSON-safe calibration bundle for Pascucci run configs."""
+
+    K_int, dt_float = _validate_k_dt(K, dt)
+    start_hour_float = float(start_hour)
+    if not np.isfinite(start_hour_float):
+        raise ValueError("start_hour must be finite")
+    if "params_H" not in calibration or "params_S" not in calibration:
+        raise ValueError("calibration must contain params_H and params_S")
+
+    log_price_bool = bool(log_price)
+    return _to_json_native(
+        {
+            "params_H": serialize_ou_params(calibration["params_H"], K_int),
+            "params_S": serialize_ou_params(calibration["params_S"], K_int),
+            "calibration": {
+                "schema": "pascucci_ou_calibration_v1",
+                "K": K_int,
+                "dt": dt_float,
+                "start_hour": start_hour_float,
+                "day_window_hours": [7.0, 19.0],
+                "log_price": log_price_bool,
+                "H_transform": "linear",
+                "S_transform": "log" if log_price_bool else "linear",
+                "H_metadata": {} if H_metadata is None else H_metadata,
+                "S_metadata": {} if S_metadata is None else S_metadata,
+            },
+        }
+    )
+
+
+def build_pascucci_run_config_params(default_params, calibration_config) -> Dict[str, object]:
+    """Inject calibrated Pascucci OU params into a JSON-safe params dict."""
+
+    for key in ("params_H", "params_S", "calibration"):
+        if key not in calibration_config:
+            raise ValueError(f"calibration_config must contain {key}")
+
+    params = _to_json_native(default_params)
+    params["params_H"] = _to_json_native(calibration_config["params_H"])
+    params["params_S"] = _to_json_native(calibration_config["params_S"])
+    params["pascucci_calibration"] = _to_json_native(calibration_config["calibration"])
+    return params
