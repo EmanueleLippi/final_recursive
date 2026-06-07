@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -404,6 +405,48 @@ PASCUCCI_CALIBRATION_TDD_CONTRACTS = {
         "expected": "Quadratic metadata, params, deterministic Xi, and RNG stream unchanged.",
         "failure": "Catches hidden import-time coupling to the benchmark path.",
     },
+    "pascucci_ou_params_json_safe_after_serialization": {
+        "type": "unit",
+        "target": "pascucci_calibration.serialize_ou_params",
+        "purpose": "Make params_S/params_H safe for run_config JSON without relying on ad hoc encoder side effects.",
+        "expected": "OU params validate after serialization and contain only JSON-native scalars/lists.",
+        "failure": "Catches numpy scalar/array leakage into persisted run configs.",
+    },
+    "pascucci_day_night_boundary_semantics_are_explicit": {
+        "type": "unit",
+        "target": "pascucci_calibration.is_day",
+        "purpose": "Freeze physical day/night regime boundaries used by OU calibration.",
+        "expected": "Day is [7, 19) modulo 24, so 7.0 is day and 19.0 is night.",
+        "failure": "Catches off-by-one or hidden timezone/phase changes in day/night fits.",
+    },
+    "pascucci_log_price_false_calibrates_linear_prices": {
+        "type": "regression-unit",
+        "target": "pascucci_calibration.calibrate_pascucci_ou_inputs",
+        "purpose": "Protect both log-price and linear-price branches from collapsing to the same scale.",
+        "expected": "log_price=False matches direct calibration on linear S, while log_price=True matches direct calibration on log(S).",
+        "failure": "Catches silent double-log or no-log mistakes.",
+    },
+    "pascucci_calibration_config_records_units_log_price_dt_and_sources": {
+        "type": "unit",
+        "target": "pascucci_calibration.build_pascucci_calibration_config",
+        "purpose": "Freeze metadata for units, log-price policy, physical clock phase, and data sources.",
+        "expected": "JSON-safe config includes params_H, params_S, K, dt, start_hour, log_price, transforms, and source metadata.",
+        "failure": "Catches untraceable calibration assumptions before micro-runs.",
+    },
+    "pascucci_build_run_config_params_injects_calibrated_ou_without_losing_solver_flags": {
+        "type": "regression-unit",
+        "target": "pascucci_calibration.build_pascucci_run_config_params",
+        "purpose": "Ensure calibrated OU params can replace defaults in Pascucci params while preserving solver/training flags.",
+        "expected": "Returned params are JSON-safe, contain calibrated params_S/params_H and calibration metadata, and do not mutate defaults.",
+        "failure": "Catches non-reproducible run configs or accidental solver flag drops.",
+    },
+    "pascucci_minimal_fixture_pipeline_builds_json_run_params": {
+        "type": "acceptance-unit",
+        "target": "pascucci_data + pascucci_calibration fixture pipeline",
+        "purpose": "Exercise the minimum CSV/XLSX -> prepare -> calibrate -> run params path without starting a run.",
+        "expected": "Fixture pipeline produces finite validated params and a JSON-dumpable Pascucci run params dict.",
+        "failure": "Catches broken end-to-end calibration wiring before T12/T24 gates.",
+    },
 }
 
 
@@ -412,6 +455,30 @@ def _assert_pascucci_tdd_contract(name: str) -> None:
     for key in ("type", "target", "purpose", "expected", "failure"):
         value = str(contract.get(key, "")).strip()
         assert value, f"{name} missing TDD contract field {key}"
+
+
+def _assert_json_native_tree(value, *, path: str = "root") -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            assert isinstance(key, str), f"{path} contains non-string key {key!r}"
+            _assert_json_native_tree(child, path=f"{path}.{key}")
+        return
+    if isinstance(value, list):
+        for idx, child in enumerate(value):
+            _assert_json_native_tree(child, path=f"{path}[{idx}]")
+        return
+    assert value is None or isinstance(value, (str, int, float, bool)), (
+        f"{path} contains non-JSON-native value {type(value).__name__}: {value!r}"
+    )
+    if isinstance(value, float):
+        assert np.isfinite(value), f"{path} contains non-finite float"
+
+
+def _assert_json_roundtrip(value) -> None:
+    _assert_json_native_tree(value)
+    encoded = json.dumps(value, allow_nan=False, sort_keys=True)
+    decoded = json.loads(encoded)
+    assert decoded == value
 
 
 def _write_rows_csv(path: Path, fieldnames: List[str], rows: List[dict]) -> None:
@@ -638,6 +705,12 @@ def test_pascucci_tdd_contract_metadata() -> None:
         "pascucci_calibration_output_contract_shapes",
         "pascucci_calibrate_inputs_log_price_guard_and_parity",
         "quadratic_spec_unaffected_by_pascucci_calibration_import",
+        "pascucci_ou_params_json_safe_after_serialization",
+        "pascucci_day_night_boundary_semantics_are_explicit",
+        "pascucci_log_price_false_calibrates_linear_prices",
+        "pascucci_calibration_config_records_units_log_price_dt_and_sources",
+        "pascucci_build_run_config_params_injects_calibrated_ou_without_losing_solver_flags",
+        "pascucci_minimal_fixture_pipeline_builds_json_run_params",
     }
     assert set(PASCUCCI_CALIBRATION_TDD_CONTRACTS) == expected_names
     for name in expected_names:
@@ -994,6 +1067,275 @@ def test_quadratic_spec_unaffected_by_pascucci_calibration_import() -> None:
     np.testing.assert_allclose(xi_after, xi_before)
     np.testing.assert_allclose(random_before, expected_random_before)
     np.testing.assert_allclose(random_after, expected_random_after_import)
+
+
+def _build_sprint12_calibration_config(K: int = 1) -> dict:
+    from .pascucci_calibration import build_pascucci_calibration_config, calibrate_pascucci_ou_inputs
+
+    H_series = _simulate_piecewise_ou_series(
+        n_points=240,
+        dt=0.5,
+        start_hour=6.0,
+        kappa_day=0.22,
+        kappa_night=0.18,
+        a0_day=1.10,
+        a0_night=-0.45,
+        alpha_day=np.asarray([0.08], dtype=np.float64)[:K],
+        alpha_night=np.asarray([-0.04], dtype=np.float64)[:K],
+        beta_day=np.asarray([0.03], dtype=np.float64)[:K],
+        beta_night=np.asarray([-0.02], dtype=np.float64)[:K],
+        x0=0.20,
+    )
+    log_S_series = _simulate_piecewise_ou_series(
+        n_points=240,
+        dt=0.5,
+        start_hour=6.0,
+        kappa_day=0.20,
+        kappa_night=0.16,
+        a0_day=0.22,
+        a0_night=-0.05,
+        alpha_day=np.asarray([0.05], dtype=np.float64)[:K],
+        alpha_night=np.asarray([-0.02], dtype=np.float64)[:K],
+        beta_day=np.asarray([0.02], dtype=np.float64)[:K],
+        beta_night=np.asarray([-0.01], dtype=np.float64)[:K],
+        x0=0.10,
+    )
+    calibration = calibrate_pascucci_ou_inputs(
+        H_series,
+        np.exp(log_S_series),
+        K=K,
+        dt=0.5,
+        start_hour=6.0,
+        log_price=True,
+    )
+    return build_pascucci_calibration_config(
+        calibration,
+        K=K,
+        dt=0.5,
+        start_hour=6.0,
+        log_price=True,
+        H_metadata={
+            "source_path": "fixture_H.csv",
+            "units": "kW",
+            "n_per_hour": 2,
+            "mul_factor": 0.001,
+        },
+        S_metadata={
+            "source_path": "fixture_S.xlsx",
+            "units": "EUR_per_MWh",
+            "n_per_hour": 2,
+            "mul_factor": 0.01,
+        },
+    )
+
+
+def test_pascucci_ou_params_json_safe_after_serialization() -> None:
+    _assert_pascucci_tdd_contract("pascucci_ou_params_json_safe_after_serialization")
+    from .pascucci_calibration import calibrate_OU_variable, serialize_ou_params, validate_ou_params
+
+    K = 1
+    series = _simulate_piecewise_ou_series(
+        n_points=240,
+        dt=1.0,
+        start_hour=0.0,
+        alpha_day=np.asarray([0.10], dtype=np.float64),
+        alpha_night=np.asarray([-0.06], dtype=np.float64),
+        beta_day=np.asarray([0.04], dtype=np.float64),
+        beta_night=np.asarray([-0.03], dtype=np.float64),
+    )
+    params = calibrate_OU_variable(series, K=K, dt=1.0, start_hour=0.0)
+    json_params = serialize_ou_params(params, K=K)
+
+    assert json_params is not params
+    assert set(json_params) == set(params)
+    assert validate_ou_params(json_params, K=K) is None
+    for key in ("alpha_day", "alpha_night", "beta_day", "beta_night"):
+        assert isinstance(json_params[key], list), key
+        assert len(json_params[key]) == K
+    for key in ("kappa_day", "kappa_night", "a0_day", "a0_night", "sigma_day", "sigma_night"):
+        assert isinstance(json_params[key], float), key
+    _assert_json_roundtrip(json_params)
+
+    json_params["alpha_day"][0] += 1.0
+    assert not np.allclose(json_params["alpha_day"], params["alpha_day"])
+
+
+def test_pascucci_day_night_boundary_semantics_are_explicit() -> None:
+    _assert_pascucci_tdd_contract("pascucci_day_night_boundary_semantics_are_explicit")
+    from .pascucci_calibration import is_day
+
+    times = np.asarray([6.999, 7.0, 18.999, 19.0, 30.999, 31.0, 42.999, 43.0], dtype=np.float64)
+    expected = np.asarray([False, True, True, False, False, True, True, False], dtype=bool)
+    result = is_day(times)
+    assert result.dtype == np.bool_
+    np.testing.assert_array_equal(result, expected)
+
+
+def test_pascucci_log_price_false_calibrates_linear_prices() -> None:
+    _assert_pascucci_tdd_contract("pascucci_log_price_false_calibrates_linear_prices")
+    from .pascucci_calibration import calibrate_OU_variable, calibrate_pascucci_ou_inputs
+
+    H_series = _simulate_piecewise_ou_series(n_points=240, dt=1.0, start_hour=0.0)
+    log_S_series = _simulate_piecewise_ou_series(
+        n_points=240,
+        dt=1.0,
+        start_hour=0.0,
+        x0=0.15,
+        a0_day=0.25,
+        a0_night=-0.10,
+    )
+    S_prices = np.exp(log_S_series)
+    linear_bundle = calibrate_pascucci_ou_inputs(H_series, S_prices, K=0, dt=1.0, start_hour=0.0, log_price=False)
+    direct_linear_params = calibrate_OU_variable(S_prices, K=0, dt=1.0, start_hour=0.0)
+    direct_log_params = calibrate_OU_variable(np.log(S_prices), K=0, dt=1.0, start_hour=0.0)
+    for key, value in direct_linear_params.items():
+        np.testing.assert_allclose(linear_bundle["params_S"][key], value, rtol=1.0e-7, atol=1.0e-8)
+
+    differences = [
+        float(abs(np.asarray(direct_linear_params[key]).reshape(-1)[0] - np.asarray(direct_log_params[key]).reshape(-1)[0]))
+        for key in ("kappa_day", "kappa_night", "a0_day", "a0_night")
+    ]
+    assert max(differences) > 1.0e-3, "linear and log price calibration should differ on this fixture"
+
+
+def test_pascucci_calibration_config_records_units_log_price_dt_and_sources() -> None:
+    _assert_pascucci_tdd_contract("pascucci_calibration_config_records_units_log_price_dt_and_sources")
+    from .pascucci_calibration import validate_ou_params
+
+    config = _build_sprint12_calibration_config(K=1)
+    assert set(config) == {"params_H", "params_S", "calibration"}
+    metadata = config["calibration"]
+    assert metadata["schema"] == "pascucci_ou_calibration_v1"
+    assert metadata["K"] == 1
+    assert metadata["dt"] == 0.5
+    assert metadata["start_hour"] == 6.0
+    assert metadata["day_window_hours"] == [7.0, 19.0]
+    assert metadata["log_price"] is True
+    assert metadata["H_transform"] == "linear"
+    assert metadata["S_transform"] == "log"
+    assert metadata["H_metadata"]["units"] == "kW"
+    assert metadata["H_metadata"]["n_per_hour"] == 2
+    assert metadata["S_metadata"]["units"] == "EUR_per_MWh"
+    assert metadata["S_metadata"]["mul_factor"] == 0.01
+    assert validate_ou_params(config["params_H"], K=1) is None
+    assert validate_ou_params(config["params_S"], K=1) is None
+    _assert_json_roundtrip(config)
+
+
+def test_pascucci_build_run_config_params_injects_calibrated_ou_without_losing_solver_flags() -> None:
+    _assert_pascucci_tdd_contract(
+        "pascucci_build_run_config_params_injects_calibrated_ou_without_losing_solver_flags"
+    )
+    from .model_specs import get_model_spec
+    from .pascucci_calibration import build_pascucci_run_config_params
+
+    defaults = get_model_spec("pascucci").build_default_params(const=0.75)
+    defaults.update(
+        {
+            "same_xi_antithetic_sampling": True,
+            "dynamic_loss_dt_normalization": True,
+            "terminal_z_component_weights": [1.0, 2.0, 3.0, 4.0],
+        }
+    )
+    defaults_snapshot = {
+        key: value.copy() if isinstance(value, dict) else value
+        for key, value in defaults.items()
+    }
+    config = _build_sprint12_calibration_config(K=1)
+    params = build_pascucci_run_config_params(defaults, config)
+
+    assert params is not defaults
+    assert params["const"] == 0.75
+    assert params["same_xi_antithetic_sampling"] is True
+    assert params["dynamic_loss_dt_normalization"] is True
+    assert params["terminal_z_component_weights"] == [1.0, 2.0, 3.0, 4.0]
+    assert params["params_H"] == config["params_H"]
+    assert params["params_S"] == config["params_S"]
+    assert params["pascucci_calibration"] == config["calibration"]
+    assert np.asarray(defaults_snapshot["params_H"]["alpha_day"]).shape == (1,)
+    assert np.asarray(defaults["params_H"]["alpha_day"]).shape == (1,)
+    _assert_json_roundtrip(params)
+
+
+def test_pascucci_minimal_fixture_pipeline_builds_json_run_params() -> None:
+    _assert_pascucci_tdd_contract("pascucci_minimal_fixture_pipeline_builds_json_run_params")
+    from .model_specs import get_model_spec
+    from .pascucci_calibration import (
+        build_pascucci_calibration_config,
+        build_pascucci_run_config_params,
+        calibrate_pascucci_ou_inputs,
+        validate_ou_params,
+    )
+    from .pascucci_data import prepare_H, prepare_S
+
+    n_per_hour = 2
+    H_hours = _simulate_piecewise_ou_series(n_points=240, dt=1.0, start_hour=0.0)
+    log_S_hours = _simulate_piecewise_ou_series(
+        n_points=240,
+        dt=1.0,
+        start_hour=0.0,
+        x0=0.08,
+        a0_day=0.18,
+        a0_night=-0.08,
+    )
+    S_hours = np.exp(log_S_hours)
+    H_rows = []
+    for value in H_hours:
+        for _ in range(n_per_hour):
+            production = 5000.0
+            consumption = production + float(value) / 0.001
+            H_rows.append({"Consumo (W)": f"{consumption:.12f}", "Produzione (W)": f"{production:.12f}"})
+    S_rows = []
+    for value in S_hours:
+        for _ in range(n_per_hour):
+            S_rows.append(["fixture-day", "fixture-hour", f"{float(value) / 0.01:.12f}"])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        H_path = tmp_path / "H_fixture.csv"
+        S_path = tmp_path / "S_fixture.xlsx"
+        _write_rows_csv(H_path, ["Consumo (W)", "Produzione (W)"], H_rows)
+        _write_minimal_xlsx(S_path, ["Data", "Ora", "€/MWh"], S_rows)
+
+        prepared_H = prepare_H(str(H_path), n=n_per_hour, mul_factor=0.001)
+        prepared_S = prepare_S(str(S_path), n=n_per_hour, mul_factor=0.01)
+
+        np.testing.assert_allclose(prepared_H, H_hours, rtol=0.0, atol=1.0e-10)
+        np.testing.assert_allclose(prepared_S, S_hours, rtol=0.0, atol=1.0e-10)
+        calibration = calibrate_pascucci_ou_inputs(
+            prepared_H,
+            prepared_S,
+            K=0,
+            dt=1.0,
+            start_hour=0.0,
+            log_price=True,
+        )
+        config = build_pascucci_calibration_config(
+            calibration,
+            K=0,
+            dt=1.0,
+            start_hour=0.0,
+            log_price=True,
+            H_metadata={
+                "source_path": str(H_path),
+                "units": "kW",
+                "n_per_hour": n_per_hour,
+                "mul_factor": 0.001,
+            },
+            S_metadata={
+                "source_path": str(S_path),
+                "units": "EUR_per_MWh",
+                "n_per_hour": n_per_hour,
+                "mul_factor": 0.01,
+            },
+        )
+
+    assert validate_ou_params(config["params_H"], K=0) is None
+    assert validate_ou_params(config["params_S"], K=0) is None
+    params = build_pascucci_run_config_params(get_model_spec("pascucci").build_default_params(), config)
+    assert params["pascucci_calibration"]["H_metadata"]["source_path"].endswith("H_fixture.csv")
+    assert params["pascucci_calibration"]["S_metadata"]["source_path"].endswith("S_fixture.xlsx")
+    _assert_json_roundtrip(params)
 
 
 def _pascucci_psi(x: np.ndarray, d: float, x_max: float) -> np.ndarray:
@@ -4009,6 +4351,30 @@ def run_tests(argv: List[str] | None = None) -> int:
         (
             "quadratic_spec_unaffected_by_pascucci_calibration_import",
             test_quadratic_spec_unaffected_by_pascucci_calibration_import,
+        ),
+        (
+            "pascucci_ou_params_json_safe_after_serialization",
+            test_pascucci_ou_params_json_safe_after_serialization,
+        ),
+        (
+            "pascucci_day_night_boundary_semantics_are_explicit",
+            test_pascucci_day_night_boundary_semantics_are_explicit,
+        ),
+        (
+            "pascucci_log_price_false_calibrates_linear_prices",
+            test_pascucci_log_price_false_calibrates_linear_prices,
+        ),
+        (
+            "pascucci_calibration_config_records_units_log_price_dt_and_sources",
+            test_pascucci_calibration_config_records_units_log_price_dt_and_sources,
+        ),
+        (
+            "pascucci_build_run_config_params_injects_calibrated_ou_without_losing_solver_flags",
+            test_pascucci_build_run_config_params_injects_calibrated_ou_without_losing_solver_flags,
+        ),
+        (
+            "pascucci_minimal_fixture_pipeline_builds_json_run_params",
+            test_pascucci_minimal_fixture_pipeline_builds_json_run_params,
         ),
         ("model_spec_params_overlay_preserves_solver_flags", test_model_spec_params_overlay_preserves_solver_flags),
         ("exact_path_plot_outputs", test_exact_path_plot_outputs),
