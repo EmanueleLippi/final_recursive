@@ -75,6 +75,8 @@ def _build_pascucci_params(const: float = 1.0) -> dict:
         "c_h": np.float32(0.0001),
         "c_con": np.float32(0.01),
         "const": np.float32(const),
+        "pascucci_cost_profile": "exp",
+        "pascucci_cost_offset": np.float32(0.0),
         "params_S": _build_default_ou_params(),
         "params_H": _build_default_ou_params(),
     }
