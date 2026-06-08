@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -12,15 +13,24 @@ from .model_specs import get_model_spec
 
 
 FIXTURE_VERSION = 1
+ORACLE_VALIDATION_MODE = "tf2_numpy_formula_regression"
+HISTORICAL_TF1_RUNTIME_PARITY = False
+HISTORICAL_REFERENCE_PATHS = {
+    "final_model3.py": "../../../to_ema/final_model3.py",
+    "final_model_modifiche_f.py": "../../../to_ema/final_model_modifiche_f.py",
+    "calibration.py": "../../../to_ema/calibration.py",
+}
 
 SOURCE_VARIANTS = {
     "final_model3": {
         "source_file": "final_model3.py",
+        "source_path": HISTORICAL_REFERENCE_PATHS["final_model3.py"],
         "pascucci_cost_profile": "exp",
         "pascucci_cost_offset": 0.0,
     },
     "final_model_modifiche_f": {
         "source_file": "final_model_modifiche_f.py",
+        "source_path": HISTORICAL_REFERENCE_PATHS["final_model_modifiche_f.py"],
         "pascucci_cost_profile": "exp_minus_offset",
         "pascucci_cost_offset": 0.12,
     },
@@ -53,6 +63,43 @@ def _normalise_cost_profile(profile: str, offset: float) -> tuple[str, float]:
     if resolved_profile == "exp" and abs(resolved_offset) > 1.0e-8:
         raise ValueError("pascucci_cost_offset must be 0.0 when pascucci_cost_profile='exp'")
     return resolved_profile, resolved_offset
+
+
+def _source_provenance(*, source_file: str, source_path: str) -> dict[str, Any]:
+    path = (Path(__file__).resolve().parent / source_path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"historical Pascucci reference not found: {source_path}")
+    payload = path.read_bytes()
+    return {
+        "source_file": str(source_file),
+        "source_path": str(source_path),
+        "source_available": True,
+        "source_sha256": hashlib.sha256(payload).hexdigest(),
+        "source_size_bytes": int(len(payload)),
+    }
+
+
+def _build_source_variant_contracts() -> dict[str, Any]:
+    return {
+        name: {
+            **contract,
+            **_source_provenance(
+                source_file=contract["source_file"],
+                source_path=contract["source_path"],
+            ),
+        }
+        for name, contract in SOURCE_VARIANTS.items()
+    }
+
+
+def _build_historical_reference_provenance() -> dict[str, Any]:
+    return {
+        source_file: _source_provenance(
+            source_file=source_file,
+            source_path=source_path,
+        )
+        for source_file, source_path in HISTORICAL_REFERENCE_PATHS.items()
+    }
 
 
 def _build_oracle_ou_params(prefix_shift: float) -> dict[str, Any]:
@@ -122,7 +169,9 @@ def build_pascucci_oracle_fixture(
     variant = str(oracle_source_variant).strip()
     if variant not in SOURCE_VARIANTS:
         raise ValueError(f"unsupported oracle_source_variant={variant!r}")
-    variant_contract = SOURCE_VARIANTS[variant]
+    source_variants = _build_source_variant_contracts()
+    historical_reference_provenance = _build_historical_reference_provenance()
+    variant_contract = source_variants[variant]
     profile = (
         variant_contract["pascucci_cost_profile"]
         if pascucci_cost_profile is None
@@ -158,8 +207,11 @@ def build_pascucci_oracle_fixture(
         "z_labels": list(spec.z_labels),
         "moment_names": list(spec.moment_names),
         "equation_scope": ["mu", "sigma", "alpha", "f", "g"],
+        "oracle_validation_mode": ORACLE_VALIDATION_MODE,
+        "historical_tf1_runtime_parity": HISTORICAL_TF1_RUNTIME_PARITY,
         "oracle_source_variant": variant,
-        "source_variants": _json_safe(SOURCE_VARIANTS),
+        "source_variants": _json_safe(source_variants),
+        "historical_reference_provenance": _json_safe(historical_reference_provenance),
         "recursive_terminal_blob": None,
         "coverage": {
             "day_night_hours": [6.0, 7.0, 18.0, 19.0],
