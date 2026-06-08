@@ -450,8 +450,82 @@ PASCUCCI_CALIBRATION_TDD_CONTRACTS = {
 }
 
 
+PASCUCCI_MODEL_LAYER_TDD_CONTRACTS = {
+    "pascucci_cost_profile_default_is_exp_and_json_safe": {
+        "type": "regression-unit",
+        "target": "model_specs.get_model_spec('pascucci').build_default_params",
+        "purpose": "Freeze the current Pascucci running-cost profile as explicit config instead of an implicit formula.",
+        "expected": "Default params record pascucci_cost_profile='exp' and pascucci_cost_offset=0.0 in JSON-safe form.",
+        "failure": "Catches silent flips from exp(S) to exp(S)-0.12 or untracked cost-profile choices.",
+    },
+    "pascucci_cost_profile_exp_minus_offset_changes_only_running_cost": {
+        "type": "oracle-unit",
+        "target": "models.NN_Pascucci.f_tf/phi_tf/g_tf",
+        "purpose": "Make the historical exp(S)-0.12 variant selectable while preserving the terminal cost.",
+        "expected": "The offset profile shifts f and phi by -offset*(H+V), while g remains tied to exp(S).",
+        "failure": "Catches applying the 0.12 offset to the wrong equation or losing the exp(S) baseline.",
+    },
+    "pascucci_cost_profile_rejects_unknown_profile": {
+        "type": "negative-unit",
+        "target": "models.NN_Pascucci.__init__",
+        "purpose": "Fail fast on unsupported Pascucci cost profiles before any training run.",
+        "expected": "Constructing a Pascucci model with an unknown cost profile raises ValueError.",
+        "failure": "Catches silent fallback to an unintended economic objective.",
+    },
+    "pascucci_cli_records_cost_profile_params_in_run_config": {
+        "type": "integration-unit",
+        "target": "cli.run_program/run_config.json",
+        "purpose": "Ensure the selected Pascucci cost profile is persisted in reproducible run metadata.",
+        "expected": "A stubbed tiny CLI run records pascucci_cost_profile and pascucci_cost_offset in params/run_config.",
+        "failure": "Catches a configurable model choice that is not traceable in output artifacts.",
+    },
+    "pascucci_cli_rejects_cost_profile_for_quadratic_model": {
+        "type": "negative-integration-unit",
+        "target": "cli.run_program",
+        "purpose": "Protect the frozen quadratic benchmark from Pascucci-specific config pollution.",
+        "expected": "Passing Pascucci cost-profile args with quadratic_coupled raises ValueError before any run.",
+        "failure": "Catches benchmark run_config drift or accidental cross-model parameter injection.",
+    },
+    "pascucci_recursive_cost_profile_matches_standard_formula": {
+        "type": "regression-unit",
+        "target": "models.NN_Pascucci_Recursive.f_tf/phi_tf/g_tf",
+        "purpose": "Keep the recursive Pascucci block model on the same running-cost formula as the standard model.",
+        "expected": "The recursive model has the same offset delta for f/phi and leaves g unchanged.",
+        "failure": "Catches standard/recursive model divergence before micro-runs.",
+    },
+    "pascucci_cli_records_cost_profile_params_in_recursive_run_config": {
+        "type": "integration-unit",
+        "target": "cli.run_program recursive/run_config.json",
+        "purpose": "Ensure recursive Pascucci runs persist the selected cost profile before training.",
+        "expected": "A stubbed tiny recursive CLI run records the selected cost profile and forwards it to orchestration.",
+        "failure": "Catches recursive-only config drops before time-stitching validation.",
+    },
+    "pascucci_physical_constraint_diagnostics_q_v_are_model_owned": {
+        "type": "unit",
+        "target": "models.NN_Pascucci.physical_constraint_diagnostics_tf",
+        "purpose": "Expose Q/V physical violations from the Pascucci model layer without solver branching.",
+        "expected": "Per-sample non-negative Q/V lower/upper violations match x_max, v_min, and v_max.",
+        "failure": "Catches hidden physical diagnostics or accidental coupling to generic solver code.",
+    },
+    "pascucci_q_v_barrier_drift_pushes_toward_physical_domain": {
+        "type": "regression-unit",
+        "target": "models.NN_Pascucci.mu_tf",
+        "purpose": "Protect the existing barrier signs for Q/V before adding later physical diagnostics.",
+        "expected": "With zero Z_V, dV is positive below Q=0, negative above Q=x_max, and zero in the interior.",
+        "failure": "Catches sign inversions in the Pascucci Q/V barrier terms.",
+    },
+}
+
+
 def _assert_pascucci_tdd_contract(name: str) -> None:
     contract = PASCUCCI_CALIBRATION_TDD_CONTRACTS[name]
+    for key in ("type", "target", "purpose", "expected", "failure"):
+        value = str(contract.get(key, "")).strip()
+        assert value, f"{name} missing TDD contract field {key}"
+
+
+def _assert_pascucci_model_tdd_contract(name: str) -> None:
+    contract = PASCUCCI_MODEL_LAYER_TDD_CONTRACTS[name]
     for key in ("type", "target", "purpose", "expected", "failure"):
         value = str(contract.get(key, "")).strip()
         assert value, f"{name} missing TDD contract field {key}"
@@ -715,6 +789,23 @@ def test_pascucci_tdd_contract_metadata() -> None:
     assert set(PASCUCCI_CALIBRATION_TDD_CONTRACTS) == expected_names
     for name in expected_names:
         _assert_pascucci_tdd_contract(name)
+
+
+def test_pascucci_model_layer_tdd_contract_metadata() -> None:
+    expected_names = {
+        "pascucci_cost_profile_default_is_exp_and_json_safe",
+        "pascucci_cost_profile_exp_minus_offset_changes_only_running_cost",
+        "pascucci_cost_profile_rejects_unknown_profile",
+        "pascucci_cli_records_cost_profile_params_in_run_config",
+        "pascucci_cli_rejects_cost_profile_for_quadratic_model",
+        "pascucci_recursive_cost_profile_matches_standard_formula",
+        "pascucci_cli_records_cost_profile_params_in_recursive_run_config",
+        "pascucci_physical_constraint_diagnostics_q_v_are_model_owned",
+        "pascucci_q_v_barrier_drift_pushes_toward_physical_domain",
+    }
+    assert set(PASCUCCI_MODEL_LAYER_TDD_CONTRACTS) == expected_names
+    for name in expected_names:
+        _assert_pascucci_model_tdd_contract(name)
 
 
 def test_pascucci_prepare_H_hourly_mean_net_power_and_scale() -> None:
@@ -1501,6 +1592,274 @@ def test_model_spec_mean_field_moment_names() -> None:
         "mean_q",
         "mean_h_plus_v",
     )
+
+
+def _build_pascucci_unit_model(params: dict, *, M: int = 4):
+    from .models import NN_Pascucci
+
+    return NN_Pascucci(
+        Xi_generator_default,
+        0.25,
+        M,
+        2,
+        4,
+        [5, 8, 1],
+        params,
+    )
+
+
+def _build_pascucci_recursive_unit_model(params: dict, *, M: int = 4):
+    from .models import NN_Pascucci_Recursive
+
+    return NN_Pascucci_Recursive(
+        Xi_generator_default,
+        0.25,
+        M,
+        2,
+        4,
+        [5, 8, 1],
+        params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+    )
+
+
+def test_pascucci_cost_profile_default_is_exp_and_json_safe() -> None:
+    _assert_pascucci_model_tdd_contract("pascucci_cost_profile_default_is_exp_and_json_safe")
+    from .model_specs import get_model_spec
+
+    quadratic_params = get_model_spec("quadratic_coupled").build_default_params()
+    assert "pascucci_cost_profile" not in quadratic_params
+    assert "pascucci_cost_offset" not in quadratic_params
+
+    params = get_model_spec("pascucci").build_default_params()
+    assert params["pascucci_cost_profile"] == "exp"
+    assert float(params["pascucci_cost_offset"]) == 0.0
+    _assert_json_roundtrip(
+        {
+            "pascucci_cost_profile": params["pascucci_cost_profile"],
+            "pascucci_cost_offset": float(params["pascucci_cost_offset"]),
+        }
+    )
+
+
+def test_pascucci_cost_profile_exp_minus_offset_changes_only_running_cost() -> None:
+    _assert_pascucci_model_tdd_contract("pascucci_cost_profile_exp_minus_offset_changes_only_running_cost")
+    from .model_specs import get_model_spec
+    from .tf_backend import tf
+
+    spec = get_model_spec("pascucci")
+    base_params = spec.build_default_params(const=0.77)
+    base_params["pascucci_cost_profile"] = "exp"
+    base_params["pascucci_cost_offset"] = np.float32(0.0)
+    offset_params = spec.build_default_params(const=0.77)
+    offset_params["pascucci_cost_profile"] = "exp_minus_offset"
+    offset_params["pascucci_cost_offset"] = np.float32(0.12)
+
+    base_model = _build_pascucci_unit_model(base_params)
+    offset_model = _build_pascucci_unit_model(offset_params)
+    try:
+        X = np.array(
+            [
+                [1.2, 0.4, 0.2, 4.5],
+                [-0.4, -0.2, -0.1, 7.7],
+                [0.3, 1.0, -0.5, 2.2],
+                [0.0, -0.5, 0.3, 0.8],
+            ],
+            dtype=np.float32,
+        )
+        Y = np.array([[0.1], [0.2], [-0.1], [0.3]], dtype=np.float32)
+        Z = np.array(
+            [
+                [0.1, 0.2, -0.3, 0.4],
+                [0.2, -0.1, 0.4, -0.5],
+                [0.3, 0.0, 0.2, -0.1],
+                [0.4, -0.2, -0.1, 0.2],
+            ],
+            dtype=np.float32,
+        )
+        t = np.zeros((4, 1), dtype=np.float32)
+
+        t_tf = tf.convert_to_tensor(t)
+        X_tf = tf.convert_to_tensor(X)
+        Y_tf = tf.convert_to_tensor(Y)
+        Z_tf = tf.convert_to_tensor(Z)
+        base_f = base_model.f_tf(t_tf, X_tf, Y_tf, Z_tf).numpy()
+        offset_f = offset_model.f_tf(t_tf, X_tf, Y_tf, Z_tf).numpy()
+
+        H_plus_V = X[:, [1]] + X[:, [2]]
+        expected_delta = -float(offset_params["pascucci_cost_offset"]) * H_plus_V
+        np.testing.assert_allclose(offset_f - base_f, expected_delta, rtol=1.0e-6, atol=1.0e-6)
+        np.testing.assert_allclose(
+            offset_model.phi_tf(t_tf, X_tf, Y_tf, Z_tf).numpy(),
+            -offset_f,
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+        np.testing.assert_allclose(
+            offset_model.g_tf(X_tf).numpy(),
+            base_model.g_tf(X_tf).numpy(),
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+    finally:
+        base_model.close()
+        offset_model.close()
+
+
+def test_pascucci_cost_profile_rejects_unknown_profile() -> None:
+    _assert_pascucci_model_tdd_contract("pascucci_cost_profile_rejects_unknown_profile")
+    from .model_specs import get_model_spec
+
+    params = get_model_spec("pascucci").build_default_params()
+    params["pascucci_cost_profile"] = "exp_plus_untracked_magic"
+    params["pascucci_cost_offset"] = np.float32(0.0)
+    model = None
+    try:
+        model = _build_pascucci_unit_model(params)
+    except ValueError as exc:
+        assert "pascucci_cost_profile" in str(exc)
+    else:
+        raise AssertionError("unknown Pascucci cost profile should fail before model construction succeeds")
+    finally:
+        if model is not None:
+            model.close()
+
+
+def test_pascucci_recursive_cost_profile_matches_standard_formula() -> None:
+    _assert_pascucci_model_tdd_contract("pascucci_recursive_cost_profile_matches_standard_formula")
+    from .model_specs import get_model_spec
+    from .tf_backend import tf
+
+    spec = get_model_spec("pascucci")
+    base_params = spec.build_default_params(const=0.77)
+    base_params["pascucci_cost_profile"] = "exp"
+    base_params["pascucci_cost_offset"] = np.float32(0.0)
+    offset_params = spec.build_default_params(const=0.77)
+    offset_params["pascucci_cost_profile"] = "exp_minus_offset"
+    offset_params["pascucci_cost_offset"] = np.float32(0.12)
+
+    base_model = _build_pascucci_recursive_unit_model(base_params)
+    offset_model = _build_pascucci_recursive_unit_model(offset_params)
+    try:
+        X = np.array(
+            [
+                [0.2, 0.4, 0.2, 4.5],
+                [-0.4, -0.2, -0.1, 7.7],
+                [0.3, 1.0, -0.5, 2.2],
+                [0.0, -0.5, 0.3, 0.8],
+            ],
+            dtype=np.float32,
+        )
+        Y = np.array([[0.1], [0.2], [-0.1], [0.3]], dtype=np.float32)
+        Z = np.array(
+            [
+                [0.1, 0.2, -0.3, 0.4],
+                [0.2, -0.1, 0.4, -0.5],
+                [0.3, 0.0, 0.2, -0.1],
+                [0.4, -0.2, -0.1, 0.2],
+            ],
+            dtype=np.float32,
+        )
+        t = np.zeros((4, 1), dtype=np.float32)
+        t_tf = tf.convert_to_tensor(t)
+        X_tf = tf.convert_to_tensor(X)
+        Y_tf = tf.convert_to_tensor(Y)
+        Z_tf = tf.convert_to_tensor(Z)
+        base_f = base_model.f_tf(t_tf, X_tf, Y_tf, Z_tf).numpy()
+        offset_f = offset_model.f_tf(t_tf, X_tf, Y_tf, Z_tf).numpy()
+
+        expected_delta = -float(offset_params["pascucci_cost_offset"]) * (X[:, [1]] + X[:, [2]])
+        np.testing.assert_allclose(offset_f - base_f, expected_delta, rtol=1.0e-6, atol=1.0e-6)
+        np.testing.assert_allclose(
+            offset_model.phi_tf(t_tf, X_tf, Y_tf, Z_tf).numpy(),
+            -offset_f,
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+        np.testing.assert_allclose(
+            offset_model.g_tf(X_tf).numpy(),
+            base_model.g_tf(X_tf).numpy(),
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+    finally:
+        base_model.close()
+        offset_model.close()
+
+
+def test_pascucci_physical_constraint_diagnostics_q_v_are_model_owned() -> None:
+    _assert_pascucci_model_tdd_contract("pascucci_physical_constraint_diagnostics_q_v_are_model_owned")
+    from .model_specs import get_model_spec
+    from .tf_backend import tf
+
+    params = get_model_spec("pascucci").build_default_params()
+    model = _build_pascucci_unit_model(params)
+    try:
+        X = np.array(
+            [
+                [0.0, 0.0, -2.5, -0.25],
+                [0.0, 0.0, 0.0, 5.0],
+                [0.0, 0.0, 2.25, 10.5],
+                [0.0, 0.0, -1.0, 10.0],
+            ],
+            dtype=np.float32,
+        )
+        diagnostics = model.physical_constraint_diagnostics_tf(tf.convert_to_tensor(X))
+        assert set(diagnostics) == {
+            "q_lower_violation",
+            "q_upper_violation",
+            "v_lower_violation",
+            "v_upper_violation",
+        }
+        expected = {
+            "q_lower_violation": np.array([[0.25], [0.0], [0.0], [0.0]], dtype=np.float32),
+            "q_upper_violation": np.array([[0.0], [0.0], [0.5], [0.0]], dtype=np.float32),
+            "v_lower_violation": np.array([[0.5], [0.0], [0.0], [0.0]], dtype=np.float32),
+            "v_upper_violation": np.array([[0.0], [0.0], [0.25], [0.0]], dtype=np.float32),
+        }
+        for key, expected_value in expected.items():
+            value = diagnostics[key].numpy()
+            assert value.shape == (4, 1), key
+            assert np.isfinite(value).all(), key
+            assert np.all(value >= 0.0), key
+            np.testing.assert_allclose(value, expected_value, rtol=1.0e-6, atol=1.0e-6)
+    finally:
+        model.close()
+
+
+def test_pascucci_q_v_barrier_drift_pushes_toward_physical_domain() -> None:
+    _assert_pascucci_model_tdd_contract("pascucci_q_v_barrier_drift_pushes_toward_physical_domain")
+    from .model_specs import get_model_spec
+    from .tf_backend import tf
+
+    params = get_model_spec("pascucci").build_default_params()
+    model = _build_pascucci_unit_model(params, M=3)
+    try:
+        X = np.array(
+            [
+                [0.0, 0.0, -2.0, -0.5],
+                [0.0, 0.0, 0.0, 10.5],
+                [0.0, 0.0, 0.0, 5.0],
+            ],
+            dtype=np.float32,
+        )
+        t = np.zeros((3, 1), dtype=np.float32)
+        Y = np.zeros((3, 1), dtype=np.float32)
+        Z = np.zeros((3, 4), dtype=np.float32)
+        mu = model.mu_tf(
+            tf.convert_to_tensor(t),
+            tf.convert_to_tensor(X),
+            tf.convert_to_tensor(Y),
+            tf.convert_to_tensor(Z),
+        ).numpy()
+        dV = mu[:, 2]
+        assert dV[0] > 0.0, dV
+        assert dV[1] < 0.0, dV
+        assert abs(float(dV[2])) <= 1.0e-7, dV
+    finally:
+        model.close()
 
 
 def test_pascucci_mean_field_moments_contract() -> None:
@@ -3653,6 +4012,302 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
         cli.plot_stage_logs = original_plot_stage_logs
 
 
+def test_cli_records_pascucci_cost_profile_params_in_run_config() -> None:
+    _assert_pascucci_model_tdd_contract("pascucci_cli_records_cost_profile_params_in_run_config")
+    from . import cli, orchestration
+    from .tf_backend import require_tensorflow
+
+    require_tensorflow()
+
+    class FakeSession:
+        def close(self) -> None:
+            pass
+
+    class FakeStandardModel:
+        def __init__(self) -> None:
+            self.sess = FakeSession()
+
+        def save_model(self, path: str) -> None:
+            marker = Path(path)
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("fake checkpoint\n", encoding="utf-8")
+
+    standard_calls = []
+
+    def fake_run_standard_reference(**kwargs):
+        standard_calls.append(kwargs)
+        assert kwargs["model_spec"].name == "pascucci"
+        return FakeStandardModel(), {
+            "stage_logs": [
+                {
+                    "phase": "curriculum",
+                    "const": 1.0,
+                    "lr": 1.0e-3,
+                    "n_iter": 1,
+                    "train_last_loss": 1.0,
+                    "eval_mean_loss": 1.0,
+                    "eval_std_loss": 0.0,
+                    "eval_mean_loss_per_sample": 0.25,
+                    "eval_std_loss_per_sample": 0.0,
+                    "eval_mean_y0": 0.0,
+                    "eval_std_y0": 0.0,
+                    "elapsed_sec": 0.0,
+                }
+            ],
+            "eval_stats": {
+                "mean_loss": 1.0,
+                "std_loss": 0.0,
+                "mean_loss_per_sample": 0.25,
+                "std_loss_per_sample": 0.0,
+                "mean_y0": 0.0,
+                "std_y0": 0.0,
+            },
+            "refine_rounds": 0,
+        }
+
+    original_run_standard_reference = orchestration.run_standard_reference
+    original_export_standard_parameter_blob = cli.export_standard_parameter_blob
+    original_plot_stage_logs = cli.plot_stage_logs
+    orchestration.run_standard_reference = fake_run_standard_reference
+    cli.export_standard_parameter_blob = lambda model: _make_blob([5, 8, 1])
+    cli.plot_stage_logs = lambda *args, **kwargs: None
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            try:
+                exit_code = cli.main(
+                    [
+                        "run",
+                        "--mode",
+                        "standard",
+                        "--model",
+                        "pascucci",
+                        "--pascucci_cost_profile",
+                        "exp_minus_offset",
+                        "--pascucci_cost_offset",
+                        "0.12",
+                        "--M",
+                        "4",
+                        "--N",
+                        "2",
+                        "--T_standard",
+                        "0.25",
+                        "--T_total",
+                        "0.25",
+                        "--block_size",
+                        "0.25",
+                        "--passes",
+                        "1",
+                        "--visual_sample_paths",
+                        "1",
+                        "--output_dir",
+                        str(out_dir),
+                    ]
+                )
+            except SystemExit as exc:
+                raise AssertionError("CLI should accept Pascucci cost-profile arguments") from exc
+            assert exit_code == 0
+            runs = sorted(out_dir.glob("run_*"))
+            assert len(runs) == 1
+            config = json.loads((runs[0] / "run_config.json").read_text(encoding="utf-8"))
+            assert config["model_name"] == "pascucci"
+            assert config["params"]["pascucci_cost_profile"] == "exp_minus_offset"
+            assert config["params"]["pascucci_cost_offset"] == 0.12
+            assert standard_calls[0]["params"]["pascucci_cost_profile"] == "exp_minus_offset"
+            assert float(standard_calls[0]["params"]["pascucci_cost_offset"]) == 0.12
+    finally:
+        orchestration.run_standard_reference = original_run_standard_reference
+        cli.export_standard_parameter_blob = original_export_standard_parameter_blob
+        cli.plot_stage_logs = original_plot_stage_logs
+
+
+def test_cli_rejects_pascucci_cost_profile_for_quadratic_model() -> None:
+    _assert_pascucci_model_tdd_contract("pascucci_cli_rejects_cost_profile_for_quadratic_model")
+    from . import cli
+    from .tf_backend import require_tensorflow
+
+    require_tensorflow()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            cli.main(
+                [
+                    "run",
+                    "--mode",
+                    "standard",
+                    "--model",
+                    "quadratic_coupled",
+                    "--pascucci_cost_profile",
+                    "exp_minus_offset",
+                    "--pascucci_cost_offset",
+                    "0.12",
+                    "--M",
+                    "4",
+                    "--N",
+                    "2",
+                    "--T_standard",
+                    "0.25",
+                    "--T_total",
+                    "0.25",
+                    "--block_size",
+                    "0.25",
+                    "--passes",
+                    "1",
+                    "--visual_sample_paths",
+                    "1",
+                    "--output_dir",
+                    str(Path(tmp)),
+                ]
+            )
+        except SystemExit as exc:
+            raise AssertionError("CLI should parse Pascucci args and reject them semantically for quadratic_coupled") from exc
+        except ValueError as exc:
+            message = str(exc)
+            assert "--pascucci_cost_profile" in message
+            assert "pascucci" in message
+        else:
+            raise AssertionError("quadratic_coupled should reject Pascucci-specific cost-profile args")
+
+
+def test_cli_records_pascucci_cost_profile_params_in_recursive_run_config() -> None:
+    _assert_pascucci_model_tdd_contract("pascucci_cli_records_cost_profile_params_in_recursive_run_config")
+    from . import cli, orchestration
+    from .sampling import build_blocks
+    from .tf_backend import require_tensorflow
+
+    require_tensorflow()
+
+    recursive_calls = []
+    print_calls = []
+
+    def fake_run_recursive_training(**kwargs):
+        recursive_calls.append(kwargs)
+        blocks = build_blocks(T_total=kwargs["T_total"], block_size=kwargs["block_size"])
+        logs = [
+            {
+                "pass": 1,
+                "block": 0,
+                "t_start": blocks[0]["t_start"],
+                "t_end": blocks[0]["t_end"],
+                "T_block": blocks[0]["T_block"],
+                "eval_mean_loss": 1.0,
+                "eval_std_loss": 0.0,
+                "eval_mean_loss_per_sample": 0.25,
+                "eval_std_loss_per_sample": 0.0,
+                "eval_mean_y0": 0.0,
+                "precision_target": None,
+                "refine_rounds": 0,
+            }
+        ]
+        return {
+            "blocks": blocks,
+            "passes": [
+                {
+                    "pass_id": 1,
+                    "reference_loss": 1.0,
+                    "logs": logs,
+                    "blobs": [_make_blob([5, 8, 1]) for _ in blocks],
+                    "models_dir": kwargs["output_dir"],
+                    "pass_init_mode": kwargs["pass1_init_mode"],
+                    "boundary_source": "base_xi",
+                    "is_bootstrap_pass": True,
+                    "active_set_summary": {},
+                }
+            ],
+            "pass1": {
+                "logs": logs,
+                "reference_loss": 1.0,
+                "blobs": [_make_blob([5, 8, 1]) for _ in blocks],
+            },
+            "boundary_samples": [
+                np.zeros((kwargs["M"], kwargs["D"]), dtype=np.float32)
+                for _ in range(len(blocks) + 1)
+            ],
+        }
+
+    def fake_print_recursive_pass(**kwargs):
+        print_calls.append(kwargs)
+        eval_bundle_path = Path(kwargs["eval_bundle_path"])
+        eval_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(
+            eval_bundle_path,
+            Xi_initial=np.zeros((4, kwargs["D"]), dtype=np.float32),
+        )
+        return {
+            "processed_pass_ids": [1],
+            "exact_summary_by_pass": {},
+            "exact_summary_by_pass_index": {},
+            "eval_bundle_path": str(eval_bundle_path),
+            "evaluation_bundle_M": 4,
+            "excluded_pass_ids_from_selection": [],
+            "excluded_pass_indices_from_selection": [],
+            "selected_pass_id": 1,
+            "selected_pass_index": 0,
+            "selected_score_metric": "loss.eval_mean_loss_per_sample",
+            "selected_score": 0.25,
+            "selected_scores_by_pass": {"1": 0.25},
+            "selected_scores_by_pass_index": {"0": 0.25},
+            "score_key": "eval_mean_loss_per_sample",
+            "pass_scores_loss": {1: 0.25},
+            "pass_scores_loss_by_index": {0: 0.25},
+        }
+
+    original_run_recursive_training = orchestration.run_recursive_training
+    original_print_recursive_pass = orchestration.print_recursive_pass
+    orchestration.run_recursive_training = fake_run_recursive_training
+    orchestration.print_recursive_pass = fake_print_recursive_pass
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            try:
+                exit_code = cli.main(
+                    [
+                        "run",
+                        "--mode",
+                        "recursive",
+                        "--model",
+                        "pascucci",
+                        "--pascucci_cost_profile",
+                        "exp_minus_offset",
+                        "--pascucci_cost_offset",
+                        "0.12",
+                        "--M",
+                        "4",
+                        "--N",
+                        "2",
+                        "--T_standard",
+                        "0.25",
+                        "--T_total",
+                        "0.25",
+                        "--block_size",
+                        "0.25",
+                        "--passes",
+                        "1",
+                        "--visual_sample_paths",
+                        "1",
+                        "--output_dir",
+                        str(out_dir),
+                    ]
+                )
+            except SystemExit as exc:
+                raise AssertionError("CLI should accept Pascucci cost-profile arguments in recursive mode") from exc
+            assert exit_code == 0
+            runs = sorted(out_dir.glob("run_*"))
+            assert len(runs) == 1
+            config = json.loads((runs[0] / "run_config.json").read_text(encoding="utf-8"))
+            assert config["mode"] == "recursive"
+            assert config["params"]["pascucci_cost_profile"] == "exp_minus_offset"
+            assert config["params"]["pascucci_cost_offset"] == 0.12
+            assert recursive_calls[0]["params"]["pascucci_cost_profile"] == "exp_minus_offset"
+            assert float(recursive_calls[0]["params"]["pascucci_cost_offset"]) == 0.12
+            assert len(print_calls) == 1
+    finally:
+        orchestration.run_recursive_training = original_run_recursive_training
+        orchestration.print_recursive_pass = original_print_recursive_pass
+
+
 def test_cli_rejects_unsupported_model_argument() -> None:
     from . import cli
     from .tf_backend import require_tensorflow
@@ -4318,6 +4973,7 @@ def run_tests(argv: List[str] | None = None) -> int:
         ("evaluation_bundle_rejects_block_metadata_mismatch", test_evaluation_bundle_rejects_block_metadata_mismatch),
         ("model_spec_contract", test_model_spec_contract),
         ("pascucci_tdd_contract_metadata", test_pascucci_tdd_contract_metadata),
+        ("pascucci_model_layer_tdd_contract_metadata", test_pascucci_model_layer_tdd_contract_metadata),
         ("pascucci_prepare_H_hourly_mean_net_power_and_scale", test_pascucci_prepare_H_hourly_mean_net_power_and_scale),
         ("pascucci_prepare_H_missing_columns_raise", test_pascucci_prepare_H_missing_columns_raise),
         (
@@ -4394,6 +5050,30 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "model_spec_mean_field_moment_names",
         "test_model_spec_mean_field_moment_names",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_cost_profile_default_is_exp_and_json_safe",
+        "test_pascucci_cost_profile_default_is_exp_and_json_safe",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_cost_profile_exp_minus_offset_changes_only_running_cost",
+        "test_pascucci_cost_profile_exp_minus_offset_changes_only_running_cost",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_cost_profile_rejects_unknown_profile",
+        "test_pascucci_cost_profile_rejects_unknown_profile",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_recursive_cost_profile_matches_standard_formula",
+        "test_pascucci_recursive_cost_profile_matches_standard_formula",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_physical_constraint_diagnostics_q_v_are_model_owned",
+        "test_pascucci_physical_constraint_diagnostics_q_v_are_model_owned",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_q_v_barrier_drift_pushes_toward_physical_domain",
+        "test_pascucci_q_v_barrier_drift_pushes_toward_physical_domain",
     ) and ok
     ok = _run_subprocess_case(
         "pascucci_mean_field_moments_contract",
@@ -4490,6 +5170,18 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "cli_tiny_standard_and_both_model_spec_outputs",
         "test_cli_tiny_standard_and_both_model_spec_outputs",
+    ) and ok
+    ok = _run_subprocess_case(
+        "cli_records_pascucci_cost_profile_params_in_run_config",
+        "test_cli_records_pascucci_cost_profile_params_in_run_config",
+    ) and ok
+    ok = _run_subprocess_case(
+        "cli_rejects_pascucci_cost_profile_for_quadratic_model",
+        "test_cli_rejects_pascucci_cost_profile_for_quadratic_model",
+    ) and ok
+    ok = _run_subprocess_case(
+        "cli_records_pascucci_cost_profile_params_in_recursive_run_config",
+        "test_cli_records_pascucci_cost_profile_params_in_recursive_run_config",
     ) and ok
     ok = _run_subprocess_case(
         "cli_rejects_unsupported_model_argument",
