@@ -131,6 +131,37 @@ def _fixed_validation_batch(
     return t_batch.astype(np.float32), W_batch.astype(np.float32), Xi.astype(np.float32)
 
 
+def _pascucci_physical_violation_traces_from_x(X: np.ndarray, params: dict) -> dict[str, np.ndarray]:
+    X = np.asarray(X, dtype=np.float32)
+    V = X[:, :, [2]]
+    q = X[:, :, [3]]
+    x_max = np.float32(params["x_max"])
+    v_min = np.float32(params["v_min"])
+    v_max = np.float32(params["v_max"])
+    return {
+        "q_lower_violation": np.mean(np.maximum(-q, 0.0), axis=0).astype(np.float32),
+        "q_upper_violation": np.mean(np.maximum(q - x_max, 0.0), axis=0).astype(np.float32),
+        "v_lower_violation": np.mean(np.maximum(v_min - V, 0.0), axis=0).astype(np.float32),
+        "v_upper_violation": np.mean(np.maximum(V - v_max, 0.0), axis=0).astype(np.float32),
+    }
+
+
+def _assert_source_provenance_contract(provenance: dict, *, expected_file: str) -> None:
+    import hashlib
+
+    assert provenance["source_file"] == expected_file
+    assert provenance["source_path"].endswith(expected_file)
+    assert provenance["source_available"] is True
+    assert isinstance(provenance["source_sha256"], str)
+    assert len(provenance["source_sha256"]) == 64
+    int(provenance["source_sha256"], 16)
+    assert int(provenance["source_size_bytes"]) > 0
+    path = (Path(__file__).resolve().parent / provenance["source_path"]).resolve()
+    payload = path.read_bytes()
+    assert provenance["source_sha256"] == hashlib.sha256(payload).hexdigest()
+    assert provenance["source_size_bytes"] == len(payload)
+
+
 def _run_case(name: str, fn: Callable[[], None]) -> bool:
     try:
         fn()
@@ -514,6 +545,13 @@ PASCUCCI_MODEL_LAYER_TDD_CONTRACTS = {
         "expected": "With zero Z_V, dV is positive below Q=0, negative above Q=x_max, and zero in the interior.",
         "failure": "Catches sign inversions in the Pascucci Q/V barrier terms.",
     },
+    "pascucci_q_v_barrier_sweep_with_nonzero_z_v": {
+        "type": "regression-unit",
+        "target": "models.NN_Pascucci.mu_tf",
+        "purpose": "Protect Q/V barrier and control interaction when the active control component Z_V is nonzero.",
+        "expected": "Boundary pushes have the correct sign and dV matches the closed-form Pascucci barrier formula.",
+        "failure": "Catches ignored Z_V terms, barrier sign flips, or scaling drift in the Q/V physical-domain guard.",
+    },
 }
 
 
@@ -545,6 +583,20 @@ PASCUCCI_ORACLE_FIXTURE_TDD_CONTRACTS = {
         "purpose": "Avoid ambiguity between historical final_model3 and final_model_modifiche_f running-cost variants.",
         "expected": "Fixture metadata records source variant, cost profile, and offset; unsupported profiles fail fast.",
         "failure": "Catches selecting the wrong historical oracle source by implication.",
+    },
+    "pascucci_oracle_provenance_metadata_roundtrip": {
+        "type": "acceptance-unit",
+        "target": "pascucci_oracle_fixture + pascucci_equation_oracle provenance metadata",
+        "purpose": "Make oracle source provenance reproducible and auditable before thesis-level oracle evidence.",
+        "expected": "Fixture/oracle metadata record validation mode, TF1-runtime parity status, source paths, sizes, and SHA-256 hashes.",
+        "failure": "Catches stale, missing, or lossy provenance metadata in pointwise oracle artifacts.",
+    },
+    "pascucci_oracle_fixture_missing_historical_reference_fails_fast": {
+        "type": "negative-unit",
+        "target": "pascucci_oracle_fixture.build_pascucci_oracle_fixture",
+        "purpose": "Document that oracle provenance requires the read-only historical Pascucci source files.",
+        "expected": "Fixture generation raises FileNotFoundError with an actionable message when a historical reference is unavailable.",
+        "failure": "Catches silent downgrade from content-addressed provenance to filename-only oracle metadata.",
     },
     "quadratic_spec_unaffected_by_pascucci_oracle_fixture_import": {
         "type": "regression-unit",
@@ -894,6 +946,7 @@ def test_pascucci_model_layer_tdd_contract_metadata() -> None:
         "pascucci_cli_records_cost_profile_params_in_recursive_run_config",
         "pascucci_physical_constraint_diagnostics_q_v_are_model_owned",
         "pascucci_q_v_barrier_drift_pushes_toward_physical_domain",
+        "pascucci_q_v_barrier_sweep_with_nonzero_z_v",
     }
     assert set(PASCUCCI_MODEL_LAYER_TDD_CONTRACTS) == expected_names
     for name in expected_names:
@@ -906,6 +959,8 @@ def test_pascucci_oracle_fixture_tdd_contract_metadata() -> None:
         "pascucci_oracle_fixture_reproducible_and_seed_sensitive",
         "pascucci_oracle_fixture_save_load_roundtrip",
         "pascucci_oracle_fixture_cost_profile_variants_are_explicit",
+        "pascucci_oracle_provenance_metadata_roundtrip",
+        "pascucci_oracle_fixture_missing_historical_reference_fails_fast",
         "quadratic_spec_unaffected_by_pascucci_oracle_fixture_import",
     }
     assert set(PASCUCCI_ORACLE_FIXTURE_TDD_CONTRACTS) == expected_names
@@ -1964,6 +2019,104 @@ def test_pascucci_q_v_barrier_drift_pushes_toward_physical_domain() -> None:
         model.close()
 
 
+def test_pascucci_q_v_barrier_sweep_with_nonzero_z_v() -> None:
+    _assert_pascucci_model_tdd_contract("pascucci_q_v_barrier_sweep_with_nonzero_z_v")
+    from .model_specs import get_model_spec
+    from .tf_backend import tf
+
+    params = get_model_spec("pascucci").build_default_params()
+
+    def expected_dv_np(X_np: np.ndarray, Z_np: np.ndarray) -> np.ndarray:
+        H = X_np[:, [1]]
+        V = X_np[:, [2]]
+        q = X_np[:, [3]]
+        mean_v = np.mean(V, axis=0, keepdims=True)
+        d = np.float32(params["d"])
+        x_max = np.float32(params["x_max"])
+        v_min = np.float32(params["v_min"])
+        v_max = np.float32(params["v_max"])
+        psi = np.maximum(0.0, np.minimum(1.0, np.minimum(q / d, (x_max - q) / d))).astype(np.float32)
+        psi1 = np.maximum(0.0, np.minimum(1.0, (q - x_max) / d)).astype(np.float32)
+        psi2 = np.maximum(0.0, np.minimum(1.0, -q / d)).astype(np.float32)
+        psi3 = np.maximum(0.0, np.minimum(1.0, (v_max - V) / d)).astype(np.float32)
+        psi4 = np.maximum(0.0, np.minimum(1.0, (V - v_min) / d)).astype(np.float32)
+        sigma_v = (
+            np.float32(params["s3"])
+            + np.float32(params["s3h"]) * np.abs(H)
+            + np.float32(params["s3v"]) * np.abs(V)
+            + np.float32(params["s3k"]) * np.abs(V - mean_v)
+        ).astype(np.float32)
+        alpha = -(psi * Z_np[:, [2]]) / (
+            2.0 * np.float32(params["l_a"]) * np.maximum(sigma_v, np.float32(1.0e-7))
+        )
+        return (
+            alpha * psi
+            + np.float32(params["c3"]) * psi2 * psi3
+            - np.float32(params["c4"]) * psi1 * psi4
+        )[:, 0].astype(np.float32)
+
+    model = _build_pascucci_unit_model(params, M=12)
+    try:
+        q_lower = -0.25
+        q_upper = float(params["x_max"]) + 0.25
+        q_mid = 0.5 * float(params["x_max"])
+        v_mid = 0.0
+        cases = []
+        expected_signs = []
+        for z_v in (-2.0, -1.0, 1.0, 2.0):
+            cases.append([0.0, 0.0, v_mid, q_lower])
+            expected_signs.append(1.0)
+            cases.append([0.0, 0.0, v_mid, q_upper])
+            expected_signs.append(-1.0)
+            cases.append([0.0, 0.0, v_mid, q_mid])
+            expected_signs.append(-np.sign(z_v))
+
+        X = np.asarray(cases, dtype=np.float32)
+        t = np.zeros((X.shape[0], 1), dtype=np.float32)
+        Y = np.zeros((X.shape[0], 1), dtype=np.float32)
+        Z = np.zeros((X.shape[0], 4), dtype=np.float32)
+        Z[:, 2] = np.repeat(np.asarray([-2.0, -1.0, 1.0, 2.0], dtype=np.float32), 3)
+        mu = model.mu_tf(
+            tf.convert_to_tensor(t),
+            tf.convert_to_tensor(X),
+            tf.convert_to_tensor(Y),
+            tf.convert_to_tensor(Z),
+        ).numpy()
+        dV = mu[:, 2]
+        assert np.isfinite(dV).all(), dV
+        np.testing.assert_allclose(dV, expected_dv_np(X, Z), rtol=1.0e-6, atol=1.0e-6)
+        for actual, expected_sign in zip(dV, expected_signs):
+            assert np.sign(actual) == expected_sign, (dV, expected_signs)
+
+        q_faces = np.asarray(
+            [
+                [0.0, 0.0, float(params["v_min"]) + 0.1, -0.1],
+                [0.0, 0.0, float(params["v_max"]) - 0.1, -0.1],
+                [0.0, 0.0, float(params["v_min"]) + 0.1, float(params["x_max"]) + 0.1],
+                [0.0, 0.0, float(params["v_max"]) - 0.1, float(params["x_max"]) + 0.1],
+            ],
+            dtype=np.float32,
+        )
+        face_Z = np.zeros((q_faces.shape[0], 4), dtype=np.float32)
+        face_Z[:, 2] = np.asarray([-3.0, 3.0, -3.0, 3.0], dtype=np.float32)
+        face_mu = model.mu_tf(
+            tf.zeros((q_faces.shape[0], 1), dtype=tf.float32),
+            tf.convert_to_tensor(q_faces),
+            tf.zeros((q_faces.shape[0], 1), dtype=tf.float32),
+            tf.convert_to_tensor(face_Z),
+        ).numpy()
+        np.testing.assert_allclose(
+            face_mu[:, 2],
+            expected_dv_np(q_faces, face_Z),
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+        assert np.all(face_mu[:2, 2] > 0.0), face_mu[:, 2]
+        assert np.all(face_mu[2:, 2] < 0.0), face_mu[:, 2]
+    finally:
+        model.close()
+
+
 def _assert_pascucci_oracle_fixture_arrays(fixture: dict, *, expected_seed: int) -> None:
     metadata = fixture["metadata"]
     inputs = fixture["inputs"]
@@ -1978,9 +2131,26 @@ def _assert_pascucci_oracle_fixture_arrays(fixture: dict, *, expected_seed: int)
     assert tuple(metadata["moment_names"]) == ("mean_v", "mean_q", "mean_h_plus_v")
     assert metadata["equation_scope"] == ["mu", "sigma", "alpha", "f", "g"]
     assert metadata["recursive_terminal_blob"] is None
+    assert metadata["oracle_validation_mode"] == "tf2_numpy_formula_regression"
+    assert metadata["historical_tf1_runtime_parity"] is False
     assert metadata["source_variants"]["final_model3"]["pascucci_cost_profile"] == "exp"
     assert metadata["source_variants"]["final_model_modifiche_f"]["pascucci_cost_profile"] == "exp_minus_offset"
     assert np.isclose(metadata["source_variants"]["final_model_modifiche_f"]["pascucci_cost_offset"], 0.12)
+    _assert_source_provenance_contract(
+        metadata["source_variants"]["final_model3"],
+        expected_file="final_model3.py",
+    )
+    _assert_source_provenance_contract(
+        metadata["source_variants"]["final_model_modifiche_f"],
+        expected_file="final_model_modifiche_f.py",
+    )
+    assert set(metadata["historical_reference_provenance"]) == {
+        "final_model3.py",
+        "final_model_modifiche_f.py",
+        "calibration.py",
+    }
+    for source_file, provenance in metadata["historical_reference_provenance"].items():
+        _assert_source_provenance_contract(provenance, expected_file=source_file)
     assert set(metadata["coverage"]) == {"day_night_hours", "q_values", "v_values", "z_v_values"}
     assert metadata["coverage"]["day_night_hours"] == [6.0, 7.0, 18.0, 19.0]
 
@@ -2107,6 +2277,83 @@ def test_pascucci_oracle_fixture_save_load_roundtrip() -> None:
             assert np.array_equal(loaded[section][key], value), (section, key)
 
 
+def test_pascucci_oracle_provenance_metadata_roundtrip() -> None:
+    _assert_pascucci_oracle_fixture_tdd_contract("pascucci_oracle_provenance_metadata_roundtrip")
+    from .pascucci_equation_oracle import evaluate_pascucci_equation_oracle
+    from .pascucci_oracle_fixture import (
+        build_pascucci_oracle_fixture,
+        load_pascucci_oracle_fixture,
+        save_pascucci_oracle_fixture,
+    )
+
+    fixture = build_pascucci_oracle_fixture(
+        seed=2468,
+        oracle_source_variant="final_model_modifiche_f",
+        pascucci_cost_profile="exp_minus_offset",
+        pascucci_cost_offset=0.12,
+    )
+    oracle = evaluate_pascucci_equation_oracle(fixture)
+
+    assert fixture["metadata"]["oracle_validation_mode"] == "tf2_numpy_formula_regression"
+    assert fixture["metadata"]["historical_tf1_runtime_parity"] is False
+    assert oracle["metadata"]["oracle_validation_mode"] == fixture["metadata"]["oracle_validation_mode"]
+    assert oracle["metadata"]["historical_tf1_runtime_parity"] is False
+    assert (
+        oracle["metadata"]["source_provenance"]
+        == fixture["metadata"]["source_variants"]["final_model_modifiche_f"]
+    )
+    assert (
+        oracle["metadata"]["historical_reference_provenance"]
+        == fixture["metadata"]["historical_reference_provenance"]
+    )
+    _assert_json_roundtrip(fixture["metadata"])
+    _assert_json_roundtrip(oracle["metadata"])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "pascucci_oracle_fixture.npz"
+        save_pascucci_oracle_fixture(fixture, path)
+        loaded = load_pascucci_oracle_fixture(path)
+    assert loaded["metadata"] == fixture["metadata"]
+
+    for missing_key in (
+        "oracle_validation_mode",
+        "historical_tf1_runtime_parity",
+        "historical_reference_provenance",
+    ):
+        legacy_fixture = dict(fixture)
+        legacy_fixture["metadata"] = dict(fixture["metadata"])
+        del legacy_fixture["metadata"][missing_key]
+        try:
+            evaluate_pascucci_equation_oracle(legacy_fixture)
+        except ValueError as exc:
+            assert missing_key in str(exc)
+        else:
+            raise AssertionError(f"legacy fixture without {missing_key} should fail fast")
+
+
+def test_pascucci_oracle_fixture_missing_historical_reference_fails_fast() -> None:
+    _assert_pascucci_oracle_fixture_tdd_contract(
+        "pascucci_oracle_fixture_missing_historical_reference_fails_fast"
+    )
+    from . import pascucci_oracle_fixture
+
+    original_paths = dict(pascucci_oracle_fixture.HISTORICAL_REFERENCE_PATHS)
+    try:
+        pascucci_oracle_fixture.HISTORICAL_REFERENCE_PATHS["calibration.py"] = (
+            "../../../to_ema/__missing_pascucci_reference_for_test__.py"
+        )
+        try:
+            pascucci_oracle_fixture.build_pascucci_oracle_fixture(seed=2468)
+        except FileNotFoundError as exc:
+            assert "historical Pascucci reference not found" in str(exc)
+            assert "__missing_pascucci_reference_for_test__.py" in str(exc)
+        else:
+            raise AssertionError("missing historical reference should fail fixture provenance")
+    finally:
+        pascucci_oracle_fixture.HISTORICAL_REFERENCE_PATHS.clear()
+        pascucci_oracle_fixture.HISTORICAL_REFERENCE_PATHS.update(original_paths)
+
+
 def test_pascucci_oracle_fixture_cost_profile_variants_are_explicit() -> None:
     _assert_pascucci_oracle_fixture_tdd_contract("pascucci_oracle_fixture_cost_profile_variants_are_explicit")
     from .pascucci_oracle_fixture import build_pascucci_oracle_fixture
@@ -2203,6 +2450,16 @@ def _assert_pascucci_equation_oracle_bundle(oracle: dict, fixture: dict) -> None
     assert metadata["fixture_seed"] == fixture["metadata"]["seed"]
     assert metadata["oracle_source_variant"] == fixture["metadata"]["oracle_source_variant"]
     assert metadata["source_file"] == fixture["metadata"]["source_variants"][metadata["oracle_source_variant"]]["source_file"]
+    assert metadata["oracle_validation_mode"] == fixture["metadata"]["oracle_validation_mode"]
+    assert metadata["historical_tf1_runtime_parity"] is False
+    assert (
+        metadata["source_provenance"]
+        == fixture["metadata"]["source_variants"][metadata["oracle_source_variant"]]
+    )
+    assert (
+        metadata["historical_reference_provenance"]
+        == fixture["metadata"]["historical_reference_provenance"]
+    )
     assert metadata["pascucci_cost_profile"] == fixture["params"]["pascucci_cost_profile"]
     assert np.isclose(metadata["pascucci_cost_offset"], fixture["params"]["pascucci_cost_offset"])
     assert metadata["equation_scope"] == ["mu", "sigma", "alpha", "f", "g"]
@@ -2792,6 +3049,7 @@ def test_pascucci_runtime_moment_diagnostics_follow_loss_context() -> None:
             "mean_q": np.mean(X_np[:, :, [3]], axis=0),
             "mean_h_plus_v": np.mean(X_np[:, :, [1]] + X_np[:, :, [2]], axis=0),
         }
+        expected.update(_pascucci_physical_violation_traces_from_x(X_np, params))
         assert set(diagnostics) == set(expected)
         assert len(model.diagnostic_contexts) >= X_np.shape[1]
         for step in range(X_np.shape[1]):
@@ -2803,6 +3061,56 @@ def test_pascucci_runtime_moment_diagnostics_follow_loss_context() -> None:
             assert value_np.dtype == np.float32, (key, value_np.dtype)
             assert np.isfinite(value_np).all(), key
             np.testing.assert_allclose(value_np, expected_trace, rtol=1.0e-6, atol=1.0e-6)
+    finally:
+        model.close()
+
+
+def test_pascucci_runtime_physical_q_v_diagnostics_follow_loss_context() -> None:
+    from .model_specs import get_model_spec
+    from .models import NN_Pascucci_Recursive
+    from .tf_backend import reset_backend_state, set_seed
+
+    reset_backend_state()
+    set_seed(75)
+
+    spec = get_model_spec("pascucci")
+    params = spec.build_default_params(const=0.75)
+    model = NN_Pascucci_Recursive(
+        Xi_generator=spec.xi_generator,
+        T=0.25,
+        M=4,
+        N=2,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        terminal_blob=None,
+        normalize_time_input=True,
+    )
+
+    try:
+        t_batch, W_batch, Xi_batch = _fixed_validation_batch(M=4, N=2, D=4, T=0.25, seed=75)
+        Xi_batch[:, 2] = np.asarray([-2.50, -2.05, 2.25, 0.00], dtype=np.float32)
+        Xi_batch[:, 3] = np.asarray([-0.25, 0.00, 10.50, 5.00], dtype=np.float32)
+        _, X, _, _, diagnostics = model.loss_function(
+            t_batch,
+            W_batch,
+            Xi_batch,
+            const_value=0.75,
+            return_runtime_diagnostics=True,
+        )
+        X_np = X.numpy()
+        expected = _pascucci_physical_violation_traces_from_x(X_np, params)
+        for key, expected_trace in expected.items():
+            assert key in diagnostics, f"{key} missing from diagnostics: {sorted(diagnostics)}"
+            value = diagnostics[key].numpy()
+            assert value.shape == (X_np.shape[1], 1), (key, value.shape)
+            assert value.dtype == np.float32, (key, value.dtype)
+            assert np.isfinite(value).all(), key
+            assert np.all(value >= 0.0), key
+            np.testing.assert_allclose(value, expected_trace, rtol=1.0e-6, atol=1.0e-6)
     finally:
         model.close()
 
@@ -2970,6 +3278,12 @@ def test_pascucci_fixed_eval_bundle_recomputes_moments_deterministically() -> No
                 np.mean(X_np[:, -1, [1]] + X_np[:, -1, [2]])
             ),
         }
+        expected_block_end.update(
+            {
+                f"mean_block_end_{key}": float(value[-1, 0])
+                for key, value in _pascucci_physical_violation_traces_from_x(X_np, params).items()
+            }
+        )
         for key, trace in diagnostics.items():
             trace_np = trace.numpy() if hasattr(trace, "numpy") else np.asarray(trace)
             np.testing.assert_allclose(
@@ -3011,6 +3325,9 @@ def test_pascucci_fixed_eval_bundle_recomputes_moments_deterministically() -> No
             np.testing.assert_allclose(first[key], second[key], rtol=1.0e-7, atol=1.0e-7)
         for key, expected in expected_block_end.items():
             np.testing.assert_allclose(first[key], expected, rtol=1.0e-6, atol=1.0e-6)
+            std_key = key.replace("mean_", "std_", 1)
+            assert std_key in first, f"{std_key} missing from fixed eval stats: {sorted(first)}"
+            np.testing.assert_allclose(first[std_key], 0.0, rtol=0.0, atol=1.0e-7)
     finally:
         model.close()
 
@@ -3735,6 +4052,8 @@ def test_prefixed_eval_diagnostics_forwards_scalar_model_moments_only() -> None:
             "std_loss_dynamic": 0.01,
             "mean_block_end_mean_v": np.float32(1.25),
             "std_block_end_mean_v": np.float32(0.05),
+            "mean_block_end_q_lower_violation": np.float32(0.10),
+            "std_block_end_q_lower_violation": np.float32(0.02),
             "mean_trace_mean_v": np.asarray([1.0, 2.0], dtype=np.float32),
             "mean_unrelated_scalar": np.float32(0.33),
             "std_bad": np.float32(np.inf),
@@ -3747,6 +4066,8 @@ def test_prefixed_eval_diagnostics_forwards_scalar_model_moments_only() -> None:
     np.testing.assert_allclose(diagnostics["eval_std_loss_dynamic"], 0.01)
     np.testing.assert_allclose(diagnostics["eval_mean_block_end_mean_v"], 1.25)
     np.testing.assert_allclose(diagnostics["eval_std_block_end_mean_v"], 0.05)
+    np.testing.assert_allclose(diagnostics["eval_mean_block_end_q_lower_violation"], 0.10)
+    np.testing.assert_allclose(diagnostics["eval_std_block_end_q_lower_violation"], 0.02)
     assert "eval_mean_loss" not in diagnostics
     assert "eval_std_loss" not in diagnostics
     assert "eval_mean_trace_mean_v" not in diagnostics
@@ -3805,10 +4126,12 @@ def test_predict_recursive_stitched_pascucci_moment_traces() -> None:
             axis=0,
         ),
     }
+    expected.update(_pascucci_physical_violation_traces_from_x(stitched["X"], params))
     for key, expected_trace in expected.items():
         assert key in stitched, f"{key} missing from stitched keys: {sorted(stitched)}"
         assert stitched[key].shape == (len(blocks) * N_per_block + 1, 1)
         assert stitched[key].dtype == np.float32
+        assert np.isfinite(stitched[key]).all(), key
         np.testing.assert_allclose(stitched[key], expected_trace, rtol=1.0e-6, atol=1.0e-6)
 
     quadratic_spec = get_model_spec("quadratic_coupled")
@@ -4034,6 +4357,10 @@ def test_print_recursive_pass_saves_stitched_moment_traces() -> None:
             "mean_v": np.asarray([[0.1], [0.2], [0.3]], dtype=np.float32),
             "mean_q": np.asarray([[4.0], [4.5], [5.0]], dtype=np.float32),
             "mean_h_plus_v": np.asarray([[0.6], [0.45], [0.3]], dtype=np.float32),
+            "q_lower_violation": np.asarray([[0.0], [0.1], [0.2]], dtype=np.float32),
+            "q_upper_violation": np.asarray([[0.0], [0.0], [0.3]], dtype=np.float32),
+            "v_lower_violation": np.asarray([[0.4], [0.0], [0.0]], dtype=np.float32),
+            "v_upper_violation": np.asarray([[0.0], [0.5], [0.0]], dtype=np.float32),
         }
 
     original_predict = orchestration.predict_recursive_stitched
@@ -4075,9 +4402,19 @@ def test_print_recursive_pass_saves_stitched_moment_traces() -> None:
                 with np.load(path) as data:
                     keys = set(data.files)
                     assert {"t", "X", "Y", "Z"}.issubset(keys)
-                    for key in ("mean_v", "mean_q", "mean_h_plus_v"):
+                    for key in (
+                        "mean_v",
+                        "mean_q",
+                        "mean_h_plus_v",
+                        "q_lower_violation",
+                        "q_upper_violation",
+                        "v_lower_violation",
+                        "v_upper_violation",
+                    ):
                         assert key in keys, f"{key} missing from {filename}: {sorted(keys)}"
                         assert data[key].shape == (3, 1)
+                        assert data[key].dtype == np.float32
+                        assert np.isfinite(data[key]).all(), key
                     assert "block_params" not in keys
                     assert not any(key.startswith(("params_", "weights_")) for key in keys)
     finally:
@@ -5549,6 +5886,10 @@ def run_tests(argv: List[str] | None = None) -> int:
         "test_pascucci_q_v_barrier_drift_pushes_toward_physical_domain",
     ) and ok
     ok = _run_subprocess_case(
+        "pascucci_q_v_barrier_sweep_with_nonzero_z_v",
+        "test_pascucci_q_v_barrier_sweep_with_nonzero_z_v",
+    ) and ok
+    ok = _run_subprocess_case(
         "pascucci_oracle_fixture_generation_contract",
         "test_pascucci_oracle_fixture_generation_contract",
     ) and ok
@@ -5559,6 +5900,14 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "pascucci_oracle_fixture_save_load_roundtrip",
         "test_pascucci_oracle_fixture_save_load_roundtrip",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_oracle_provenance_metadata_roundtrip",
+        "test_pascucci_oracle_provenance_metadata_roundtrip",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_oracle_fixture_missing_historical_reference_fails_fast",
+        "test_pascucci_oracle_fixture_missing_historical_reference_fails_fast",
     ) and ok
     ok = _run_subprocess_case(
         "pascucci_oracle_fixture_cost_profile_variants_are_explicit",
@@ -5603,6 +5952,10 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "pascucci_runtime_moment_diagnostics_follow_loss_context",
         "test_pascucci_runtime_moment_diagnostics_follow_loss_context",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_runtime_physical_q_v_diagnostics_follow_loss_context",
+        "test_pascucci_runtime_physical_q_v_diagnostics_follow_loss_context",
     ) and ok
     ok = _run_subprocess_case(
         "quadratic_runtime_moment_diagnostics_are_noop",

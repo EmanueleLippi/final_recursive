@@ -20,6 +20,10 @@ class PascucciMeanFieldMoments:
     mean_v: object
     mean_q: object
     mean_h_plus_v: object
+    q_lower_violation: object = None
+    q_upper_violation: object = None
+    v_lower_violation: object = None
+    v_upper_violation: object = None
 
 
 class _SessionShim:
@@ -829,11 +833,21 @@ class NN_Pascucci(FBSNN):
     def loss_context_diagnostics_tf(self, loss_context):
         if loss_context is None:
             return {}
-        return {
+        diagnostics = {
             "mean_v": loss_context.mean_v,
             "mean_q": loss_context.mean_q,
             "mean_h_plus_v": loss_context.mean_h_plus_v,
         }
+        for key in (
+            "q_lower_violation",
+            "q_upper_violation",
+            "v_lower_violation",
+            "v_upper_violation",
+        ):
+            value = getattr(loss_context, key, None)
+            if value is not None:
+                diagnostics[key] = value
+        return diagnostics
 
     def is_day_tf(self, t):
         hour = tf.math.floormod(t, 24.0)
@@ -899,10 +913,31 @@ class NN_Pascucci(FBSNN):
 
     def mean_field_moments_tf(self, X):
         _, H, V, X_state = tf.split(tf.cast(X, tf.float32), num_or_size_splits=4, axis=1)
+        physical_diagnostics = self.physical_constraint_diagnostics_tf(X)
         return PascucciMeanFieldMoments(
             mean_v=tf.reduce_mean(V, axis=0, keepdims=True),
             mean_q=tf.reduce_mean(X_state, axis=0, keepdims=True),
             mean_h_plus_v=tf.reduce_mean(H + V, axis=0, keepdims=True),
+            q_lower_violation=tf.reduce_mean(
+                physical_diagnostics["q_lower_violation"],
+                axis=0,
+                keepdims=True,
+            ),
+            q_upper_violation=tf.reduce_mean(
+                physical_diagnostics["q_upper_violation"],
+                axis=0,
+                keepdims=True,
+            ),
+            v_lower_violation=tf.reduce_mean(
+                physical_diagnostics["v_lower_violation"],
+                axis=0,
+                keepdims=True,
+            ),
+            v_upper_violation=tf.reduce_mean(
+                physical_diagnostics["v_upper_violation"],
+                axis=0,
+                keepdims=True,
+            ),
         )
 
     def _mean_field_moments_or_default(self, X, moment_state=None):

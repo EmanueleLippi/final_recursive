@@ -198,7 +198,17 @@ def evaluate_pascucci_equation_oracle(fixture: dict[str, Any]) -> dict[str, Any]
 
     fixture_metadata, inputs, params, moments = _validate_fixture(fixture)
     variant = str(fixture_metadata["oracle_source_variant"])
-    source_file = fixture_metadata["source_variants"][variant]["source_file"]
+    try:
+        source_provenance = fixture_metadata["source_variants"][variant]
+    except KeyError as exc:
+        raise ValueError(f"oracle source variant metadata missing for {variant!r}") from exc
+    source_file = source_provenance["source_file"]
+    if "oracle_validation_mode" not in fixture_metadata:
+        raise ValueError("Pascucci oracle fixture metadata missing oracle_validation_mode")
+    if "historical_tf1_runtime_parity" not in fixture_metadata:
+        raise ValueError("Pascucci oracle fixture metadata missing historical_tf1_runtime_parity")
+    if "historical_reference_provenance" not in fixture_metadata:
+        raise ValueError("Pascucci oracle fixture metadata missing historical_reference_provenance")
     X = inputs["X"]
     t = inputs["t"]
     Z = inputs["Z"]
@@ -216,7 +226,11 @@ def evaluate_pascucci_equation_oracle(fixture: dict[str, Any]) -> dict[str, Any]
         "fixture_seed": int(fixture_metadata["seed"]),
         "oracle_source_variant": variant,
         "source_file": source_file,
+        "source_provenance": dict(source_provenance),
         "historical_references": list(HISTORICAL_REFERENCES),
+        "historical_reference_provenance": dict(fixture_metadata["historical_reference_provenance"]),
+        "oracle_validation_mode": str(fixture_metadata["oracle_validation_mode"]),
+        "historical_tf1_runtime_parity": bool(fixture_metadata["historical_tf1_runtime_parity"]),
         "equation_scope": ["mu", "sigma", "alpha", "f", "g"],
         "moment_policy": "explicit_fixture_moments",
         "pascucci_cost_profile": str(params["pascucci_cost_profile"]),
