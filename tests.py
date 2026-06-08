@@ -517,6 +517,45 @@ PASCUCCI_MODEL_LAYER_TDD_CONTRACTS = {
 }
 
 
+PASCUCCI_ORACLE_FIXTURE_TDD_CONTRACTS = {
+    "pascucci_oracle_fixture_generation_contract": {
+        "type": "acceptance-unit",
+        "target": "pascucci_oracle_fixture.build_pascucci_oracle_fixture",
+        "purpose": "Create a deterministic pointwise Pascucci fixture for future TF1/TF2 oracle tests.",
+        "expected": "Fixture contains JSON-safe metadata/params plus finite float32 t, X, Y, Z arrays and explicit moments.",
+        "failure": "Catches untraceable, non-serializable, or under-specified oracle fixture inputs before #21.",
+    },
+    "pascucci_oracle_fixture_reproducible_and_seed_sensitive": {
+        "type": "unit",
+        "target": "pascucci_oracle_fixture.build_pascucci_oracle_fixture",
+        "purpose": "Pin reproducibility while keeping seed changes observable.",
+        "expected": "Same seed gives identical arrays and metadata; different seed changes pointwise non-time inputs.",
+        "failure": "Catches hidden RNG, unstable ordering, or a seed parameter that is recorded but ignored.",
+    },
+    "pascucci_oracle_fixture_save_load_roundtrip": {
+        "type": "io-unit",
+        "target": "pascucci_oracle_fixture.save/load_pascucci_oracle_fixture",
+        "purpose": "Make fixture artifacts reusable across future TF1/TF2 subprocess oracle checks.",
+        "expected": "NPZ roundtrip preserves arrays, metadata, params, and explicit moments without pickle.",
+        "failure": "Catches non-portable fixture artifacts or lossy metadata serialization.",
+    },
+    "pascucci_oracle_fixture_cost_profile_variants_are_explicit": {
+        "type": "regression-unit",
+        "target": "pascucci_oracle_fixture.build_pascucci_oracle_fixture metadata",
+        "purpose": "Avoid ambiguity between historical final_model3 and final_model_modifiche_f running-cost variants.",
+        "expected": "Fixture metadata records source variant, cost profile, and offset; unsupported profiles fail fast.",
+        "failure": "Catches selecting the wrong historical oracle source by implication.",
+    },
+    "quadratic_spec_unaffected_by_pascucci_oracle_fixture_import": {
+        "type": "regression-unit",
+        "target": "model_specs.get_model_spec plus pascucci_oracle_fixture import",
+        "purpose": "Protect the frozen quadratic benchmark from Pascucci oracle-fixture side effects.",
+        "expected": "Quadratic params and deterministic Xi remain unchanged after importing/building Pascucci fixtures.",
+        "failure": "Catches hidden import-time coupling or benchmark config pollution.",
+    },
+}
+
+
 def _assert_pascucci_tdd_contract(name: str) -> None:
     contract = PASCUCCI_CALIBRATION_TDD_CONTRACTS[name]
     for key in ("type", "target", "purpose", "expected", "failure"):
@@ -526,6 +565,13 @@ def _assert_pascucci_tdd_contract(name: str) -> None:
 
 def _assert_pascucci_model_tdd_contract(name: str) -> None:
     contract = PASCUCCI_MODEL_LAYER_TDD_CONTRACTS[name]
+    for key in ("type", "target", "purpose", "expected", "failure"):
+        value = str(contract.get(key, "")).strip()
+        assert value, f"{name} missing TDD contract field {key}"
+
+
+def _assert_pascucci_oracle_fixture_tdd_contract(name: str) -> None:
+    contract = PASCUCCI_ORACLE_FIXTURE_TDD_CONTRACTS[name]
     for key in ("type", "target", "purpose", "expected", "failure"):
         value = str(contract.get(key, "")).strip()
         assert value, f"{name} missing TDD contract field {key}"
@@ -806,6 +852,19 @@ def test_pascucci_model_layer_tdd_contract_metadata() -> None:
     assert set(PASCUCCI_MODEL_LAYER_TDD_CONTRACTS) == expected_names
     for name in expected_names:
         _assert_pascucci_model_tdd_contract(name)
+
+
+def test_pascucci_oracle_fixture_tdd_contract_metadata() -> None:
+    expected_names = {
+        "pascucci_oracle_fixture_generation_contract",
+        "pascucci_oracle_fixture_reproducible_and_seed_sensitive",
+        "pascucci_oracle_fixture_save_load_roundtrip",
+        "pascucci_oracle_fixture_cost_profile_variants_are_explicit",
+        "quadratic_spec_unaffected_by_pascucci_oracle_fixture_import",
+    }
+    assert set(PASCUCCI_ORACLE_FIXTURE_TDD_CONTRACTS) == expected_names
+    for name in expected_names:
+        _assert_pascucci_oracle_fixture_tdd_contract(name)
 
 
 def test_pascucci_prepare_H_hourly_mean_net_power_and_scale() -> None:
@@ -1844,6 +1903,210 @@ def test_pascucci_q_v_barrier_drift_pushes_toward_physical_domain() -> None:
         assert abs(float(dV[2])) <= 1.0e-7, dV
     finally:
         model.close()
+
+
+def _assert_pascucci_oracle_fixture_arrays(fixture: dict, *, expected_seed: int) -> None:
+    metadata = fixture["metadata"]
+    inputs = fixture["inputs"]
+    moments = fixture["moments"]
+
+    assert metadata["fixture_version"] == 1
+    assert metadata["model_name"] == "pascucci"
+    assert metadata["seed"] == int(expected_seed)
+    assert metadata["dtype"] == "float32"
+    assert tuple(metadata["state_labels"]) == ("S", "H", "V", "X_state")
+    assert tuple(metadata["z_labels"]) == ("Z_S", "Z_H", "Z_V", "Z_X")
+    assert tuple(metadata["moment_names"]) == ("mean_v", "mean_q", "mean_h_plus_v")
+    assert metadata["equation_scope"] == ["mu", "sigma", "alpha", "f", "g"]
+    assert metadata["recursive_terminal_blob"] is None
+    assert metadata["source_variants"]["final_model3"]["pascucci_cost_profile"] == "exp"
+    assert metadata["source_variants"]["final_model_modifiche_f"]["pascucci_cost_profile"] == "exp_minus_offset"
+    assert np.isclose(metadata["source_variants"]["final_model_modifiche_f"]["pascucci_cost_offset"], 0.12)
+    assert set(metadata["coverage"]) == {"day_night_hours", "q_values", "v_values", "z_v_values"}
+    assert metadata["coverage"]["day_night_hours"] == [6.0, 7.0, 18.0, 19.0]
+
+    assert set(inputs) == {"t", "X", "Y", "Z"}
+    expected_shapes = {
+        "t": (6, 1),
+        "X": (6, 4),
+        "Y": (6, 1),
+        "Z": (6, 4),
+    }
+    for key, expected_shape in expected_shapes.items():
+        value = inputs[key]
+        assert isinstance(value, np.ndarray), key
+        assert value.shape == expected_shape, key
+        assert value.dtype == np.float32, key
+        assert np.isfinite(value).all(), key
+
+    assert np.array_equal(inputs["t"][:, 0], np.asarray([6.0, 7.0, 12.0, 18.0, 19.0, 30.0], dtype=np.float32))
+    assert np.any(inputs["Z"][:, 2] != 0.0)
+    assert np.any(inputs["Z"][:, 0] != inputs["Z"][:, 2])
+    assert np.any(inputs["X"][:, 3] < 0.0)
+    assert np.any(inputs["X"][:, 3] > float(fixture["params"]["x_max"]))
+    assert np.any(inputs["X"][:, 2] < float(fixture["params"]["v_min"]))
+    assert np.any(inputs["X"][:, 2] > float(fixture["params"]["v_max"]))
+
+    expected_moments = {
+        "mean_v": np.mean(inputs["X"][:, [2]], axis=0, keepdims=True),
+        "mean_q": np.mean(inputs["X"][:, [3]], axis=0, keepdims=True),
+        "mean_h_plus_v": np.mean(inputs["X"][:, [1]] + inputs["X"][:, [2]], axis=0, keepdims=True),
+    }
+    assert set(moments) == set(expected_moments)
+    for key, expected in expected_moments.items():
+        value = moments[key]
+        assert value.shape == (1, 1), key
+        assert value.dtype == np.float32, key
+        np.testing.assert_allclose(value, expected.astype(np.float32), rtol=0.0, atol=1.0e-7)
+
+
+def test_pascucci_oracle_fixture_generation_contract() -> None:
+    _assert_pascucci_oracle_fixture_tdd_contract("pascucci_oracle_fixture_generation_contract")
+    from .pascucci_oracle_fixture import build_pascucci_oracle_fixture
+
+    fixture = build_pascucci_oracle_fixture(seed=20260608)
+    assert set(fixture) == {"metadata", "inputs", "params", "moments"}
+    _assert_pascucci_oracle_fixture_arrays(fixture, expected_seed=20260608)
+    assert fixture["metadata"]["oracle_source_variant"] == "final_model3"
+    assert fixture["params"]["pascucci_cost_profile"] == "exp"
+    assert float(fixture["params"]["pascucci_cost_offset"]) == 0.0
+    _assert_json_roundtrip(fixture["metadata"])
+    _assert_json_roundtrip(fixture["params"])
+
+
+def test_pascucci_oracle_fixture_reproducible_and_seed_sensitive() -> None:
+    _assert_pascucci_oracle_fixture_tdd_contract("pascucci_oracle_fixture_reproducible_and_seed_sensitive")
+    from .pascucci_oracle_fixture import build_pascucci_oracle_fixture
+
+    first = build_pascucci_oracle_fixture(seed=12345)
+    second = build_pascucci_oracle_fixture(seed=12345)
+    changed = build_pascucci_oracle_fixture(seed=12346)
+
+    assert first["metadata"] == second["metadata"]
+    assert first["params"] == second["params"]
+    for section in ("inputs", "moments"):
+        for key, value in first[section].items():
+            assert np.array_equal(value, second[section][key]), (section, key)
+
+    assert np.array_equal(first["inputs"]["t"], changed["inputs"]["t"])
+    assert not np.array_equal(first["inputs"]["X"], changed["inputs"]["X"])
+    assert not np.array_equal(first["inputs"]["Z"], changed["inputs"]["Z"])
+    assert changed["metadata"]["seed"] == 12346
+
+
+def test_pascucci_oracle_fixture_save_load_roundtrip() -> None:
+    _assert_pascucci_oracle_fixture_tdd_contract("pascucci_oracle_fixture_save_load_roundtrip")
+    from .pascucci_oracle_fixture import (
+        build_pascucci_oracle_fixture,
+        load_pascucci_oracle_fixture,
+        save_pascucci_oracle_fixture,
+    )
+
+    fixture = build_pascucci_oracle_fixture(
+        seed=9876,
+        oracle_source_variant="final_model_modifiche_f",
+        pascucci_cost_profile="exp_minus_offset",
+        pascucci_cost_offset=0.12,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "pascucci_oracle_fixture.npz"
+        save_pascucci_oracle_fixture(fixture, path)
+        with np.load(path, allow_pickle=False) as raw:
+            assert "metadata_json" in raw.files
+            assert "params_json" in raw.files
+            assert "t" in raw.files
+            assert "X" in raw.files
+            assert "Y" in raw.files
+            assert "Z" in raw.files
+            assert "moment_mean_v" in raw.files
+            assert "moment_mean_q" in raw.files
+            assert "moment_mean_h_plus_v" in raw.files
+        loaded = load_pascucci_oracle_fixture(path)
+
+        malformed_path = Path(tmp) / "malformed_pascucci_oracle_fixture.npz"
+        np.savez(
+            malformed_path,
+            metadata_json=np.asarray(json.dumps(fixture["metadata"], sort_keys=True)),
+            params_json=np.asarray(json.dumps(fixture["params"], sort_keys=True)),
+            t=fixture["inputs"]["t"],
+            X=fixture["inputs"]["X"],
+            Y=fixture["inputs"]["Y"],
+            Z=fixture["inputs"]["Z"],
+        )
+        try:
+            load_pascucci_oracle_fixture(malformed_path)
+        except ValueError as exc:
+            assert "missing Pascucci oracle fixture keys" in str(exc)
+            assert "moment_mean_v" in str(exc)
+        else:
+            raise AssertionError("malformed oracle fixture should fail schema validation")
+
+    assert loaded["metadata"] == fixture["metadata"]
+    assert loaded["params"] == fixture["params"]
+    for section in ("inputs", "moments"):
+        for key, value in fixture[section].items():
+            assert np.array_equal(loaded[section][key], value), (section, key)
+
+
+def test_pascucci_oracle_fixture_cost_profile_variants_are_explicit() -> None:
+    _assert_pascucci_oracle_fixture_tdd_contract("pascucci_oracle_fixture_cost_profile_variants_are_explicit")
+    from .pascucci_oracle_fixture import build_pascucci_oracle_fixture
+
+    base = build_pascucci_oracle_fixture(seed=77, oracle_source_variant="final_model3")
+    assert base["metadata"]["oracle_source_variant"] == "final_model3"
+    assert base["params"]["pascucci_cost_profile"] == "exp"
+    assert float(base["params"]["pascucci_cost_offset"]) == 0.0
+
+    offset = build_pascucci_oracle_fixture(
+        seed=77,
+        oracle_source_variant="final_model_modifiche_f",
+        pascucci_cost_profile="exp_minus_offset",
+        pascucci_cost_offset=0.12,
+    )
+    assert offset["metadata"]["oracle_source_variant"] == "final_model_modifiche_f"
+    assert offset["params"]["pascucci_cost_profile"] == "exp_minus_offset"
+    assert np.isclose(offset["params"]["pascucci_cost_offset"], 0.12)
+
+    for kwargs in (
+        {"oracle_source_variant": "unknown_source"},
+        {"pascucci_cost_profile": "exp_plus_hidden_magic"},
+        {"pascucci_cost_profile": "exp", "pascucci_cost_offset": 0.12},
+    ):
+        try:
+            build_pascucci_oracle_fixture(seed=77, **kwargs)
+        except ValueError as exc:
+            assert "pascucci" in str(exc) or "oracle_source_variant" in str(exc)
+        else:
+            raise AssertionError(f"invalid fixture args should fail: {kwargs}")
+
+
+def test_quadratic_spec_unaffected_by_pascucci_oracle_fixture_import() -> None:
+    _assert_pascucci_oracle_fixture_tdd_contract("quadratic_spec_unaffected_by_pascucci_oracle_fixture_import")
+    from .model_specs import get_model_spec
+
+    spec_before = get_model_spec("quadratic_coupled")
+    params_before = spec_before.build_default_params()
+    xi_before = spec_before.deterministic_xi(4, 4, seed=2026)
+    np.random.seed(8642)
+    rng_before = np.random.rand(4).astype(np.float32)
+
+    from .pascucci_oracle_fixture import build_pascucci_oracle_fixture
+
+    fixture = build_pascucci_oracle_fixture(seed=2026)
+    assert fixture["metadata"]["model_name"] == "pascucci"
+
+    spec_after = get_model_spec("quadratic_coupled")
+    params_after = spec_after.build_default_params()
+    xi_after = spec_after.deterministic_xi(4, 4, seed=2026)
+    np.random.seed(8642)
+    rng_after = np.random.rand(4).astype(np.float32)
+
+    assert spec_after.name == spec_before.name
+    assert "pascucci_cost_profile" not in params_after
+    assert "pascucci_cost_offset" not in params_after
+    assert sorted(params_after) == sorted(params_before)
+    np.testing.assert_array_equal(xi_after, xi_before)
+    np.testing.assert_array_equal(rng_after, rng_before)
 
 
 def test_pascucci_mean_field_moments_contract() -> None:
@@ -4958,6 +5221,7 @@ def run_tests(argv: List[str] | None = None) -> int:
         ("model_spec_contract", test_model_spec_contract),
         ("pascucci_tdd_contract_metadata", test_pascucci_tdd_contract_metadata),
         ("pascucci_model_layer_tdd_contract_metadata", test_pascucci_model_layer_tdd_contract_metadata),
+        ("pascucci_oracle_fixture_tdd_contract_metadata", test_pascucci_oracle_fixture_tdd_contract_metadata),
         ("pascucci_prepare_H_hourly_mean_net_power_and_scale", test_pascucci_prepare_H_hourly_mean_net_power_and_scale),
         ("pascucci_prepare_H_missing_columns_raise", test_pascucci_prepare_H_missing_columns_raise),
         (
@@ -5058,6 +5322,26 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "pascucci_q_v_barrier_drift_pushes_toward_physical_domain",
         "test_pascucci_q_v_barrier_drift_pushes_toward_physical_domain",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_oracle_fixture_generation_contract",
+        "test_pascucci_oracle_fixture_generation_contract",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_oracle_fixture_reproducible_and_seed_sensitive",
+        "test_pascucci_oracle_fixture_reproducible_and_seed_sensitive",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_oracle_fixture_save_load_roundtrip",
+        "test_pascucci_oracle_fixture_save_load_roundtrip",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_oracle_fixture_cost_profile_variants_are_explicit",
+        "test_pascucci_oracle_fixture_cost_profile_variants_are_explicit",
+    ) and ok
+    ok = _run_subprocess_case(
+        "quadratic_spec_unaffected_by_pascucci_oracle_fixture_import",
+        "test_quadratic_spec_unaffected_by_pascucci_oracle_fixture_import",
     ) and ok
     ok = _run_subprocess_case(
         "pascucci_mean_field_moments_contract",
