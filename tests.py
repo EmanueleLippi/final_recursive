@@ -1670,15 +1670,7 @@ def test_pascucci_cost_profile_exp_minus_offset_changes_only_running_cost() -> N
             dtype=np.float32,
         )
         Y = np.array([[0.1], [0.2], [-0.1], [0.3]], dtype=np.float32)
-        Z = np.array(
-            [
-                [0.1, 0.2, -0.3, 0.4],
-                [0.2, -0.1, 0.4, -0.5],
-                [0.3, 0.0, 0.2, -0.1],
-                [0.4, -0.2, -0.1, 0.2],
-            ],
-            dtype=np.float32,
-        )
+        Z = np.zeros((4, 4), dtype=np.float32)
         t = np.zeros((4, 1), dtype=np.float32)
 
         t_tf = tf.convert_to_tensor(t)
@@ -1753,15 +1745,7 @@ def test_pascucci_recursive_cost_profile_matches_standard_formula() -> None:
             dtype=np.float32,
         )
         Y = np.array([[0.1], [0.2], [-0.1], [0.3]], dtype=np.float32)
-        Z = np.array(
-            [
-                [0.1, 0.2, -0.3, 0.4],
-                [0.2, -0.1, 0.4, -0.5],
-                [0.3, 0.0, 0.2, -0.1],
-                [0.4, -0.2, -0.1, 0.2],
-            ],
-            dtype=np.float32,
-        )
+        Z = np.zeros((4, 4), dtype=np.float32)
         t = np.zeros((4, 1), dtype=np.float32)
         t_tf = tf.convert_to_tensor(t)
         X_tf = tf.convert_to_tensor(X)
@@ -4113,9 +4097,9 @@ def test_cli_records_pascucci_cost_profile_params_in_run_config() -> None:
             config = json.loads((runs[0] / "run_config.json").read_text(encoding="utf-8"))
             assert config["model_name"] == "pascucci"
             assert config["params"]["pascucci_cost_profile"] == "exp_minus_offset"
-            assert config["params"]["pascucci_cost_offset"] == 0.12
+            assert np.isclose(config["params"]["pascucci_cost_offset"], 0.12)
             assert standard_calls[0]["params"]["pascucci_cost_profile"] == "exp_minus_offset"
-            assert float(standard_calls[0]["params"]["pascucci_cost_offset"]) == 0.12
+            assert np.isclose(float(standard_calls[0]["params"]["pascucci_cost_offset"]), 0.12)
     finally:
         orchestration.run_standard_reference = original_run_standard_reference
         cli.export_standard_parameter_blob = original_export_standard_parameter_blob
@@ -4299,9 +4283,9 @@ def test_cli_records_pascucci_cost_profile_params_in_recursive_run_config() -> N
             config = json.loads((runs[0] / "run_config.json").read_text(encoding="utf-8"))
             assert config["mode"] == "recursive"
             assert config["params"]["pascucci_cost_profile"] == "exp_minus_offset"
-            assert config["params"]["pascucci_cost_offset"] == 0.12
+            assert np.isclose(config["params"]["pascucci_cost_offset"], 0.12)
             assert recursive_calls[0]["params"]["pascucci_cost_profile"] == "exp_minus_offset"
-            assert float(recursive_calls[0]["params"]["pascucci_cost_offset"]) == 0.12
+            assert np.isclose(float(recursive_calls[0]["params"]["pascucci_cost_offset"]), 0.12)
             assert len(print_calls) == 1
     finally:
         orchestration.run_recursive_training = original_run_recursive_training

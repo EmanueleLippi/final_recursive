@@ -45,6 +45,23 @@ def run_program(argv: Optional[List[str]] = None):
             "Default: quadratic_coupled. Valori supportati ora: quadratic_coupled, pascucci."
         ),
     )
+    parser.add_argument(
+        "--pascucci_cost_profile",
+        type=str,
+        default="exp",
+        choices=["exp", "exp_minus_offset"],
+        help=(
+            "Profilo di costo di Pascucci. "
+            "exp: costo proporzionale a exp(S) (come in Pascucci); "
+            "exp_minus_offset: costo proporzionale a exp(S) - offset, con offset >= 0."
+        ),
+    )
+    parser.add_argument(
+        "--pascucci_cost_offset",
+        type=float,
+        default=0.0,
+        help="Offset per il profilo di costo di Pascucci.",
+    )
     parser.add_argument("--M", type=int, default=100)
     parser.add_argument("--N", type=int, default=100, help="N steps per block")
     parser.add_argument("--D", type=int, default=4)
@@ -391,6 +408,13 @@ def run_program(argv: Optional[List[str]] = None):
         )
 
     params = model_spec.build_default_params(const=effective_const)
+    pascucci_cost_profile = str(args.pascucci_cost_profile).strip().lower()
+    pascucci_cost_offset = float(args.pascucci_cost_offset)
+    if model_spec.name == "pascucci":
+        params["pascucci_cost_profile"] = pascucci_cost_profile
+        params["pascucci_cost_offset"] = np.float32(pascucci_cost_offset)
+    elif pascucci_cost_profile != "exp" or abs(pascucci_cost_offset) > 1e-8:
+        raise ValueError("--pascucci_cost_profile/--pascucci_cost_offset are supported only with --model pascucci")
     params.update(
         {
             "same_xi_antithetic_sampling": bool(args.same_xi_antithetic_sampling),

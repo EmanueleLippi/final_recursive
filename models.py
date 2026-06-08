@@ -786,6 +786,14 @@ class NN_Pascucci(FBSNN):
         self.c_h = parameters["c_h"]
         self.c_con = parameters["c_con"]
         self.const = parameters["const"]
+        self.pascucci_cost_profile = str(parameters.get("pascucci_cost_profile", "exp")).strip().lower()
+        self.pascucci_cost_offset = np.float32(parameters.get("pascucci_cost_offset", 0.0))
+        if self.pascucci_cost_profile not in("exp", "exp_minus_offset"):
+            raise ValueError(f"unsupported pascucci_cost_profile={self.pascucci_cost_profile!r}")
+        if not np.isfinite(float(self.pascucci_cost_offset)) or float(self.pascucci_cost_offset) < 0.0:
+            raise ValueError("pascucci_cost_offset must be finite and >= 0")
+        if self.pascucci_cost_profile == "exp" and abs(float(self.pascucci_cost_offset)) > 1e-8:
+            raise ValueError("pascucci_cost_offset must be 0.0 when pascucci_cost_profile = 'exp'")
 
         self.params_S_tf = self._build_tf_params(self.params_S)
         self.params_H_tf = self._build_tf_params(self.params_H)
@@ -909,6 +917,21 @@ class NN_Pascucci(FBSNN):
             2.0 * (X_state - mean_value) ** 2,
         )
 
+    def running_cost_price_tf(self, S):
+        price = tf.exp(tf.cast(S, tf.float32))
+        if self.pascucci_cost_profile == "exp_minus_offset":
+            price = price - tf.cast(self.pascucci_cost_offset, tf.float32)
+        return price
+
+    def physical_constraint_diagnostics_tf(self, X):
+        _, _, V, X_state = tf.split(tf.cast(X, tf.float32), 4, axis=1)
+        return {
+            "q_lower_violation": tf.nn.relu(-X_state),
+            "q_upper_violation": tf.nn.relu(X_state - tf.cast(self.x_max, tf.float32)),
+            "v_lower_violation": tf.nn.relu(tf.cast(self.v_min, tf.float32) - V),
+            "v_upper_violation": tf.nn.relu(V - tf.cast(self.v_max, tf.float32)),
+        }
+
     def alpha_tf(self, t, X, Z_V, moment_state=None):
         _, _, _, X_state = tf.split(tf.cast(X, tf.float32), num_or_size_splits=4, axis=1)
         denom = 2.0 * self.l_a * tf.maximum(
@@ -931,7 +954,7 @@ class NN_Pascucci(FBSNN):
         S, H, V, X_state = tf.split(tf.cast(X, tf.float32), num_or_size_splits=4, axis=1)
         _, _, Z_V, _ = tf.split(tf.cast(Z, tf.float32), num_or_size_splits=4, axis=1)
         moments = self._mean_field_moments_or_default(X, moment_state)
-        term1 = tf.exp(S) * (H + V)
+        term1 = self.running_cost_price_tf(S) * (H + V)
         term2 = self.l_v * V ** 2
         term3 = self.l_a * self.alpha_tf(t, X, Z_V, moment_state=moments) ** 2
         term4 = self.c_h * self.h_tf(X_state, moments.mean_q)
