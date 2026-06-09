@@ -9,7 +9,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .application_metrics import summarize_pascucci_stitched_diagnostics
+from .application_metrics import (
+    summarize_application_alpha,
+    summarize_application_pass_stability,
+    summarize_controlled_uncontrolled_comparison,
+    summarize_pascucci_stitched_diagnostics,
+)
 from .exact import compute_stitched_exact_bundle, save_exact_error_timeseries_csv
 from .io_utils import _as_blob_dict, save_blob_npz, save_json, save_rows_csv
 from .models import FBSNN
@@ -101,11 +106,18 @@ def _stitch_rollout_inputs(
 
 
 def _summarize_application_cost_result(result: Dict[str, Any]) -> Dict[str, Any]:
-    return {
+    payload = {
         "schema": result["schema"],
         "metadata": dict(result.get("metadata", {})),
         "summary": dict(result.get("summary", {})),
     }
+    pathwise = result.get("pathwise", {})
+    if "alpha" in pathwise:
+        payload["alpha_summary"] = summarize_application_alpha(
+            pathwise["alpha"],
+            baseline_mode=payload["metadata"].get("baseline_mode", ""),
+        )
+    return payload
 
 
 def _application_pathwise_npz(result: Dict[str, Any], prefix: str) -> Dict[str, np.ndarray]:
@@ -113,6 +125,13 @@ def _application_pathwise_npz(result: Dict[str, Any], prefix: str) -> Dict[str, 
     for key, value in result.get("pathwise", {}).items():
         arrays[f"{prefix}_{key}"] = np.asarray(value, dtype=np.float32)
     return arrays
+
+
+def _application_z_v_index(model_spec: ModelSpec) -> int:
+    z_labels = tuple(str(label) for label in getattr(model_spec, "z_labels", ()))
+    if "Z_V" not in z_labels:
+        raise ValueError("application pass stability requires model_spec.z_labels to include 'Z_V'")
+    return int(z_labels.index("Z_V"))
 
 
 def _compute_application_metric_artifact(
@@ -183,6 +202,7 @@ def _compute_application_metric_artifact(
                 stitched=stitched,
                 blocks=blocks,
                 params=params,
+                state_labels=getattr(model_spec, "state_labels", None),
             ),
         }
 
@@ -199,6 +219,10 @@ def _compute_application_metric_artifact(
             )
             pathwise_npz.update(_application_pathwise_npz(uncontrolled, "uncontrolled"))
             payload["uncontrolled"] = _summarize_application_cost_result(uncontrolled)
+            payload["comparison"] = summarize_controlled_uncontrolled_comparison(
+                controlled=controlled,
+                uncontrolled=uncontrolled,
+            )
 
         payload["pathwise_npz_keys"] = sorted(pathwise_npz)
         return payload, pathwise_npz
@@ -379,6 +403,8 @@ def print_recursive_pass(
     visual_exact_bundle_by_pass = {}
     application_summary_by_pass = {}
     application_pathwise_by_pass = {}
+    application_stability_by_pass = {}
+    previous_application_pass_id = None
     for p in pass_entries:
         pass_id = int(p["pass_id"])
         pass_tag = _pass_tag(pass_id)
@@ -426,10 +452,21 @@ def print_recursive_pass(
             application_npz_path = os.path.join(rec_dir, f"application_metrics_{pass_tag}.npz")
             application_summary["output_path"] = application_json_path
             application_summary["pathwise_npz_path"] = application_npz_path
+            if previous_application_pass_id is not None:
+                stability = summarize_application_pass_stability(
+                    previous_stitched=stitched_by_pass[previous_application_pass_id],
+                    current_stitched=stitched_pred,
+                    previous_pathwise=application_pathwise_by_pass[previous_application_pass_id],
+                    current_pathwise=application_pathwise,
+                    z_v_index=_application_z_v_index(spec),
+                )
+                application_summary["stability_vs_previous_pass"] = stability
+                application_stability_by_pass[pass_id] = stability
             save_blob_npz(application_pathwise, application_npz_path)
             save_json(application_summary, application_json_path)
             application_summary_by_pass[pass_id] = application_summary
             application_pathwise_by_pass[pass_id] = application_pathwise
+            previous_application_pass_id = pass_id
 
         if exact_solution is not None:
             exact_bundle = compute_stitched_exact_bundle(
@@ -653,6 +690,10 @@ def print_recursive_pass(
         "application_summary_by_pass_index": {
             str(_pass_index(k)): v for k, v in application_summary_by_pass.items()
         },
+        "application_stability_by_pass": application_stability_by_pass,
+        "application_stability_by_pass_index": {
+            str(_pass_index(k)): v for k, v in application_stability_by_pass.items()
+        },
         "selected_application_summary": selected_application_summary,
         "eval_bundle_path": eval_bundle_path,
         "evaluation_bundle_M": int(Xi_stitched.shape[0]),
@@ -794,8 +835,11 @@ def predict_recursive_stitched(
     Y_segments = []
     Z_segments = []
     diagnostic_segments = {}
+    boundary_signed_jumps = []
     boundary_abs_jumps = []
+    boundary_y_signed_jumps = []
     boundary_y_abs_jumps = []
+    boundary_z_signed_jumps = []
     boundary_z_abs_jumps = []
     previous_terminal_X = None
     previous_terminal_Y = None
@@ -837,15 +881,15 @@ def predict_recursive_stitched(
             )
 
             if previous_terminal_X is not None:
-                boundary_abs_jumps.append(
-                    np.abs(np.asarray(X_b[:, 0, :], dtype=np.float32) - previous_terminal_X)
-                )
-                boundary_y_abs_jumps.append(
-                    np.abs(np.asarray(Y_b[:, 0, :], dtype=np.float32) - previous_terminal_Y)
-                )
-                boundary_z_abs_jumps.append(
-                    np.abs(np.asarray(Z_b[:, 0, :], dtype=np.float32) - previous_terminal_Z)
-                )
+                x_jump = np.asarray(X_b[:, 0, :], dtype=np.float32) - previous_terminal_X
+                y_jump = np.asarray(Y_b[:, 0, :], dtype=np.float32) - previous_terminal_Y
+                z_jump = np.asarray(Z_b[:, 0, :], dtype=np.float32) - previous_terminal_Z
+                boundary_signed_jumps.append(x_jump)
+                boundary_abs_jumps.append(np.abs(x_jump))
+                boundary_y_signed_jumps.append(y_jump)
+                boundary_y_abs_jumps.append(np.abs(y_jump))
+                boundary_z_signed_jumps.append(z_jump)
+                boundary_z_abs_jumps.append(np.abs(z_jump))
 
             start_idx = 0 if b == 0 else 1
             t_segments.append(t_b[:, start_idx:, :].astype(np.float32))
@@ -882,12 +926,21 @@ def predict_recursive_stitched(
     }
     for key, segments in diagnostic_segments.items():
         stitched[key] = np.concatenate(segments, axis=0).astype(np.float32)
-    emit_boundary_jumps = bool(boundary_abs_jumps) and (
-        str(getattr(spec, "application_metric_schema", "none")) != "none"
+    application_metric_schema = str(getattr(spec, "application_metric_schema", "none"))
+    emit_boundary_jumps = bool(boundary_abs_jumps) and application_metric_schema != "none"
+    emit_signed_boundary_jumps = (
+        bool(boundary_signed_jumps)
+        and application_metric_schema == "pascucci_application_metrics_v1"
     )
     if emit_boundary_jumps:
+        if emit_signed_boundary_jumps:
+            stitched["stitch_X_boundary_signed_jump"] = np.stack(boundary_signed_jumps, axis=0).astype(np.float32)
         stitched["stitch_X_boundary_abs_jump"] = np.stack(boundary_abs_jumps, axis=0).astype(np.float32)
+        if emit_signed_boundary_jumps:
+            stitched["stitch_Y_boundary_signed_jump"] = np.stack(boundary_y_signed_jumps, axis=0).astype(np.float32)
         stitched["stitch_Y_boundary_abs_jump"] = np.stack(boundary_y_abs_jumps, axis=0).astype(np.float32)
+        if emit_signed_boundary_jumps:
+            stitched["stitch_Z_boundary_signed_jump"] = np.stack(boundary_z_signed_jumps, axis=0).astype(np.float32)
         stitched["stitch_Z_boundary_abs_jump"] = np.stack(boundary_z_abs_jumps, axis=0).astype(np.float32)
     return stitched
 
