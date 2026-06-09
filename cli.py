@@ -9,9 +9,11 @@ from datetime import datetime
 from typing import List, Optional
 
 import numpy as np
+import hashlib
+import json
 
 from .exact import compute_stitched_exact_bundle, save_exact_error_timeseries_csv
-from .io_utils import export_standard_parameter_blob, save_blob_npz, save_json, save_rows_csv
+from .io_utils import export_standard_parameter_blob, save_blob_npz, save_json, save_rows_csv, _to_serializable
 from .naming import _pass_index, _pass_label
 from .plotting import plot_recursive_exact_comparison, plot_stage_logs, _PLOTTING_AVAILABLE
 from .sampling import build_blocks, summarize_boundary_samples
@@ -31,6 +33,11 @@ def _parse_optional_component_weights(value: str, arg_name: str, D: int):
     if any(weight < 0.0 for weight in weights):
         raise ValueError(f"{arg_name} must contain non-negative values")
     return [float(weight) for weight in weights]
+
+def _run_config_sha256(config: dict) -> str:
+    payload = {k: v for k, v in config.items() if k not in {"run_config_sha256", "timestamp"}}
+    encoded = json.dumps(_to_serializable(payload), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def run_program(argv: Optional[List[str]] = None):
@@ -521,7 +528,18 @@ def run_program(argv: Optional[List[str]] = None):
         "model_name": model_spec.name,
         "state_labels": model_spec.state_labels,
         "z_labels": model_spec.z_labels,
+        "application_metric_schema": model_spec.application_metric_schema,
+        "application_metric_names": list(model_spec.application_metric_names),
+        "application_metric_aggregation": model_spec.application_metric_aggregation,
+        "seed_manifest": {
+            "global_seed": 1234,
+            "eval_seed": int(args.eval_seed),
+            "visual_seed": None if int(args.visual_seed) < 0 else int(args.visual_seed),
+            "coarse_prepass_seed": int(args.coarse_prepass_seed),
+            "exact_init_seed": int(args.exact_init_seed),
+        },
     }
+    run_config["run_config_sha256"] = _run_config_sha256(run_config)
     save_json(run_config, os.path.join(run_root, "run_config.json"))
     print(f"[Artifacts] run directory: {run_root}")
 

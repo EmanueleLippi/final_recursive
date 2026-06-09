@@ -624,6 +624,8 @@ def predict_recursive_stitched(
     Y_segments = []
     Z_segments = []
     diagnostic_segments = {}
+    boundary_abs_jumps = []
+    previous_terminal_X = None
 
     for b, block in enumerate(blocks):
         blob = block_blobs[b]
@@ -660,6 +662,11 @@ def predict_recursive_stitched(
                 float(coupling_const),
             )
 
+            if previous_terminal_X is not None:
+                boundary_abs_jumps.append(
+                    np.abs(np.asarray(X_b[:, 0, :], dtype=np.float32) - previous_terminal_X)
+                )
+
             start_idx = 0 if b == 0 else 1
             t_segments.append(t_b[:, start_idx:, :].astype(np.float32))
             X_segments.append(X_b[:, start_idx:, :].astype(np.float32))
@@ -680,7 +687,8 @@ def predict_recursive_stitched(
                     value_np[start_idx:, ...].astype(np.float32)
                 )
 
-            Xi_curr = X_b[:, -1, :].astype(np.float32)
+            previous_terminal_X = X_b[:, -1, :].astype(np.float32)
+            Xi_curr = previous_terminal_X
         finally:
             model.sess.close()
 
@@ -692,6 +700,8 @@ def predict_recursive_stitched(
     }
     for key, segments in diagnostic_segments.items():
         stitched[key] = np.concatenate(segments, axis=0).astype(np.float32)
+    if diagnostic_segments and boundary_abs_jumps:
+        stitched["stitch_X_boundary_abs_jump"] = np.stack(boundary_abs_jumps, axis=0).astype(np.float32)
     return stitched
 
 def train_with_standard_schedule(

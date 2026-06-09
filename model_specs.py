@@ -132,6 +132,9 @@ class ModelSpec:
     build_exact_solution: Callable[..., Optional[dict]]
     build_exact_initial_boundary_samples: Optional[Callable[..., list[np.ndarray]]] = None
     moment_names: tuple[str, ...] = ()
+    application_metric_schema: str = "none"
+    application_metric_names: tuple[str, ...] = ()
+    application_metric_aggregation: str = "none"
 
     def validate_state_dim(self, D: int) -> None:
         if int(D) != int(self.state_dim):
@@ -199,6 +202,9 @@ def get_model_spec(name: Optional[str] = None) -> ModelSpec:
             build_exact_solution=_build_pascucci_exact_solution,
             build_exact_initial_boundary_samples=None,
             moment_names=("mean_v", "mean_q", "mean_h_plus_v"),
+            application_metric_schema="pascucci_application_metrics_v1",
+            application_metric_names=("cost_J_running", "cost_J_terminal", "cost_J_total"),
+            application_metric_aggregation="left_riemann_f_plus_terminal_g",
         )
 
     raise ValueError(

@@ -1767,6 +1767,29 @@ def test_model_spec_mean_field_moment_names() -> None:
     )
 
 
+def test_model_spec_application_metric_names() -> None:
+    from .model_specs import get_model_spec
+
+    quadratic = get_model_spec("quadratic_coupled")
+    pascucci = get_model_spec("pascucci")
+
+    assert getattr(quadratic, "application_metric_names", None) == (), (
+        "quadratic_coupled must declare an empty application metric contract"
+    )
+    assert getattr(quadratic, "application_metric_schema", None) == "none", (
+        "quadratic_coupled must keep application metrics disabled"
+    )
+    assert getattr(pascucci, "application_metric_schema", None) == "pascucci_application_metrics_v1", (
+        "Pascucci must declare the application metric schema used by artifacts"
+    )
+    assert getattr(pascucci, "application_metric_names", None) == (
+        "cost_J_running",
+        "cost_J_terminal",
+        "cost_J_total",
+    ), "Pascucci must declare cost J components before metrics are emitted"
+    assert set(pascucci.moment_names).isdisjoint(pascucci.application_metric_names)
+
+
 def _build_pascucci_unit_model(params: dict, *, M: int = 4):
     from .models import NN_Pascucci
 
@@ -1796,6 +1819,281 @@ def _build_pascucci_recursive_unit_model(params: dict, *, M: int = 4):
         t_end=0.25,
         T_total=0.25,
     )
+
+
+def _numpy_cost_result_pathwise(result: dict, key: str) -> np.ndarray:
+    pathwise = result.get("pathwise", {})
+    assert key in pathwise, f"{key} missing from pathwise cost result: {sorted(pathwise)}"
+    value = pathwise[key]
+    value_np = value.numpy() if hasattr(value, "numpy") else np.asarray(value)
+    value_np = np.asarray(value_np, dtype=np.float32)
+    assert value_np.ndim == 2 and value_np.shape[1] == 1, (key, value_np.shape)
+    assert np.isfinite(value_np).all(), key
+    return value_np
+
+
+def test_pascucci_application_cost_functional_decomposes_to_f_plus_g() -> None:
+    from .model_specs import get_model_spec
+    from .tf_backend import reset_backend_state, set_seed, tf
+
+    reset_backend_state()
+    set_seed(97)
+
+    spec = get_model_spec("pascucci")
+    params = spec.build_default_params(const=0.75)
+    model = _build_pascucci_recursive_unit_model(params, M=4)
+
+    try:
+        assert hasattr(model, "application_cost_functional"), (
+            "Pascucci application cost J must be explicit; eval loss is not J"
+        )
+        t_batch, W_batch, Xi_batch = _fixed_validation_batch(M=4, N=2, D=4, T=0.25, seed=97)
+        result = model.application_cost_functional(
+            t_batch,
+            W_batch,
+            Xi_batch,
+            const_value=0.75,
+            baseline_mode="controlled",
+        )
+
+        _, X, Y, Z = model.loss_function(t_batch, W_batch, Xi_batch, const_value=0.75)
+        t_tf = tf.convert_to_tensor(t_batch, dtype=tf.float32)
+        dt_np = t_batch[:, 1:, :] - t_batch[:, :-1, :]
+        running_terms = []
+        for step in range(t_batch.shape[1] - 1):
+            X_step = X[:, step, :]
+            Y_step = Y[:, step, :]
+            Z_step = Z[:, step, :]
+            t_step = t_tf[:, step, :]
+            moments = model.mean_field_moments_tf(X_step)
+            f_step = model.f_tf(t_step, X_step, Y_step, Z_step, moment_state=moments).numpy()
+            running_terms.append(f_step * dt_np[:, step, :])
+        expected_running = np.sum(np.stack(running_terms, axis=0), axis=0).astype(np.float32)
+        terminal_moments = model.mean_field_moments_tf(X[:, -1, :])
+        expected_terminal = model.g_tf(X[:, -1, :], moment_state=terminal_moments).numpy().astype(np.float32)
+        expected_total = expected_running + expected_terminal
+
+        np.testing.assert_allclose(
+            _numpy_cost_result_pathwise(result, "cost_J_running"),
+            expected_running,
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+        np.testing.assert_allclose(
+            _numpy_cost_result_pathwise(result, "cost_J_terminal"),
+            expected_terminal,
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+        np.testing.assert_allclose(
+            _numpy_cost_result_pathwise(result, "cost_J_total"),
+            expected_total,
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+    finally:
+        model.close()
+
+
+def test_pascucci_application_cost_summary_has_quantiles_and_metadata() -> None:
+    from .model_specs import get_model_spec
+    from .tf_backend import reset_backend_state, set_seed
+
+    reset_backend_state()
+    set_seed(101)
+
+    spec = get_model_spec("pascucci")
+    params = spec.build_default_params(const=0.75)
+    model = _build_pascucci_recursive_unit_model(params, M=4)
+
+    try:
+        assert hasattr(model, "application_cost_functional"), (
+            "Pascucci application cost J must expose a pathwise summary"
+        )
+        t_batch, W_batch, Xi_batch = _fixed_validation_batch(M=4, N=2, D=4, T=0.25, seed=101)
+        result = model.application_cost_functional(
+            t_batch,
+            W_batch,
+            Xi_batch,
+            const_value=0.75,
+            baseline_mode="controlled",
+        )
+        assert result["schema"] == "pascucci_application_metrics_v1"
+        assert result["metadata"]["baseline_mode"] == "controlled"
+        assert result["metadata"]["aggregation"] == "left_riemann_f_plus_terminal_g"
+        assert result["metadata"]["control_law"] == "alpha_tf"
+
+        summary = result["summary"]
+        for metric_name in ("cost_J_running", "cost_J_terminal", "cost_J_total"):
+            pathwise = _numpy_cost_result_pathwise(result, metric_name)
+            flat = pathwise[:, 0]
+            expected = {
+                "mean": float(np.mean(flat)),
+                "std": float(np.std(flat)),
+                "q05": float(np.quantile(flat, 0.05)),
+                "q50": float(np.quantile(flat, 0.50)),
+                "q95": float(np.quantile(flat, 0.95)),
+            }
+            for suffix, expected_value in expected.items():
+                key = f"{metric_name}_{suffix}"
+                assert key in summary, f"{key} missing from summary: {sorted(summary)}"
+                assert isinstance(summary[key], float)
+                assert np.isfinite(summary[key])
+                np.testing.assert_allclose(summary[key], expected_value, rtol=1.0e-6, atol=1.0e-6)
+    finally:
+        model.close()
+
+
+def test_pascucci_application_cost_functional_restores_const_state() -> None:
+    from .model_specs import get_model_spec
+    from .tf_backend import reset_backend_state, set_seed
+
+    reset_backend_state()
+    set_seed(102)
+
+    spec = get_model_spec("pascucci")
+    params = spec.build_default_params(const=0.75)
+    model = _build_pascucci_recursive_unit_model(params, M=4)
+
+    try:
+        t_batch, W_batch, Xi_batch = _fixed_validation_batch(M=4, N=2, D=4, T=0.25, seed=102)
+        before_const = np.float32(model.const)
+        before_const_tf = np.float32(model.const_tf.numpy())
+        model.application_cost_functional(
+            t_batch,
+            W_batch,
+            Xi_batch,
+            const_value=0.25,
+            baseline_mode="uncontrolled",
+        )
+        np.testing.assert_allclose(np.float32(model.const), before_const, rtol=0.0, atol=0.0)
+        np.testing.assert_allclose(np.float32(model.const_tf.numpy()), before_const_tf, rtol=0.0, atol=0.0)
+    finally:
+        model.close()
+
+
+def test_pascucci_uncontrolled_baseline_is_paired_and_alpha_zero() -> None:
+    from .model_specs import get_model_spec
+    from .tf_backend import reset_backend_state, set_seed
+
+    reset_backend_state()
+    set_seed(103)
+
+    spec = get_model_spec("pascucci")
+    params = spec.build_default_params(const=0.75)
+    model = _build_pascucci_recursive_unit_model(params, M=4)
+
+    try:
+        assert hasattr(model, "application_cost_functional"), (
+            "Controlled/uncontrolled baseline requires an explicit application cost helper"
+        )
+        t_batch, W_batch, Xi_batch = _fixed_validation_batch(M=4, N=2, D=4, T=0.25, seed=103)
+        controlled = model.application_cost_functional(
+            t_batch,
+            W_batch,
+            Xi_batch,
+            const_value=0.75,
+            baseline_mode="controlled",
+        )
+        uncontrolled = model.application_cost_functional(
+            t_batch,
+            W_batch,
+            Xi_batch,
+            const_value=0.75,
+            baseline_mode="uncontrolled",
+        )
+
+        assert controlled["metadata"]["paired_inputs"] == "same_t_W_Xi"
+        assert uncontrolled["metadata"]["paired_inputs"] == "same_t_W_Xi"
+        assert controlled["metadata"]["baseline_mode"] == "controlled"
+        assert uncontrolled["metadata"]["baseline_mode"] == "uncontrolled"
+        assert uncontrolled["metadata"]["control_law"] == "alpha_zero"
+        alpha_pathwise = np.asarray(uncontrolled["pathwise"]["alpha"], dtype=np.float32)
+        assert alpha_pathwise.shape == (Xi_batch.shape[0], t_batch.shape[1] - 1, 1)
+        np.testing.assert_allclose(alpha_pathwise, 0.0, rtol=0.0, atol=0.0)
+        assert np.isfinite(_numpy_cost_result_pathwise(controlled, "cost_J_total")).all()
+        assert np.isfinite(_numpy_cost_result_pathwise(uncontrolled, "cost_J_total")).all()
+    finally:
+        model.close()
+
+
+def test_pascucci_physical_tail_and_stitching_diagnostics_contract() -> None:
+    try:
+        from .application_metrics import summarize_pascucci_stitched_diagnostics
+    except ImportError as exc:
+        raise AssertionError(
+            "Pascucci application diagnostics must have an explicit summary helper"
+        ) from exc
+
+    params = _default_pascucci_params(const=0.75)
+    stitched = {
+        "t": np.asarray([[[0.0], [0.25], [0.50], [0.75]]], dtype=np.float32),
+        "X": np.asarray(
+            [
+                [
+                    [0.0, 0.0, -2.50, -0.50],
+                    [0.0, 0.0, -2.10, 0.00],
+                    [0.0, 0.0, 2.25, 10.50],
+                    [0.0, 0.0, 2.50, 11.00],
+                ]
+            ],
+            dtype=np.float32,
+        ),
+        "q_lower_violation": np.asarray([[0.50], [0.00], [0.00], [0.00]], dtype=np.float32),
+        "q_upper_violation": np.asarray([[0.00], [0.00], [0.50], [1.00]], dtype=np.float32),
+        "v_lower_violation": np.asarray([[0.50], [0.10], [0.00], [0.00]], dtype=np.float32),
+        "v_upper_violation": np.asarray([[0.00], [0.00], [0.25], [0.50]], dtype=np.float32),
+        "stitch_X_boundary_abs_jump": np.asarray(
+            [
+                [[0.00, 0.00, 0.10, 0.20]],
+                [[0.00, 0.00, 0.30, 1.25]],
+            ],
+            dtype=np.float32,
+        ),
+    }
+    blocks = [
+        {"idx": 0, "t_start": 0.0, "t_end": 0.25, "T_block": 0.25},
+        {"idx": 1, "t_start": 0.25, "t_end": 0.50, "T_block": 0.25},
+        {"idx": 2, "t_start": 0.50, "t_end": 0.75, "T_block": 0.25},
+    ]
+    summary = summarize_pascucci_stitched_diagnostics(
+        stitched=stitched,
+        blocks=blocks,
+        params=params,
+    )
+    for key in (
+        "q_lower_violation_mean",
+        "q_lower_violation_max",
+        "q_lower_violation_q95",
+        "q_lower_violation_rate",
+        "v_upper_violation_mean",
+        "v_upper_violation_max",
+        "v_upper_violation_q95",
+        "v_upper_violation_rate",
+        "stitch_X_boundary_max_abs_jump",
+        "stitch_X_boundary_mean_abs_jump",
+    ):
+        assert key in summary, f"{key} missing from diagnostic summary: {sorted(summary)}"
+        assert isinstance(summary[key], float)
+        assert np.isfinite(summary[key])
+    assert summary["q_upper_violation_max"] == 1.0
+    assert summary["v_lower_violation_rate"] == 0.5
+    np.testing.assert_allclose(summary["stitch_X_boundary_max_abs_jump"], 1.25)
+    np.testing.assert_allclose(summary["stitch_X_boundary_mean_abs_jump"], 0.23125)
+
+    missing_jump = dict(stitched)
+    missing_jump.pop("stitch_X_boundary_abs_jump")
+    try:
+        summarize_pascucci_stitched_diagnostics(
+            stitched=missing_jump,
+            blocks=blocks,
+            params=params,
+        )
+    except ValueError as exc:
+        assert "stitch_X_boundary_abs_jump" in str(exc)
+        assert "duplicate boundary times" in str(exc)
+    else:
+        raise AssertionError("unique stitched boundaries must not imply zero boundary jump")
 
 
 def test_pascucci_cost_profile_default_is_exp_and_json_safe() -> None:
@@ -4175,7 +4473,11 @@ def test_predict_recursive_stitched_carries_model_owned_diagnostics_without_reco
             )
             M = int(Xi_star.shape[0])
             steps = int(t_star.shape[1])
-            X = np.zeros((M, steps, self.D), dtype=np.float32)
+            X = np.tile(Xi_star[:, None, :], (1, steps, 1)).astype(np.float32)
+            if self.block_idx == 0:
+                X[:, -1, :] = np.float32(2.0)
+            else:
+                X[:, 0, :] = X[:, 0, :] + np.float32(0.5)
             Y = np.zeros((M, steps, 1), dtype=np.float32)
             Z = np.zeros((M, steps, self.D), dtype=np.float32)
             start = np.float32(100 + self.block_idx * 2)
@@ -4236,7 +4538,9 @@ def test_predict_recursive_stitched_carries_model_owned_diagnostics_without_reco
         stitched["mean_h_plus_v"],
         np.asarray([[120.0], [121.0], [122.0], [123.0], [124.0]], dtype=np.float32),
     )
-    assert np.all(stitched["X"] == 0.0)
+    assert "stitch_X_boundary_abs_jump" in stitched
+    assert stitched["stitch_X_boundary_abs_jump"].shape == (1, M, D)
+    np.testing.assert_allclose(stitched["stitch_X_boundary_abs_jump"], 0.5)
 
 
 def test_predict_recursive_stitched_accepts_legacy_three_value_predict() -> None:
@@ -4930,6 +5234,127 @@ def test_cli_records_pascucci_cost_profile_params_in_run_config() -> None:
         cli.plot_stage_logs = original_plot_stage_logs
 
 
+def test_cli_records_application_metric_manifest_in_run_config() -> None:
+    from . import cli, orchestration
+    from .tf_backend import require_tensorflow
+
+    require_tensorflow()
+
+    class FakeSession:
+        def close(self) -> None:
+            pass
+
+    class FakeStandardModel:
+        def __init__(self) -> None:
+            self.sess = FakeSession()
+
+        def save_model(self, path: str) -> None:
+            marker = Path(path)
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("fake checkpoint\n", encoding="utf-8")
+
+    def fake_run_standard_reference(**kwargs):
+        assert kwargs["model_spec"].name == "pascucci"
+        return FakeStandardModel(), {
+            "stage_logs": [],
+            "eval_stats": {
+                "mean_loss": 1.0,
+                "std_loss": 0.0,
+                "mean_loss_per_sample": 0.25,
+                "std_loss_per_sample": 0.0,
+                "mean_y0": 0.0,
+                "std_y0": 0.0,
+            },
+            "refine_rounds": 0,
+        }
+
+    original_run_standard_reference = orchestration.run_standard_reference
+    original_export_standard_parameter_blob = cli.export_standard_parameter_blob
+    original_plot_stage_logs = cli.plot_stage_logs
+    orchestration.run_standard_reference = fake_run_standard_reference
+    cli.export_standard_parameter_blob = lambda model: _make_blob([5, 8, 1])
+    cli.plot_stage_logs = lambda *args, **kwargs: None
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            exit_code = cli.main(
+                [
+                    "run",
+                    "--mode",
+                    "standard",
+                    "--model",
+                    "pascucci",
+                    "--M",
+                    "4",
+                    "--N",
+                    "2",
+                    "--T_standard",
+                    "0.25",
+                    "--T_total",
+                    "0.25",
+                    "--block_size",
+                    "0.25",
+                    "--passes",
+                    "1",
+                    "--eval_seed",
+                    "222",
+                    "--visual_seed",
+                    "333",
+                    "--coarse_prepass_seed",
+                    "444",
+                    "--exact_init_seed",
+                    "555",
+                    "--output_dir",
+                    str(out_dir),
+                ]
+            )
+            assert exit_code == 0
+            runs = sorted(out_dir.glob("run_*"))
+            assert len(runs) == 1
+            config = json.loads((runs[0] / "run_config.json").read_text(encoding="utf-8"))
+            assert config["application_metric_schema"] == "pascucci_application_metrics_v1"
+            assert config["application_metric_names"] == [
+                "cost_J_running",
+                "cost_J_terminal",
+                "cost_J_total",
+            ]
+            assert config["application_metric_aggregation"] == "left_riemann_f_plus_terminal_g"
+            assert config["seed_manifest"] == {
+                "global_seed": 1234,
+                "eval_seed": 222,
+                "visual_seed": 333,
+                "coarse_prepass_seed": 444,
+                "exact_init_seed": 555,
+            }
+            assert isinstance(config["run_config_sha256"], str)
+            assert len(config["run_config_sha256"]) == 64
+            int(config["run_config_sha256"], 16)
+    finally:
+        orchestration.run_standard_reference = original_run_standard_reference
+        cli.export_standard_parameter_blob = original_export_standard_parameter_blob
+        cli.plot_stage_logs = original_plot_stage_logs
+
+
+def test_run_config_sha256_excludes_timestamp_metadata() -> None:
+    from .cli import _run_config_sha256
+
+    config_a = {
+        "timestamp": "run_20260609_120000",
+        "model_name": "pascucci",
+        "M": 4,
+        "N": 2,
+        "application_metric_schema": "pascucci_application_metrics_v1",
+    }
+    config_b = dict(config_a)
+    config_b["timestamp"] = "run_20260609_120001"
+    config_c = dict(config_a)
+    config_c["M"] = 8
+
+    assert _run_config_sha256(config_a) == _run_config_sha256(config_b)
+    assert _run_config_sha256(config_a) != _run_config_sha256(config_c)
+
+
 def test_cli_rejects_pascucci_cost_profile_for_quadratic_model() -> None:
     _assert_pascucci_model_tdd_contract("pascucci_cli_rejects_cost_profile_for_quadratic_model")
     from . import cli
@@ -5106,6 +5531,13 @@ def test_cli_records_pascucci_cost_profile_params_in_recursive_run_config() -> N
             assert len(runs) == 1
             config = json.loads((runs[0] / "run_config.json").read_text(encoding="utf-8"))
             assert config["mode"] == "recursive"
+            assert config["application_metric_schema"] == "pascucci_application_metrics_v1"
+            assert config["application_metric_names"] == [
+                "cost_J_running",
+                "cost_J_terminal",
+                "cost_J_total",
+            ]
+            assert config["application_metric_aggregation"] == "left_riemann_f_plus_terminal_g"
             assert config["params"]["pascucci_cost_profile"] == "exp_minus_offset"
             assert np.isclose(config["params"]["pascucci_cost_offset"], 0.12)
             assert recursive_calls[0]["params"]["pascucci_cost_profile"] == "exp_minus_offset"
@@ -5862,6 +6294,30 @@ def run_tests(argv: List[str] | None = None) -> int:
         "test_model_spec_mean_field_moment_names",
     ) and ok
     ok = _run_subprocess_case(
+        "model_spec_application_metric_names",
+        "test_model_spec_application_metric_names",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_application_cost_functional_decomposes_to_f_plus_g",
+        "test_pascucci_application_cost_functional_decomposes_to_f_plus_g",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_application_cost_summary_has_quantiles_and_metadata",
+        "test_pascucci_application_cost_summary_has_quantiles_and_metadata",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_application_cost_functional_restores_const_state",
+        "test_pascucci_application_cost_functional_restores_const_state",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_uncontrolled_baseline_is_paired_and_alpha_zero",
+        "test_pascucci_uncontrolled_baseline_is_paired_and_alpha_zero",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_physical_tail_and_stitching_diagnostics_contract",
+        "test_pascucci_physical_tail_and_stitching_diagnostics_contract",
+    ) and ok
+    ok = _run_subprocess_case(
         "pascucci_cost_profile_default_is_exp_and_json_safe",
         "test_pascucci_cost_profile_default_is_exp_and_json_safe",
     ) and ok
@@ -6036,6 +6492,14 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "cli_records_pascucci_cost_profile_params_in_run_config",
         "test_cli_records_pascucci_cost_profile_params_in_run_config",
+    ) and ok
+    ok = _run_subprocess_case(
+        "cli_records_application_metric_manifest_in_run_config",
+        "test_cli_records_application_metric_manifest_in_run_config",
+    ) and ok
+    ok = _run_subprocess_case(
+        "run_config_sha256_excludes_timestamp_metadata",
+        "test_run_config_sha256_excludes_timestamp_metadata",
     ) and ok
     ok = _run_subprocess_case(
         "cli_rejects_pascucci_cost_profile_for_quadratic_model",
