@@ -9,12 +9,14 @@ from datetime import datetime
 from typing import List, Optional
 
 import numpy as np
+import hashlib
+import json
 
 from .exact import compute_stitched_exact_bundle, save_exact_error_timeseries_csv
-from .io_utils import export_standard_parameter_blob, save_blob_npz, save_json, save_rows_csv
+from .io_utils import export_standard_parameter_blob, save_blob_npz, save_json, save_rows_csv, _to_serializable
 from .naming import _pass_index, _pass_label
 from .plotting import plot_recursive_exact_comparison, plot_stage_logs, _PLOTTING_AVAILABLE
-from .sampling import build_blocks, summarize_boundary_samples
+from .sampling import build_blocks, build_stitched_rollout_inputs, summarize_boundary_samples
 from .schedules import load_training_plan_csv, parse_float_sequence_arg, resolve_coarse_curriculum_schedule
 from .tf_backend import set_tf_seed
 from .tests import run_tests
@@ -31,6 +33,56 @@ def _parse_optional_component_weights(value: str, arg_name: str, D: int):
     if any(weight < 0.0 for weight in weights):
         raise ValueError(f"{arg_name} must contain non-negative values")
     return [float(weight) for weight in weights]
+
+def _run_config_sha256(config: dict) -> str:
+    payload = {k: v for k, v in config.items() if k not in {"run_config_sha256", "timestamp"}}
+    encoded = json.dumps(_to_serializable(payload), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _summarize_application_cost_result(result: dict) -> dict:
+    return {
+        "schema": result["schema"],
+        "metadata": dict(result.get("metadata", {})),
+        "summary": dict(result.get("summary", {})),
+    }
+
+
+def _application_pathwise_npz(result: dict, prefix: str) -> dict:
+    return {
+        f"{prefix}_{key}": np.asarray(value, dtype=np.float32)
+        for key, value in result.get("pathwise", {}).items()
+    }
+
+
+def _save_application_cost_artifacts(
+    *,
+    output_dir: str,
+    stem: str,
+    model_name: str,
+    horizon: dict,
+    controlled: dict,
+    uncontrolled: Optional[dict] = None,
+) -> dict:
+    pathwise = _application_pathwise_npz(controlled, "controlled")
+    payload = {
+        "schema": controlled["schema"],
+        "model_name": model_name,
+        "horizon": horizon,
+        "controlled": _summarize_application_cost_result(controlled),
+    }
+    if uncontrolled is not None:
+        pathwise.update(_application_pathwise_npz(uncontrolled, "uncontrolled"))
+        payload["uncontrolled"] = _summarize_application_cost_result(uncontrolled)
+
+    json_path = os.path.join(output_dir, f"{stem}.json")
+    npz_path = os.path.join(output_dir, f"{stem}.npz")
+    payload["output_path"] = json_path
+    payload["pathwise_npz_path"] = npz_path
+    payload["pathwise_npz_keys"] = sorted(pathwise)
+    save_blob_npz(pathwise, npz_path)
+    save_json(payload, json_path)
+    return payload
 
 
 def run_program(argv: Optional[List[str]] = None):
@@ -456,6 +508,9 @@ def run_program(argv: Optional[List[str]] = None):
                 "e non il sistema Girsanov-like modificato."
             )
 
+    visual_seed_requested = None if int(args.visual_seed) < 0 else int(args.visual_seed)
+    visual_seed_effective = int(args.eval_seed) + 7919 if visual_seed_requested is None else int(visual_seed_requested)
+
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_root = os.path.join(args.output_dir, f"run_{run_id}")
     os.makedirs(run_root, exist_ok=True)
@@ -491,7 +546,8 @@ def run_program(argv: Optional[List[str]] = None):
         "eval_bundle_path": str(args.eval_bundle_path),
         "eval_seed": int(args.eval_seed),
         "visual_sample_paths": int(args.visual_sample_paths),
-        "visual_seed": None if int(args.visual_seed) < 0 else int(args.visual_seed),
+        "visual_seed": visual_seed_requested,
+        "visual_seed_effective": int(visual_seed_effective),
         "pass1_init": str(args.pass1_init),
         "coarse_prepass_M": int(args.coarse_prepass_M),
         "coarse_prepass_N": int(args.coarse_prepass_N),
@@ -521,7 +577,19 @@ def run_program(argv: Optional[List[str]] = None):
         "model_name": model_spec.name,
         "state_labels": model_spec.state_labels,
         "z_labels": model_spec.z_labels,
+        "application_metric_schema": model_spec.application_metric_schema,
+        "application_metric_names": list(model_spec.application_metric_names),
+        "application_metric_aggregation": model_spec.application_metric_aggregation,
+        "seed_manifest": {
+            "global_seed": 1234,
+            "eval_seed": int(args.eval_seed),
+            "visual_seed": visual_seed_requested,
+            "visual_seed_effective": int(visual_seed_effective),
+            "coarse_prepass_seed": int(args.coarse_prepass_seed),
+            "exact_init_seed": int(args.exact_init_seed),
+        },
     }
+    run_config["run_config_sha256"] = _run_config_sha256(run_config)
     save_json(run_config, os.path.join(run_root, "run_config.json"))
     print(f"[Artifacts] run directory: {run_root}")
 
@@ -564,6 +632,57 @@ def run_program(argv: Optional[List[str]] = None):
             "checkpoint_path": std_ckpt_path,
             "weights_npz_path": std_blob_path,
         }
+        if (
+            model_spec.application_metric_schema != "none"
+            and hasattr(model_std, "application_cost_functional")
+        ):
+            metric_blocks = [
+                {
+                    "idx": 0,
+                    "t_start": 0.0,
+                    "t_end": float(args.T_standard),
+                    "T_block": float(args.T_standard),
+                }
+            ]
+            Xi_metric = model_spec.deterministic_xi(M, D, seed=int(args.eval_seed))
+            metric_rollout = build_stitched_rollout_inputs(
+                blocks=metric_blocks,
+                M=Xi_metric.shape[0],
+                N_per_block=N,
+                D=D,
+                seed=int(args.eval_seed),
+            )
+            t_metric, W_metric = metric_rollout[0]
+            controlled_metric = model_std.application_cost_functional(
+                t_metric,
+                W_metric,
+                Xi_metric,
+                const_value=float(standard_const),
+                baseline_mode="controlled",
+            )
+            uncontrolled_metric = model_std.application_cost_functional(
+                t_metric,
+                W_metric,
+                Xi_metric,
+                const_value=float(standard_const),
+                baseline_mode="uncontrolled",
+            )
+            std_summary["application_metrics"] = _save_application_cost_artifacts(
+                output_dir=std_dir,
+                stem="application_metrics",
+                model_name=model_spec.name,
+                horizon={
+                    "t_start": 0.0,
+                    "t_end": float(args.T_standard),
+                    "T_total": float(args.T_standard),
+                    "n_time_points": int(t_metric.shape[1]),
+                    "n_steps": int(t_metric.shape[1] - 1),
+                    "sample_paths": int(Xi_metric.shape[0]),
+                    "eval_seed": int(args.eval_seed),
+                },
+                controlled=controlled_metric,
+                uncontrolled=uncontrolled_metric,
+            )
         if exact_solution is not None:
             t_test, W_test, Xi_test = model_std.fetch_minibatch()
             X_pred, Y_pred, Z_pred = model_std.predict(Xi_test, t_test, W_test, const_value=float(standard_const))
@@ -760,7 +879,7 @@ def run_program(argv: Optional[List[str]] = None):
                 eval_min_paths=max(64, M),
                 sample_paths=int(args.visual_sample_paths),
                 visual_sample_paths=int(args.visual_sample_paths),
-                visual_seed=None if int(args.visual_seed) < 0 else int(args.visual_seed),
+                visual_seed=visual_seed_requested,
                 enforce_exact_regression_guardrail=is_last_requested_pass,
                 print_compact_logs=is_last_requested_pass,
                 exclude_pass_ids_from_selection=excluded_pass_ids_from_selection,
@@ -825,7 +944,7 @@ def run_program(argv: Optional[List[str]] = None):
                 eval_min_paths=max(64, M),
                 sample_paths=int(args.visual_sample_paths),
                 visual_sample_paths=int(args.visual_sample_paths),
-                visual_seed=None if int(args.visual_seed) < 0 else int(args.visual_seed),
+                visual_seed=visual_seed_requested,
                 enforce_exact_regression_guardrail=True,
                 print_compact_logs=True,
                 exclude_pass_ids_from_selection=excluded_pass_ids_from_selection,
@@ -865,6 +984,7 @@ def run_program(argv: Optional[List[str]] = None):
             "models_dir": os.path.join(rec_dir, "models"),
             "evaluation_bundle_path": plot_summary["eval_bundle_path"],
             "evaluation_bundle_M": int(plot_summary["evaluation_bundle_M"]),
+            "visual_seed_effective": int(plot_summary.get("visual_seed", visual_seed_effective)),
             "initialization_summary": initialization_summary,
             "active_set_freezing": {
                 "enabled": bool(
@@ -889,6 +1009,15 @@ def run_program(argv: Optional[List[str]] = None):
                 str(k): float(v) for k, v in plot_summary["pass_scores_loss_by_index"].items()
             },
         }
+        if plot_summary.get("application_summary_by_pass", {}):
+            rec_summary["application_metrics"] = {
+                "schema": model_spec.application_metric_schema,
+                "by_pass": {
+                    str(k): v for k, v in plot_summary.get("application_summary_by_pass", {}).items()
+                },
+                "by_pass_index": plot_summary.get("application_summary_by_pass_index", {}),
+                "selected_pass_summary": plot_summary.get("selected_application_summary", None),
+            }
         if exact_solution is None:
             rec_summary["exact_solution"] = {"enabled": False, "profile": "none"}
         else:

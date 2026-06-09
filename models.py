@@ -1038,6 +1038,174 @@ class NN_Pascucci(FBSNN):
         r4 = tf.concat([zeros, zeros, zeros, zeros], axis=1)
         return tf.stack([r1, r2, r3, r4], axis=1)
 
+    def _application_summary_np(self, pathwise):
+        summary = {}
+        for key in ("cost_J_running", "cost_J_terminal", "cost_J_total"):
+            values = np.asarray(pathwise[key], dtype=np.float32).reshape(-1)
+            summary[f"{key}_mean"] = float(np.mean(values))
+            summary[f"{key}_std"] = float(np.std(values))
+            summary[f"{key}_q05"] = float(np.quantile(values, 0.05))
+            summary[f"{key}_q50"] = float(np.quantile(values, 0.50))
+            summary[f"{key}_q95"] = float(np.quantile(values, 0.95))
+        return summary
+
+    def _application_alpha_trace_tf(self, t, X, Z):
+        alpha_values = []
+        for step in range(int(t.shape[1]) - 1):
+            moments = self.mean_field_moments_tf(X[:, step, :])
+            alpha_values.append(
+                self.alpha_tf(
+                    t[:, step],
+                    X[:, step, :],
+                    Z[:, step, 2:3],
+                    moment_state=moments,
+                )
+            )
+        return tf.stack(alpha_values, axis=1)
+
+    def _uncontrolled_application_rollout_tf(self, t, W, Xi):
+        X0 = tf.cast(Xi, tf.float32)
+        X_list = [X0]
+        steps = int(t.shape[1]) - 1
+        for step in range(steps):
+            t0 = t[:, step, :]
+            t1 = t[:, step + 1, :]
+            dW = W[:, step + 1, :] - W[:, step, :]
+            Y0 = tf.zeros([tf.shape(X0)[0], 1], dtype=tf.float32)
+            Z0 = tf.zeros([tf.shape(X0)[0], self.D], dtype=tf.float32)
+            moments = self.mean_field_moments_tf(X0)
+            sigma0 = self.sigma_tf(t0, X0, Y0, moment_state=moments)
+            sigma_dW = tf.squeeze(tf.matmul(sigma0, tf.expand_dims(dW, axis=-1)), axis=-1)
+            X0 = X0 + self.mu_tf(t0, X0, Y0, Z0, moment_state=moments) * (t1 - t0) + sigma_dW
+            X_list.append(X0)
+
+        X = tf.stack(X_list, axis=1)
+        Y = tf.zeros([tf.shape(X)[0], tf.shape(X)[1], 1], dtype=tf.float32)
+        Z = tf.zeros([tf.shape(X)[0], tf.shape(X)[1], self.D], dtype=tf.float32)
+        alpha = tf.zeros([tf.shape(X)[0], steps, 1], dtype=tf.float32)
+        return X, Y, Z, alpha
+
+    def _application_cost_pathwise_tf(self, t, X, Y, Z):
+        running = tf.zeros([tf.shape(X)[0], 1], dtype=tf.float32)
+        for step in range(int(t.shape[1]) - 1):
+            moments = self.mean_field_moments_tf(X[:, step, :])
+            running += self.f_tf(
+                t[:, step, :],
+                X[:, step, :],
+                Y[:, step, :],
+                Z[:, step, :],
+                moment_state=moments,
+            ) * (t[:, step + 1, :] - t[:, step, :])
+        terminal_moments = self.mean_field_moments_tf(X[:, -1, :])
+        terminal = self.g_tf(X[:, -1, :], moment_state=terminal_moments)
+        return running, terminal, running + terminal
+
+    def _application_cost_result_np(
+        self,
+        running,
+        terminal,
+        total,
+        alpha,
+        *,
+        baseline_mode,
+        control_law,
+        paired_inputs,
+    ):
+        pathwise = {
+            "cost_J_running": running.numpy().astype(np.float32),
+            "cost_J_terminal": terminal.numpy().astype(np.float32),
+            "cost_J_total": total.numpy().astype(np.float32),
+            "alpha": alpha.numpy().astype(np.float32),
+        }
+        return {
+            "schema": "pascucci_application_metrics_v1",
+            "metadata": {
+                "baseline_mode": str(baseline_mode),
+                "aggregation": "left_riemann_f_plus_terminal_g",
+                "control_law": str(control_law),
+                "paired_inputs": str(paired_inputs),
+            },
+            "pathwise": pathwise,
+            "summary": self._application_summary_np(pathwise),
+        }
+
+    def application_cost_from_path(
+        self,
+        t,
+        X,
+        Y,
+        Z,
+        const_value=None,
+        baseline_mode="controlled",
+        control_law="alpha_tf",
+        paired_inputs="stitched_XYZ",
+    ):
+        t = tf.convert_to_tensor(t, dtype=tf.float32)
+        X = tf.convert_to_tensor(X, dtype=tf.float32)
+        Y = tf.convert_to_tensor(Y, dtype=tf.float32)
+        Z = tf.convert_to_tensor(Z, dtype=tf.float32)
+        previous_const = np.float32(self.const)
+        previous_const_tf = np.float32(self.const_tf.numpy())
+        try:
+            if const_value is not None:
+                self._set_const(const_value)
+
+            mode = str(baseline_mode or "controlled").strip().lower()
+            if mode not in ("controlled", "uncontrolled"):
+                raise ValueError(f"baseline_mode must be 'controlled' or 'uncontrolled'")
+            running, terminal, total = self._application_cost_pathwise_tf(t, X, Y, Z)
+            alpha = self._application_alpha_trace_tf(t, X, Z)
+            return self._application_cost_result_np(
+                running,
+                terminal,
+                total,
+                alpha,
+                baseline_mode=mode,
+                control_law=control_law,
+                paired_inputs=paired_inputs,
+            )
+        finally:
+            if const_value is not None:
+                self.const = previous_const
+                self.const_tf.assign(previous_const_tf)
+
+    def application_cost_functional(self, t, W, Xi, const_value=None, baseline_mode="controlled"):
+        t = tf.convert_to_tensor(t, dtype=tf.float32)
+        W = tf.convert_to_tensor(W, dtype=tf.float32)
+        Xi = tf.convert_to_tensor(Xi, dtype=tf.float32)
+        previous_const = np.float32(self.const)
+        previous_const_tf = np.float32(self.const_tf.numpy())
+        try:
+            if const_value is not None:
+                self._set_const(const_value)
+
+            mode = str(baseline_mode or "controlled").strip().lower()
+            if mode == "controlled":
+                _, X, Y, Z = self.loss_function(t, W, Xi, const_value=const_value)
+                alpha = self._application_alpha_trace_tf(t, X, Z)
+                control_law = "alpha_tf"
+            elif mode == "uncontrolled":
+                X, Y, Z, alpha = self._uncontrolled_application_rollout_tf(t, W, Xi)
+                control_law = "alpha_zero"
+            else:
+                raise ValueError(f"baseline_mode must be 'controlled' or 'uncontrolled'")
+
+            running, terminal, total = self._application_cost_pathwise_tf(t, X, Y, Z)
+            return self._application_cost_result_np(
+                running,
+                terminal,
+                total,
+                alpha,
+                baseline_mode=mode,
+                control_law=control_law,
+                paired_inputs="same_t_W_Xi",
+            )
+        finally:
+            if const_value is not None:
+                self.const = previous_const
+                self.const_tf.assign(previous_const_tf)
+
+
 class NN_Pascucci_Recursive(NN_Pascucci):
     """
     Recursive block model for Pascucci with existing recursive runtime behavior.
