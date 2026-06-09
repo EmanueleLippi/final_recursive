@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from .application_metrics import summarize_pascucci_stitched_diagnostics
 from .exact import compute_stitched_exact_bundle, save_exact_error_timeseries_csv
 from .io_utils import _as_blob_dict, save_blob_npz, save_json, save_rows_csv
 from .models import FBSNN
@@ -76,6 +77,133 @@ def _prefixed_eval_diagnostics(eval_stats: Dict[str, Any]) -> Dict[str, float]:
         if np.isfinite(scalar):
             diagnostics[f"eval_{key_str}"] = scalar
     return diagnostics
+
+
+def _stitch_rollout_inputs(
+    rollout_inputs: List[Tuple[np.ndarray, np.ndarray]],
+) -> Tuple[np.ndarray, np.ndarray]:
+    t_segments = []
+    W_segments = []
+    previous_W_terminal = None
+    for idx, (t_block, W_block) in enumerate(rollout_inputs):
+        t_np = np.asarray(t_block, dtype=np.float32)
+        W_np = np.asarray(W_block, dtype=np.float32)
+        if previous_W_terminal is not None:
+            W_np = W_np - W_np[:, :1, :] + previous_W_terminal[:, None, :]
+        start_idx = 0 if idx == 0 else 1
+        t_segments.append(t_np[:, start_idx:, :])
+        W_segments.append(W_np[:, start_idx:, :])
+        previous_W_terminal = W_np[:, -1, :].astype(np.float32)
+    return (
+        np.concatenate(t_segments, axis=1).astype(np.float32),
+        np.concatenate(W_segments, axis=1).astype(np.float32),
+    )
+
+
+def _summarize_application_cost_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "schema": result["schema"],
+        "metadata": dict(result.get("metadata", {})),
+        "summary": dict(result.get("summary", {})),
+    }
+
+
+def _application_pathwise_npz(result: Dict[str, Any], prefix: str) -> Dict[str, np.ndarray]:
+    arrays = {}
+    for key, value in result.get("pathwise", {}).items():
+        arrays[f"{prefix}_{key}"] = np.asarray(value, dtype=np.float32)
+    return arrays
+
+
+def _compute_application_metric_artifact(
+    *,
+    stitched: Dict[str, np.ndarray],
+    blocks: List[Dict[str, float]],
+    rollout_inputs: Optional[List[Tuple[np.ndarray, np.ndarray]]],
+    params: Dict[str, np.ndarray],
+    D: int,
+    layers: List[int],
+    T_total: float,
+    coupling_const: float,
+    model_spec: ModelSpec,
+) -> Optional[Tuple[Dict[str, Any], Dict[str, np.ndarray]]]:
+    schema = str(getattr(model_spec, "application_metric_schema", "none"))
+    if schema == "none":
+        return None
+
+    t = np.asarray(stitched["t"], dtype=np.float32)
+    X = np.asarray(stitched["X"], dtype=np.float32)
+    Y = np.asarray(stitched["Y"], dtype=np.float32)
+    Z = np.asarray(stitched["Z"], dtype=np.float32)
+    if t.shape[1] < 2:
+        raise ValueError("application metrics require at least two stitched time points")
+
+    reset_backend_state()
+    model = model_spec.build_recursive_model(
+        Xi_generator=make_empirical_generator(X[:, 0, :], jitter_scale=0.0),
+        T=float(T_total),
+        M=int(X.shape[0]),
+        N=int(t.shape[1] - 1),
+        D=int(D),
+        layers=layers,
+        parameters=params,
+        t_start=float(t[0, 0, 0]),
+        t_end=float(t[0, -1, 0]),
+        T_total=float(T_total),
+        terminal_blob=None,
+    )
+    try:
+        if not hasattr(model, "application_cost_from_path"):
+            return None
+
+        controlled = model.application_cost_from_path(
+            t,
+            X,
+            Y,
+            Z,
+            const_value=float(coupling_const),
+            baseline_mode="controlled",
+            control_law="alpha_tf",
+            paired_inputs="stitched_XYZ",
+        )
+        pathwise_npz = _application_pathwise_npz(controlled, "controlled")
+        payload = {
+            "schema": schema,
+            "model_name": model_spec.name,
+            "horizon": {
+                "t_start": float(t[0, 0, 0]),
+                "t_end": float(t[0, -1, 0]),
+                "T_total": float(T_total),
+                "n_time_points": int(t.shape[1]),
+                "n_steps": int(t.shape[1] - 1),
+                "sample_paths": int(X.shape[0]),
+            },
+            "controlled": _summarize_application_cost_result(controlled),
+            "diagnostics": summarize_pascucci_stitched_diagnostics(
+                stitched=stitched,
+                blocks=blocks,
+                params=params,
+            ),
+        }
+
+        if rollout_inputs is not None and hasattr(model, "application_cost_functional"):
+            t_rollout, W_rollout = _stitch_rollout_inputs(rollout_inputs)
+            if t_rollout.shape != t.shape or not np.allclose(t_rollout, t, rtol=1.0e-6, atol=1.0e-6):
+                raise ValueError("application metrics require rollout inputs on the stitched time grid")
+            uncontrolled = model.application_cost_functional(
+                t_rollout,
+                W_rollout,
+                X[:, 0, :],
+                const_value=float(coupling_const),
+                baseline_mode="uncontrolled",
+            )
+            pathwise_npz.update(_application_pathwise_npz(uncontrolled, "uncontrolled"))
+            payload["uncontrolled"] = _summarize_application_cost_result(uncontrolled)
+
+        payload["pathwise_npz_keys"] = sorted(pathwise_npz)
+        return payload, pathwise_npz
+    finally:
+        model.close()
 
 
 def print_recursive_pass(
@@ -249,6 +377,8 @@ def print_recursive_pass(
     exact_bundle_by_pass = {}
     visual_stitched_by_pass = {}
     visual_exact_bundle_by_pass = {}
+    application_summary_by_pass = {}
+    application_pathwise_by_pass = {}
     for p in pass_entries:
         pass_id = int(p["pass_id"])
         pass_tag = _pass_tag(pass_id)
@@ -278,6 +408,28 @@ def print_recursive_pass(
             sample_paths=sample_paths,
             file_suffix=f"_{pass_tag}",
         )
+
+        application_artifact = _compute_application_metric_artifact(
+            stitched=stitched_pred,
+            blocks=blocks,
+            rollout_inputs=rollout_inputs,
+            params=params,
+            D=D,
+            layers=layers,
+            T_total=T_total,
+            coupling_const=float(coupling_const),
+            model_spec=spec,
+        )
+        if application_artifact is not None:
+            application_summary, application_pathwise = application_artifact
+            application_json_path = os.path.join(rec_dir, f"application_metrics_{pass_tag}.json")
+            application_npz_path = os.path.join(rec_dir, f"application_metrics_{pass_tag}.npz")
+            application_summary["output_path"] = application_json_path
+            application_summary["pathwise_npz_path"] = application_npz_path
+            save_blob_npz(application_pathwise, application_npz_path)
+            save_json(application_summary, application_json_path)
+            application_summary_by_pass[pass_id] = application_summary
+            application_pathwise_by_pass[pass_id] = application_pathwise
 
         if exact_solution is not None:
             exact_bundle = compute_stitched_exact_bundle(
@@ -400,6 +552,7 @@ def print_recursive_pass(
     selected_exact_bundle = exact_bundle_by_pass.get(selected_pass_id, None)
     selected_visual_stitched = visual_stitched_by_pass.get(selected_pass_id, None)
     selected_visual_exact_bundle = visual_exact_bundle_by_pass.get(selected_pass_id, None)
+    selected_application_summary = application_summary_by_pass.get(selected_pass_id, None)
     save_blob_npz(
         selected_stitched,
         os.path.join(rec_dir, "stitched_predictions_final.npz"),
@@ -452,6 +605,18 @@ def print_recursive_pass(
                 include_error_plots=False,
             )
 
+    if selected_application_summary is not None:
+        application_final_json_path = os.path.join(rec_dir, "application_metrics_final.json")
+        application_final_npz_path = os.path.join(rec_dir, "application_metrics_final.npz")
+        application_final_summary = dict(selected_application_summary)
+        application_final_summary["selected_from_pass_id"] = int(selected_pass_id)
+        application_final_summary["selected_from_pass_index"] = int(_pass_index(selected_pass_id))
+        application_final_summary["output_path"] = application_final_json_path
+        application_final_summary["pathwise_npz_path"] = application_final_npz_path
+        save_blob_npz(application_pathwise_by_pass[selected_pass_id], application_final_npz_path)
+        save_json(application_final_summary, application_final_json_path)
+        selected_application_summary = application_final_summary
+
     plot_recursive_stitched_y_convergence(
         stitched_by_pass=stitched_by_pass,
         blocks=blocks,
@@ -484,6 +649,11 @@ def print_recursive_pass(
         "exact_summary_by_pass_index": {
             str(_pass_index(k)): v for k, v in exact_summary_by_pass.items()
         },
+        "application_summary_by_pass": application_summary_by_pass,
+        "application_summary_by_pass_index": {
+            str(_pass_index(k)): v for k, v in application_summary_by_pass.items()
+        },
+        "selected_application_summary": selected_application_summary,
         "eval_bundle_path": eval_bundle_path,
         "evaluation_bundle_M": int(Xi_stitched.shape[0]),
         "visual_sample_paths": int(max(0, visual_path_count)),
@@ -625,7 +795,11 @@ def predict_recursive_stitched(
     Z_segments = []
     diagnostic_segments = {}
     boundary_abs_jumps = []
+    boundary_y_abs_jumps = []
+    boundary_z_abs_jumps = []
     previous_terminal_X = None
+    previous_terminal_Y = None
+    previous_terminal_Z = None
 
     for b, block in enumerate(blocks):
         blob = block_blobs[b]
@@ -666,6 +840,12 @@ def predict_recursive_stitched(
                 boundary_abs_jumps.append(
                     np.abs(np.asarray(X_b[:, 0, :], dtype=np.float32) - previous_terminal_X)
                 )
+                boundary_y_abs_jumps.append(
+                    np.abs(np.asarray(Y_b[:, 0, :], dtype=np.float32) - previous_terminal_Y)
+                )
+                boundary_z_abs_jumps.append(
+                    np.abs(np.asarray(Z_b[:, 0, :], dtype=np.float32) - previous_terminal_Z)
+                )
 
             start_idx = 0 if b == 0 else 1
             t_segments.append(t_b[:, start_idx:, :].astype(np.float32))
@@ -688,6 +868,8 @@ def predict_recursive_stitched(
                 )
 
             previous_terminal_X = X_b[:, -1, :].astype(np.float32)
+            previous_terminal_Y = Y_b[:, -1, :].astype(np.float32)
+            previous_terminal_Z = Z_b[:, -1, :].astype(np.float32)
             Xi_curr = previous_terminal_X
         finally:
             model.sess.close()
@@ -700,8 +882,13 @@ def predict_recursive_stitched(
     }
     for key, segments in diagnostic_segments.items():
         stitched[key] = np.concatenate(segments, axis=0).astype(np.float32)
-    if diagnostic_segments and boundary_abs_jumps:
+    emit_boundary_jumps = bool(boundary_abs_jumps) and (
+        str(getattr(spec, "application_metric_schema", "none")) != "none"
+    )
+    if emit_boundary_jumps:
         stitched["stitch_X_boundary_abs_jump"] = np.stack(boundary_abs_jumps, axis=0).astype(np.float32)
+        stitched["stitch_Y_boundary_abs_jump"] = np.stack(boundary_y_abs_jumps, axis=0).astype(np.float32)
+        stitched["stitch_Z_boundary_abs_jump"] = np.stack(boundary_z_abs_jumps, axis=0).astype(np.float32)
     return stitched
 
 def train_with_standard_schedule(

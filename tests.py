@@ -1972,6 +1972,37 @@ def test_pascucci_application_cost_functional_restores_const_state() -> None:
         model.close()
 
 
+def test_pascucci_application_cost_from_path_rejects_invalid_baseline_mode() -> None:
+    from .model_specs import get_model_spec
+    from .tf_backend import reset_backend_state, set_seed
+
+    reset_backend_state()
+    set_seed(104)
+
+    spec = get_model_spec("pascucci")
+    params = spec.build_default_params(const=0.75)
+    model = _build_pascucci_recursive_unit_model(params, M=4)
+
+    try:
+        t_batch, W_batch, Xi_batch = _fixed_validation_batch(M=4, N=2, D=4, T=0.25, seed=104)
+        _, X, Y, Z = model.loss_function(t_batch, W_batch, Xi_batch, const_value=0.75)
+        try:
+            model.application_cost_from_path(
+                t_batch,
+                X,
+                Y,
+                Z,
+                const_value=0.75,
+                baseline_mode="bad-mode",
+            )
+        except ValueError as exc:
+            assert "baseline_mode must be 'controlled' or 'uncontrolled'" in str(exc)
+        else:
+            raise AssertionError("application_cost_from_path should reject invalid baseline_mode")
+    finally:
+        model.close()
+
+
 def test_pascucci_uncontrolled_baseline_is_paired_and_alpha_zero() -> None:
     from .model_specs import get_model_spec
     from .tf_backend import reset_backend_state, set_seed
@@ -2080,6 +2111,51 @@ def test_pascucci_physical_tail_and_stitching_diagnostics_contract() -> None:
     assert summary["v_lower_violation_rate"] == 0.5
     np.testing.assert_allclose(summary["stitch_X_boundary_max_abs_jump"], 1.25)
     np.testing.assert_allclose(summary["stitch_X_boundary_mean_abs_jump"], 0.23125)
+
+    duplicate_boundary = dict(stitched)
+    duplicate_boundary.pop("stitch_X_boundary_abs_jump")
+    duplicate_boundary["t"] = np.asarray([[[0.0], [0.25], [0.25], [0.50]]], dtype=np.float32)
+    duplicate_boundary["X"] = np.asarray(
+        [
+            [
+                [0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 2.0],
+                [0.0, 0.0, 0.5, 3.0],
+                [0.0, 0.0, 0.5, 4.0],
+            ]
+        ],
+        dtype=np.float32,
+    )
+    duplicate_summary = summarize_pascucci_stitched_diagnostics(
+        stitched=duplicate_boundary,
+        blocks=blocks[:2],
+        params=params,
+    )
+    np.testing.assert_allclose(duplicate_summary["stitch_X_boundary_max_abs_jump"], 1.0)
+    np.testing.assert_allclose(duplicate_summary["stitch_X_boundary_mean_abs_jump"], 0.375)
+
+    pathwise_tail = dict(stitched)
+    pathwise_tail["X"] = np.asarray(
+        [
+            [[0.0, 0.0, 0.0, 9.0], [0.0, 0.0, 0.0, 9.0]],
+            [[0.0, 0.0, 0.0, 9.0], [0.0, 0.0, 0.0, 20.0]],
+        ],
+        dtype=np.float32,
+    )
+    for key in (
+        "q_lower_violation",
+        "q_upper_violation",
+        "v_lower_violation",
+        "v_upper_violation",
+    ):
+        pathwise_tail[key] = np.zeros((2, 1), dtype=np.float32)
+    tail_summary = summarize_pascucci_stitched_diagnostics(
+        stitched=pathwise_tail,
+        blocks=[{"idx": 0, "t_start": 0.0, "t_end": 0.25, "T_block": 0.25}],
+        params=params,
+    )
+    np.testing.assert_allclose(tail_summary["q_upper_violation_max"], 10.0)
+    np.testing.assert_allclose(tail_summary["q_upper_violation_rate"], 0.25)
 
     missing_jump = dict(stitched)
     missing_jump.pop("stitch_X_boundary_abs_jump")
@@ -4490,6 +4566,7 @@ def test_predict_recursive_stitched_carries_model_owned_diagnostics_without_reco
 
     class FakeSpec:
         name = "sentinel_model"
+        application_metric_schema = "sentinel_diagnostics_v1"
 
         def __init__(self) -> None:
             self.calls = 0
@@ -4543,6 +4620,84 @@ def test_predict_recursive_stitched_carries_model_owned_diagnostics_without_reco
     np.testing.assert_allclose(stitched["stitch_X_boundary_abs_jump"], 0.5)
 
 
+def test_predict_recursive_stitched_schema_none_diagnostics_do_not_change_boundary_keyset() -> None:
+    from .orchestration import predict_recursive_stitched
+
+    class FakeSession:
+        def close(self) -> None:
+            pass
+
+    class DiagnosticOnlyModel:
+        def __init__(self, block_idx: int, D: int) -> None:
+            self.block_idx = int(block_idx)
+            self.D = int(D)
+            self.sess = FakeSession()
+
+        def import_parameter_blob(self, blob, strict=True) -> None:
+            del blob, strict
+
+        def predict(self, Xi_star, t_star, W_star, const_value=None, return_runtime_diagnostics=False):
+            del W_star, const_value
+            assert return_runtime_diagnostics is True
+            M = int(Xi_star.shape[0])
+            steps = int(t_star.shape[1])
+            X = np.tile(Xi_star[:, None, :], (1, steps, 1)).astype(np.float32)
+            X[:, -1, :] = np.float32(self.block_idx + 1)
+            Y = np.zeros((M, steps, 1), dtype=np.float32)
+            Z = np.zeros((M, steps, self.D), dtype=np.float32)
+            diagnostics = {
+                "mean_probe": np.arange(steps, dtype=np.float32).reshape(steps, 1)
+            }
+            return X, Y, Z, diagnostics
+
+    class SchemaNoneSpec:
+        name = "schema_none_with_diagnostics"
+        application_metric_schema = "none"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def validate_state_dim(self, D: int) -> None:
+            assert int(D) == 4
+
+        def build_recursive_model(self, **kwargs):
+            model = DiagnosticOnlyModel(block_idx=self.calls, D=kwargs["D"])
+            self.calls += 1
+            return model
+
+    D = 4
+    M = 4
+    N_per_block = 2
+    blocks = build_blocks(T_total=0.5, block_size=0.25)
+    rollout = build_stitched_rollout_inputs(
+        blocks=blocks,
+        M=M,
+        N_per_block=N_per_block,
+        D=D,
+        seed=94,
+    )
+    spec = SchemaNoneSpec()
+    stitched = predict_recursive_stitched(
+        block_blobs=[{}, {}],
+        blocks=blocks,
+        Xi_initial=np.zeros((M, D), dtype=np.float32),
+        params={},
+        N_per_block=N_per_block,
+        D=D,
+        layers=[5, 8, 1],
+        T_total=0.5,
+        rollout_inputs=rollout,
+        model_spec=spec,
+    )
+
+    assert spec.calls == 2
+    assert set(stitched) == {"t", "X", "Y", "Z", "mean_probe"}
+    np.testing.assert_allclose(
+        stitched["mean_probe"],
+        np.asarray([[0.0], [1.0], [2.0], [1.0], [2.0]], dtype=np.float32),
+    )
+
+
 def test_predict_recursive_stitched_accepts_legacy_three_value_predict() -> None:
     from .orchestration import predict_recursive_stitched
 
@@ -4572,6 +4727,7 @@ def test_predict_recursive_stitched_accepts_legacy_three_value_predict() -> None
 
     class LegacySpec:
         name = "legacy_sentinel"
+        application_metric_schema = "legacy_boundary_diagnostics_v1"
 
         def __init__(self) -> None:
             self.calls = 0
@@ -4610,11 +4766,25 @@ def test_predict_recursive_stitched_accepts_legacy_three_value_predict() -> None
     )
 
     assert spec.calls == 2
-    assert set(stitched) == {"t", "X", "Y", "Z"}
+    assert set(stitched) == {
+        "t",
+        "X",
+        "Y",
+        "Z",
+        "stitch_X_boundary_abs_jump",
+        "stitch_Y_boundary_abs_jump",
+        "stitch_Z_boundary_abs_jump",
+    }
     assert stitched["t"].shape == (M, 5, 1)
     assert stitched["X"].shape == (M, 5, D)
     assert stitched["Y"].shape == (M, 5, 1)
     assert stitched["Z"].shape == (M, 5, D)
+    assert stitched["stitch_X_boundary_abs_jump"].shape == (1, M, D)
+    assert stitched["stitch_Y_boundary_abs_jump"].shape == (1, M, 1)
+    assert stitched["stitch_Z_boundary_abs_jump"].shape == (1, M, D)
+    np.testing.assert_allclose(stitched["stitch_X_boundary_abs_jump"], 1.0)
+    np.testing.assert_allclose(stitched["stitch_Y_boundary_abs_jump"], 0.0)
+    np.testing.assert_allclose(stitched["stitch_Z_boundary_abs_jump"], 0.0)
 
 
 def test_print_recursive_pass_saves_stitched_moment_traces() -> None:
@@ -4721,6 +4891,36 @@ def test_print_recursive_pass_saves_stitched_moment_traces() -> None:
                         assert np.isfinite(data[key]).all(), key
                     assert "block_params" not in keys
                     assert not any(key.startswith(("params_", "weights_")) for key in keys)
+            for filename in ("application_metrics_pass00.json", "application_metrics_final.json"):
+                payload = json.loads((rec_dir / filename).read_text(encoding="utf-8"))
+                assert payload["schema"] == "pascucci_application_metrics_v1"
+                assert payload["model_name"] == "pascucci"
+                assert payload["controlled"]["metadata"]["baseline_mode"] == "controlled"
+                assert payload["uncontrolled"]["metadata"]["baseline_mode"] == "uncontrolled"
+                for metric_name in (
+                    "cost_J_running_mean",
+                    "cost_J_terminal_mean",
+                    "cost_J_total_mean",
+                ):
+                    assert metric_name in payload["controlled"]["summary"]
+                    assert np.isfinite(payload["controlled"]["summary"][metric_name])
+                assert "stitch_X_boundary_max_abs_jump" in payload["diagnostics"]
+                assert Path(payload["pathwise_npz_path"]).exists()
+            for filename in ("application_metrics_pass00.npz", "application_metrics_final.npz"):
+                with np.load(rec_dir / filename) as data:
+                    keys = set(data.files)
+                    assert {
+                        "controlled_cost_J_running",
+                        "controlled_cost_J_terminal",
+                        "controlled_cost_J_total",
+                        "controlled_alpha",
+                        "uncontrolled_cost_J_running",
+                        "uncontrolled_cost_J_terminal",
+                        "uncontrolled_cost_J_total",
+                        "uncontrolled_alpha",
+                    }.issubset(keys)
+                    assert data["controlled_cost_J_total"].shape == (4, 1)
+                    assert data["uncontrolled_cost_J_total"].shape == (4, 1)
     finally:
         orchestration.predict_recursive_stitched = original_predict
         orchestration.plot_recursive_pass_logs_multi = original_plot_logs
@@ -4928,6 +5128,39 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text("fake checkpoint\n", encoding="utf-8")
 
+        def application_cost_functional(self, t, W, Xi, const_value=None, baseline_mode="controlled"):
+            del W, const_value
+            mode = str(baseline_mode)
+            M = int(np.asarray(Xi).shape[0])
+            steps = int(np.asarray(t).shape[1]) - 1
+            base = np.float32(1.0 if mode == "controlled" else 2.0)
+            running = np.full((M, 1), base, dtype=np.float32)
+            terminal = np.full((M, 1), base + np.float32(0.25), dtype=np.float32)
+            total = running + terminal
+            alpha = np.zeros((M, steps, 1), dtype=np.float32)
+            pathwise = {
+                "cost_J_running": running,
+                "cost_J_terminal": terminal,
+                "cost_J_total": total,
+                "alpha": alpha,
+            }
+            return {
+                "schema": "pascucci_application_metrics_v1",
+                "metadata": {
+                    "baseline_mode": mode,
+                    "aggregation": "left_riemann_f_plus_terminal_g",
+                    "control_law": "alpha_tf" if mode == "controlled" else "alpha_zero",
+                    "paired_inputs": "same_t_W_Xi",
+                },
+                "pathwise": pathwise,
+                "summary": {
+                    f"{metric}_{suffix}": float(np.asarray(values).reshape(-1).mean())
+                    for metric, values in pathwise.items()
+                    if metric.startswith("cost_J_")
+                    for suffix in ("mean",)
+                },
+            }
+
     standard_calls = []
     recursive_calls = []
     print_calls = []
@@ -5100,6 +5333,18 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
                 assert config["z_labels"] == ["Z_S", "Z_H", "Z_V", "Z_X"]
                 assert config["M"] == 4
                 assert config["N"] == 2
+                if expected_model == "quadratic_coupled":
+                    assert config["application_metric_schema"] == "none"
+                    assert config["application_metric_names"] == []
+                    assert config["application_metric_aggregation"] == "none"
+                else:
+                    assert config["application_metric_schema"] == "pascucci_application_metrics_v1"
+                    assert config["application_metric_names"] == [
+                        "cost_J_running",
+                        "cost_J_terminal",
+                        "cost_J_total",
+                    ]
+                    assert config["application_metric_aggregation"] == "left_riemann_f_plus_terminal_g"
 
                 if mode in ("standard", "both"):
                     assert (run_root / "standard" / "results.json").exists(), case_name
@@ -5253,6 +5498,37 @@ def test_cli_records_application_metric_manifest_in_run_config() -> None:
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text("fake checkpoint\n", encoding="utf-8")
 
+        def application_cost_functional(self, t, W, Xi, const_value=None, baseline_mode="controlled"):
+            del W, const_value
+            mode = str(baseline_mode)
+            M = int(np.asarray(Xi).shape[0])
+            steps = int(np.asarray(t).shape[1]) - 1
+            base = np.float32(1.0 if mode == "controlled" else 2.0)
+            running = np.full((M, 1), base, dtype=np.float32)
+            terminal = np.full((M, 1), base + np.float32(0.25), dtype=np.float32)
+            total = running + terminal
+            pathwise = {
+                "cost_J_running": running,
+                "cost_J_terminal": terminal,
+                "cost_J_total": total,
+                "alpha": np.zeros((M, steps, 1), dtype=np.float32),
+            }
+            return {
+                "schema": "pascucci_application_metrics_v1",
+                "metadata": {
+                    "baseline_mode": mode,
+                    "aggregation": "left_riemann_f_plus_terminal_g",
+                    "control_law": "alpha_tf" if mode == "controlled" else "alpha_zero",
+                    "paired_inputs": "same_t_W_Xi",
+                },
+                "pathwise": pathwise,
+                "summary": {
+                    f"{metric}_mean": float(np.asarray(values).reshape(-1).mean())
+                    for metric, values in pathwise.items()
+                    if metric.startswith("cost_J_")
+                },
+            }
+
     def fake_run_standard_reference(**kwargs):
         assert kwargs["model_spec"].name == "pascucci"
         return FakeStandardModel(), {
@@ -5324,12 +5600,28 @@ def test_cli_records_application_metric_manifest_in_run_config() -> None:
                 "global_seed": 1234,
                 "eval_seed": 222,
                 "visual_seed": 333,
+                "visual_seed_effective": 333,
                 "coarse_prepass_seed": 444,
                 "exact_init_seed": 555,
             }
+            assert config["visual_seed_effective"] == 333
             assert isinstance(config["run_config_sha256"], str)
             assert len(config["run_config_sha256"]) == 64
             int(config["run_config_sha256"], 16)
+            app_json = runs[0] / "standard" / "application_metrics.json"
+            app_npz = runs[0] / "standard" / "application_metrics.npz"
+            assert app_json.exists()
+            assert app_npz.exists()
+            payload = json.loads(app_json.read_text(encoding="utf-8"))
+            assert payload["schema"] == "pascucci_application_metrics_v1"
+            assert payload["controlled"]["metadata"]["baseline_mode"] == "controlled"
+            assert payload["uncontrolled"]["metadata"]["baseline_mode"] == "uncontrolled"
+            assert payload["horizon"]["eval_seed"] == 222
+            with np.load(app_npz) as data:
+                keys = set(data.files)
+                assert "controlled_cost_J_total" in keys
+                assert "uncontrolled_cost_J_total" in keys
+                assert data["controlled_cost_J_total"].shape == (4, 1)
     finally:
         orchestration.run_standard_reference = original_run_standard_reference
         cli.export_standard_parameter_blob = original_export_standard_parameter_blob
@@ -5538,6 +5830,10 @@ def test_cli_records_pascucci_cost_profile_params_in_recursive_run_config() -> N
                 "cost_J_total",
             ]
             assert config["application_metric_aggregation"] == "left_riemann_f_plus_terminal_g"
+            assert config["seed_manifest"]["eval_seed"] == 1234
+            assert config["seed_manifest"]["visual_seed"] is None
+            assert config["seed_manifest"]["visual_seed_effective"] == 9153
+            assert config["visual_seed_effective"] == 9153
             assert config["params"]["pascucci_cost_profile"] == "exp_minus_offset"
             assert np.isclose(config["params"]["pascucci_cost_offset"], 0.12)
             assert recursive_calls[0]["params"]["pascucci_cost_profile"] == "exp_minus_offset"
@@ -5985,9 +6281,13 @@ def test_recursive_visual_bundle_acceptance() -> None:
         )
         assert summary["visual_sample_paths"] == 2
         assert summary["visual_seed"] == 202
+        assert summary["application_summary_by_pass"] == {}
+        assert summary["selected_application_summary"] is None
         assert (tmp_path / "visual_stitched_predictions_pass00.npz").exists()
         assert (tmp_path / "visual_stitched_predictions_final.npz").exists()
         assert (tmp_path / "exact_metrics_final.json").exists()
+        assert not (tmp_path / "application_metrics_pass00.json").exists()
+        assert not (tmp_path / "application_metrics_final.json").exists()
         for filename in (
             "stitched_predictions_pass00.npz",
             "stitched_predictions_final.npz",
@@ -6310,6 +6610,10 @@ def run_tests(argv: List[str] | None = None) -> int:
         "test_pascucci_application_cost_functional_restores_const_state",
     ) and ok
     ok = _run_subprocess_case(
+        "pascucci_application_cost_from_path_rejects_invalid_baseline_mode",
+        "test_pascucci_application_cost_from_path_rejects_invalid_baseline_mode",
+    ) and ok
+    ok = _run_subprocess_case(
         "pascucci_uncontrolled_baseline_is_paired_and_alpha_zero",
         "test_pascucci_uncontrolled_baseline_is_paired_and_alpha_zero",
     ) and ok
@@ -6468,6 +6772,10 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "predict_recursive_stitched_carries_model_owned_diagnostics_without_recomputing",
         "test_predict_recursive_stitched_carries_model_owned_diagnostics_without_recomputing",
+    ) and ok
+    ok = _run_subprocess_case(
+        "predict_recursive_stitched_schema_none_diagnostics_do_not_change_boundary_keyset",
+        "test_predict_recursive_stitched_schema_none_diagnostics_do_not_change_boundary_keyset",
     ) and ok
     ok = _run_subprocess_case(
         "predict_recursive_stitched_accepts_legacy_three_value_predict",

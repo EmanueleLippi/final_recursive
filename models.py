@@ -1100,6 +1100,75 @@ class NN_Pascucci(FBSNN):
         terminal = self.g_tf(X[:, -1, :], moment_state=terminal_moments)
         return running, terminal, running + terminal
 
+    def _application_cost_result_np(
+        self,
+        running,
+        terminal,
+        total,
+        alpha,
+        *,
+        baseline_mode,
+        control_law,
+        paired_inputs,
+    ):
+        pathwise = {
+            "cost_J_running": running.numpy().astype(np.float32),
+            "cost_J_terminal": terminal.numpy().astype(np.float32),
+            "cost_J_total": total.numpy().astype(np.float32),
+            "alpha": alpha.numpy().astype(np.float32),
+        }
+        return {
+            "schema": "pascucci_application_metrics_v1",
+            "metadata": {
+                "baseline_mode": str(baseline_mode),
+                "aggregation": "left_riemann_f_plus_terminal_g",
+                "control_law": str(control_law),
+                "paired_inputs": str(paired_inputs),
+            },
+            "pathwise": pathwise,
+            "summary": self._application_summary_np(pathwise),
+        }
+
+    def application_cost_from_path(
+        self,
+        t,
+        X,
+        Y,
+        Z,
+        const_value=None,
+        baseline_mode="controlled",
+        control_law="alpha_tf",
+        paired_inputs="stitched_XYZ",
+    ):
+        t = tf.convert_to_tensor(t, dtype=tf.float32)
+        X = tf.convert_to_tensor(X, dtype=tf.float32)
+        Y = tf.convert_to_tensor(Y, dtype=tf.float32)
+        Z = tf.convert_to_tensor(Z, dtype=tf.float32)
+        previous_const = np.float32(self.const)
+        previous_const_tf = np.float32(self.const_tf.numpy())
+        try:
+            if const_value is not None:
+                self._set_const(const_value)
+
+            mode = str(baseline_mode or "controlled").strip().lower()
+            if mode not in ("controlled", "uncontrolled"):
+                raise ValueError(f"baseline_mode must be 'controlled' or 'uncontrolled'")
+            running, terminal, total = self._application_cost_pathwise_tf(t, X, Y, Z)
+            alpha = self._application_alpha_trace_tf(t, X, Z)
+            return self._application_cost_result_np(
+                running,
+                terminal,
+                total,
+                alpha,
+                baseline_mode=mode,
+                control_law=control_law,
+                paired_inputs=paired_inputs,
+            )
+        finally:
+            if const_value is not None:
+                self.const = previous_const
+                self.const_tf.assign(previous_const_tf)
+
     def application_cost_functional(self, t, W, Xi, const_value=None, baseline_mode="controlled"):
         t = tf.convert_to_tensor(t, dtype=tf.float32)
         W = tf.convert_to_tensor(W, dtype=tf.float32)
@@ -1122,23 +1191,15 @@ class NN_Pascucci(FBSNN):
                 raise ValueError(f"baseline_mode must be 'controlled' or 'uncontrolled'")
 
             running, terminal, total = self._application_cost_pathwise_tf(t, X, Y, Z)
-            pathwise = {
-                "cost_J_running": running.numpy().astype(np.float32),
-                "cost_J_terminal": terminal.numpy().astype(np.float32),
-                "cost_J_total": total.numpy().astype(np.float32),
-                "alpha": alpha.numpy().astype(np.float32),
-            }
-            return {
-                "schema": "pascucci_application_metrics_v1",
-                "metadata": {
-                    "baseline_mode": mode,
-                    "aggregation": "left_riemann_f_plus_terminal_g",
-                    "control_law": control_law,
-                    "paired_inputs": "same_t_W_Xi",
-                },
-                "pathwise": pathwise,
-                "summary": self._application_summary_np(pathwise),
-            }
+            return self._application_cost_result_np(
+                running,
+                terminal,
+                total,
+                alpha,
+                baseline_mode=mode,
+                control_law=control_law,
+                paired_inputs="same_t_W_Xi",
+            )
         finally:
             if const_value is not None:
                 self.const = previous_const

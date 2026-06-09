@@ -7,6 +7,8 @@ import numpy as np
 
 def _trace_stats(values: np.ndarray) -> Dict[str, float]:
     flat = np.asarray(values, dtype=np.float32).reshape(-1)
+    if flat.size == 0:
+        raise ValueError("metric traces must contain at least one value")
     return {
         "mean": float(np.mean(flat)),
         "max": float(np.max(flat)),
@@ -37,12 +39,36 @@ def _stitch_boundary_jump_values(stitched: dict, blocks: list) -> np.ndarray:
     return np.asarray([0.0], dtype=np.float32)
 
 
+def _physical_violation_values_from_x(stitched: dict, params: dict | None) -> Dict[str, np.ndarray]:
+    if params is None or "X" not in stitched:
+        return {}
+    required = ("x_max", "v_min", "v_max")
+    if any(key not in params for key in required):
+        return {}
+
+    X = np.asarray(stitched["X"], dtype=np.float32)
+    if X.ndim != 3 or X.shape[2] < 4:
+        return {}
+
+    V = X[:, :, 2]
+    Q = X[:, :, 3]
+    x_max = np.float32(params["x_max"])
+    v_min = np.float32(params["v_min"])
+    v_max = np.float32(params["v_max"])
+    return {
+        "q_lower_violation": np.maximum(-Q, 0.0).astype(np.float32),
+        "q_upper_violation": np.maximum(Q - x_max, 0.0).astype(np.float32),
+        "v_lower_violation": np.maximum(v_min - V, 0.0).astype(np.float32),
+        "v_upper_violation": np.maximum(V - v_max, 0.0).astype(np.float32),
+    }
+
+
 def summarize_pascucci_stitched_diagnostics(
     stitched: dict,
     blocks: list,
     params: dict | None = None,
 ) -> Dict[str, float]:
-    del params
+    pathwise_violations = _physical_violation_values_from_x(stitched, params)
     summary: Dict[str, float] = {}
     for key in (
         "q_lower_violation",
@@ -50,11 +76,18 @@ def summarize_pascucci_stitched_diagnostics(
         "v_lower_violation",
         "v_upper_violation",
     ):
-        stats = _trace_stats(np.asarray(stitched[key], dtype=np.float32))
+        values = pathwise_violations.get(key, np.asarray(stitched[key], dtype=np.float32))
+        stats = _trace_stats(values)
         for stat_name, value in stats.items():
             summary[f"{key}_{stat_name}"] = value
 
     jump_values = _stitch_boundary_jump_values(stitched, blocks)
     summary["stitch_X_boundary_max_abs_jump"] = float(np.max(jump_values))
     summary["stitch_X_boundary_mean_abs_jump"] = float(np.mean(jump_values))
+    for key in ("Y", "Z"):
+        jump_key = f"stitch_{key}_boundary_abs_jump"
+        if jump_key in stitched:
+            values = np.asarray(stitched[jump_key], dtype=np.float32).reshape(-1)
+            summary[f"stitch_{key}_boundary_max_abs_jump"] = float(np.max(values))
+            summary[f"stitch_{key}_boundary_mean_abs_jump"] = float(np.mean(values))
     return summary
