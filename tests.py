@@ -2172,6 +2172,215 @@ def test_pascucci_physical_tail_and_stitching_diagnostics_contract() -> None:
         raise AssertionError("unique stitched boundaries must not imply zero boundary jump")
 
 
+def test_pascucci_controlled_uncontrolled_comparison_is_paired_and_sign_safe() -> None:
+    try:
+        from .application_metrics import summarize_controlled_uncontrolled_comparison
+    except ImportError as exc:
+        raise AssertionError(
+            "Controlled/uncontrolled artifacts need an explicit paired comparison helper"
+        ) from exc
+
+    controlled = {
+        "metadata": {"baseline_mode": "controlled", "paired_inputs": "stitched_XYZ"},
+        "pathwise": {
+            "cost_J_running": np.asarray([[1.0], [3.0], [-2.0]], dtype=np.float32),
+            "cost_J_terminal": np.asarray([[0.5], [-4.0], [1.0]], dtype=np.float32),
+            "cost_J_total": np.asarray([[1.5], [-1.0], [-1.0]], dtype=np.float32),
+        },
+    }
+    uncontrolled = {
+        "metadata": {"baseline_mode": "uncontrolled", "paired_inputs": "same_t_W_Xi"},
+        "pathwise": {
+            "cost_J_running": np.asarray([[2.0], [1.0], [-3.0]], dtype=np.float32),
+            "cost_J_terminal": np.asarray([[1.5], [-5.0], [3.0]], dtype=np.float32),
+            "cost_J_total": np.asarray([[3.5], [-4.0], [0.0]], dtype=np.float32),
+        },
+    }
+
+    comparison = summarize_controlled_uncontrolled_comparison(
+        controlled=controlled,
+        uncontrolled=uncontrolled,
+    )
+    assert comparison["paired_pathwise_samples"] is True
+    assert comparison["paired_sample_count"] == 3
+    assert comparison["controlled_baseline_mode"] == "controlled"
+    assert comparison["uncontrolled_baseline_mode"] == "uncontrolled"
+    assert comparison["controlled_paired_inputs"] == "stitched_XYZ"
+    assert comparison["uncontrolled_paired_inputs"] == "same_t_W_Xi"
+    assert comparison["same_input_source"] is False
+
+    delta_total = controlled["pathwise"]["cost_J_total"] - uncontrolled["pathwise"]["cost_J_total"]
+    np.testing.assert_allclose(
+        comparison["delta_cost_J_total_mean"],
+        float(np.mean(delta_total)),
+        rtol=1.0e-6,
+        atol=1.0e-6,
+    )
+    np.testing.assert_allclose(
+        comparison["delta_cost_J_total_q50"],
+        float(np.quantile(delta_total.reshape(-1), 0.50)),
+        rtol=1.0e-6,
+        atol=1.0e-6,
+    )
+    np.testing.assert_allclose(
+        comparison["delta_cost_J_total_abs_q95"],
+        float(np.quantile(np.abs(delta_total.reshape(-1)), 0.95)),
+        rtol=1.0e-6,
+        atol=1.0e-6,
+    )
+    np.testing.assert_allclose(
+        comparison["cost_J_total_control_win_rate"],
+        float(np.mean(delta_total.reshape(-1) < 0.0)),
+        rtol=1.0e-6,
+        atol=1.0e-6,
+    )
+    assert not any("ratio" in key or "percent" in key for key in comparison), sorted(comparison)
+
+
+def test_pascucci_application_alpha_summary_is_controlled_only_and_plot_ready() -> None:
+    try:
+        from .application_metrics import summarize_application_alpha
+    except ImportError as exc:
+        raise AssertionError("Pascucci alpha diagnostics need an explicit summary helper") from exc
+
+    alpha = np.asarray(
+        [
+            [[-2.0], [-1.0], [0.0]],
+            [[1.0], [2.0], [3.0]],
+        ],
+        dtype=np.float32,
+    )
+    summary = summarize_application_alpha(alpha, baseline_mode="controlled")
+    flat = alpha.reshape(-1)
+    expected = {
+        "baseline_mode": "controlled",
+        "sample_count": int(flat.size),
+        "alpha_mean": float(np.mean(flat)),
+        "alpha_std": float(np.std(flat)),
+        "alpha_q05": float(np.quantile(flat, 0.05)),
+        "alpha_q50": float(np.quantile(flat, 0.50)),
+        "alpha_q95": float(np.quantile(flat, 0.95)),
+        "alpha_abs_mean": float(np.mean(np.abs(flat))),
+        "alpha_abs_q95": float(np.quantile(np.abs(flat), 0.95)),
+    }
+    for key, value in expected.items():
+        assert key in summary, f"{key} missing from alpha summary: {sorted(summary)}"
+        if isinstance(value, str):
+            assert summary[key] == value
+        else:
+            np.testing.assert_allclose(summary[key], value, rtol=1.0e-6, atol=1.0e-6)
+
+    uncontrolled = summarize_application_alpha(np.zeros_like(alpha), baseline_mode="uncontrolled")
+    assert uncontrolled["baseline_mode"] == "uncontrolled"
+    np.testing.assert_allclose(uncontrolled["alpha_abs_mean"], 0.0, rtol=0.0, atol=0.0)
+
+
+def test_pascucci_stitched_diagnostics_report_component_boundary_drift() -> None:
+    from .application_metrics import summarize_pascucci_stitched_diagnostics
+
+    params = _default_pascucci_params(const=0.75)
+    stitched = {
+        "t": np.asarray([[[0.0], [0.25], [0.50]]], dtype=np.float32),
+        "X": np.zeros((2, 3, 4), dtype=np.float32),
+        "q_lower_violation": np.zeros((3, 1), dtype=np.float32),
+        "q_upper_violation": np.zeros((3, 1), dtype=np.float32),
+        "v_lower_violation": np.zeros((3, 1), dtype=np.float32),
+        "v_upper_violation": np.zeros((3, 1), dtype=np.float32),
+        "stitch_X_boundary_signed_jump": np.asarray(
+            [
+                [[0.50, -0.25, 0.00, 2.00], [-0.50, 0.25, 1.00, 0.00]],
+            ],
+            dtype=np.float32,
+        ),
+        "stitch_X_boundary_abs_jump": np.asarray(
+            [
+                [[0.50, 0.25, 0.00, 2.00], [0.50, 0.25, 1.00, 0.00]],
+            ],
+            dtype=np.float32,
+        ),
+    }
+    blocks = [
+        {"idx": 0, "t_start": 0.0, "t_end": 0.25, "T_block": 0.25},
+        {"idx": 1, "t_start": 0.25, "t_end": 0.50, "T_block": 0.25},
+    ]
+    summary = summarize_pascucci_stitched_diagnostics(
+        stitched=stitched,
+        blocks=blocks,
+        params=params,
+        state_labels=("S", "H", "V", "Q"),
+    )
+
+    np.testing.assert_allclose(summary["stitch_X_boundary_signed_mean_jump_S"], 0.0)
+    np.testing.assert_allclose(summary["stitch_X_boundary_max_abs_jump_V"], 1.0)
+    np.testing.assert_allclose(summary["stitch_X_boundary_max_abs_jump_Q"], 2.0)
+    np.testing.assert_allclose(
+        summary["stitch_X_boundary_abs_q95_jump_Q"],
+        float(np.quantile(np.asarray([2.0, 0.0], dtype=np.float32), 0.95)),
+    )
+
+
+def test_pascucci_application_pass_stability_uses_same_grid_pathwise_deltas() -> None:
+    try:
+        from .application_metrics import summarize_application_pass_stability
+    except ImportError as exc:
+        raise AssertionError("Pascucci pass stability needs an explicit summary helper") from exc
+
+    t = np.asarray([[[0.0], [0.5], [1.0]], [[0.0], [0.5], [1.0]]], dtype=np.float32)
+    previous_stitched = {
+        "t": t,
+        "Y": np.zeros((2, 3, 1), dtype=np.float32),
+        "Z": np.zeros((2, 3, 4), dtype=np.float32),
+    }
+    current_stitched = {
+        "t": t.copy(),
+        "Y": np.asarray([[[0.0], [0.5], [1.0]], [[0.0], [0.0], [0.0]]], dtype=np.float32),
+        "Z": np.zeros((2, 3, 4), dtype=np.float32),
+    }
+    current_stitched["Z"][:, :, 2] = np.asarray(
+        [[0.0, 0.25, 0.50], [0.0, 0.00, 0.25]], dtype=np.float32
+    )
+    previous_pathwise = {
+        "controlled_cost_J_total": np.asarray([[1.0], [2.0]], dtype=np.float32),
+        "controlled_alpha": np.asarray([[[-1.0], [0.0]], [[1.0], [2.0]]], dtype=np.float32),
+    }
+    current_pathwise = {
+        "controlled_cost_J_total": np.asarray([[1.5], [1.0]], dtype=np.float32),
+        "controlled_alpha": np.asarray([[[-0.5], [0.5]], [[1.5], [1.0]]], dtype=np.float32),
+    }
+
+    stability = summarize_application_pass_stability(
+        previous_stitched=previous_stitched,
+        current_stitched=current_stitched,
+        previous_pathwise=previous_pathwise,
+        current_pathwise=current_pathwise,
+        z_v_index=2,
+    )
+    np.testing.assert_allclose(
+        stability["pass_vs_prev_Y_mae"],
+        float(np.mean(np.abs(current_stitched["Y"] - previous_stitched["Y"]))),
+        rtol=1.0e-6,
+        atol=1.0e-6,
+    )
+    np.testing.assert_allclose(
+        stability["pass_vs_prev_Z_V_mae"],
+        float(np.mean(np.abs(current_stitched["Z"][:, :, 2] - previous_stitched["Z"][:, :, 2]))),
+        rtol=1.0e-6,
+        atol=1.0e-6,
+    )
+    np.testing.assert_allclose(
+        stability["pass_vs_prev_cost_J_total_mean_abs_delta"],
+        float(np.mean(np.abs(current_pathwise["controlled_cost_J_total"] - previous_pathwise["controlled_cost_J_total"]))),
+        rtol=1.0e-6,
+        atol=1.0e-6,
+    )
+    np.testing.assert_allclose(
+        stability["pass_vs_prev_alpha_abs_mean_delta"],
+        float(np.mean(np.abs(current_pathwise["controlled_alpha"] - previous_pathwise["controlled_alpha"]))),
+        rtol=1.0e-6,
+        atol=1.0e-6,
+    )
+
+
 def test_pascucci_cost_profile_default_is_exp_and_json_safe() -> None:
     _assert_pascucci_model_tdd_contract("pascucci_cost_profile_default_is_exp_and_json_safe")
     from .model_specs import get_model_spec
@@ -4928,6 +5137,197 @@ def test_print_recursive_pass_saves_stitched_moment_traces() -> None:
         orchestration.plot_recursive_stitched_y_convergence = original_plot_convergence
 
 
+def test_print_recursive_pass_application_metrics_emit_comparison_and_stability() -> None:
+    from . import orchestration
+    from .model_specs import ModelSpec, get_model_spec
+
+    base = get_model_spec("pascucci")
+    M = 4
+    D = 4
+    layers = [5, 8, 1]
+    z_v_index = 1
+
+    class FakeApplicationModel:
+        def _summary(self, running, terminal, total):
+            summary = {}
+            for key, values in (
+                ("cost_J_running", running),
+                ("cost_J_terminal", terminal),
+                ("cost_J_total", total),
+            ):
+                flat = np.asarray(values, dtype=np.float32).reshape(-1)
+                summary[f"{key}_mean"] = float(np.mean(flat))
+                summary[f"{key}_std"] = float(np.std(flat))
+                summary[f"{key}_q05"] = float(np.quantile(flat, 0.05))
+                summary[f"{key}_q50"] = float(np.quantile(flat, 0.50))
+                summary[f"{key}_q95"] = float(np.quantile(flat, 0.95))
+            return summary
+
+        def _result(self, *, t, cost_seed, alpha, baseline_mode, control_law, paired_inputs):
+            M_local = int(alpha.shape[0])
+            running = np.full((M_local, 1), np.float32(cost_seed), dtype=np.float32)
+            terminal = np.full((M_local, 1), np.float32(0.25), dtype=np.float32)
+            total = running + terminal
+            return {
+                "schema": "pascucci_application_metrics_v1",
+                "metadata": {
+                    "baseline_mode": baseline_mode,
+                    "aggregation": "left_riemann_f_plus_terminal_g",
+                    "control_law": control_law,
+                    "paired_inputs": paired_inputs,
+                },
+                "pathwise": {
+                    "cost_J_running": running,
+                    "cost_J_terminal": terminal,
+                    "cost_J_total": total,
+                    "alpha": alpha.astype(np.float32),
+                },
+                "summary": self._summary(running, terminal, total),
+            }
+
+        def application_cost_from_path(self, t, X, Y, Z, const_value=None, baseline_mode="controlled", **kwargs):
+            del Y, const_value, kwargs
+            cost_seed = float(np.asarray(X, dtype=np.float32)[0, 0, 0]) + 1.0
+            alpha = np.asarray(Z, dtype=np.float32)[:, :-1, [z_v_index]]
+            return self._result(
+                t=t,
+                cost_seed=cost_seed,
+                alpha=alpha,
+                baseline_mode=str(baseline_mode),
+                control_law="alpha_tf",
+                paired_inputs="stitched_XYZ",
+            )
+
+        def application_cost_functional(self, t, W, Xi, const_value=None, baseline_mode="uncontrolled"):
+            del W, const_value
+            steps = int(np.asarray(t).shape[1]) - 1
+            alpha = np.zeros((int(np.asarray(Xi).shape[0]), steps, 1), dtype=np.float32)
+            return self._result(
+                t=t,
+                cost_seed=3.0,
+                alpha=alpha,
+                baseline_mode=str(baseline_mode),
+                control_law="alpha_zero",
+                paired_inputs="same_t_W_Xi",
+            )
+
+        def close(self):
+            pass
+
+    spec = ModelSpec(
+        name="pascucci_stability_stub",
+        state_dim=4,
+        state_labels=("S", "H", "V", "X_state"),
+        z_labels=("Z_S", "Z_V", "Z_H", "Z_X"),
+        build_default_params=base.build_default_params,
+        build_layers=base.build_layers,
+        xi_generator=base.xi_generator,
+        deterministic_xi=base.deterministic_xi,
+        standard_model_factory=lambda **kwargs: None,
+        recursive_model_factory=lambda **kwargs: FakeApplicationModel(),
+        build_exact_solution=lambda *args, **kwargs: None,
+        build_exact_initial_boundary_samples=None,
+        moment_names=base.moment_names,
+        application_metric_schema="pascucci_application_metrics_v1",
+        application_metric_names=base.application_metric_names,
+        application_metric_aggregation=base.application_metric_aggregation,
+    )
+    params = spec.build_default_params(const=0.75)
+    blocks = [{"idx": 0, "t_start": 0.0, "t_end": 0.25, "T_block": 0.25}]
+    pass_entries = []
+    for pass_id, loss in ((1, 0.50), (2, 0.25)):
+        pass_entries.append(
+            {
+                "pass_id": pass_id,
+                "logs": [
+                    {
+                        "pass": pass_id,
+                        "block": 0,
+                        "t_start": 0.0,
+                        "t_end": 0.25,
+                        "T_block": 0.25,
+                        "eval_mean_loss": float(loss),
+                        "eval_std_loss": 0.0,
+                        "eval_mean_loss_per_sample": float(loss),
+                        "eval_std_loss_per_sample": 0.0,
+                        "eval_mean_y0": 0.0,
+                        "precision_target": None,
+                        "refine_rounds": 0,
+                    }
+                ],
+                "blobs": [_make_blob(layers)],
+            }
+        )
+
+    predict_call = {"count": 0}
+
+    def fake_predict_recursive_stitched(**kwargs):
+        predict_call["count"] += 1
+        rollout_inputs = kwargs["rollout_inputs"]
+        t = np.asarray(rollout_inputs[0][0], dtype=np.float32)
+        pass_offset = np.float32(predict_call["count"] - 1)
+        X = np.zeros((M, t.shape[1], D), dtype=np.float32)
+        X[:, :, 0] = pass_offset
+        X[:, :, 3] = 5.0
+        Y = np.full((M, t.shape[1], 1), pass_offset, dtype=np.float32)
+        Z = np.zeros((M, t.shape[1], D), dtype=np.float32)
+        Z[:, :, z_v_index] = pass_offset * np.float32(2.0)
+        return {"t": t, "X": X, "Y": Y, "Z": Z}
+
+    original_predict = orchestration.predict_recursive_stitched
+    original_plot_logs = orchestration.plot_recursive_pass_logs_multi
+    original_plot_stitched = orchestration.plot_recursive_stitched_predictions
+    original_plot_convergence = orchestration.plot_recursive_stitched_y_convergence
+    orchestration.predict_recursive_stitched = fake_predict_recursive_stitched
+    orchestration.plot_recursive_pass_logs_multi = lambda *args, **kwargs: None
+    orchestration.plot_recursive_stitched_predictions = lambda *args, **kwargs: None
+    orchestration.plot_recursive_stitched_y_convergence = lambda *args, **kwargs: None
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            rec_dir = Path(tmp)
+            summary = orchestration.print_recursive_pass(
+                pass_entries=pass_entries,
+                blocks=blocks,
+                rec_dir=str(rec_dir),
+                params=params,
+                N_per_block=2,
+                D=D,
+                layers=layers,
+                T_total=0.25,
+                exact_solution=None,
+                selection_metric="loss",
+                eval_bundle_path=str(rec_dir / "evaluation_bundle.npz"),
+                eval_seed=101,
+                eval_min_paths=M,
+                sample_paths=0,
+                print_compact_logs=False,
+                model_spec=spec,
+            )
+
+            assert summary["selected_pass_id"] == 2
+            assert 2 in summary["application_stability_by_pass"]
+            stability = summary["application_stability_by_pass"][2]
+            np.testing.assert_allclose(stability["pass_vs_prev_Z_V_mae"], 2.0, rtol=1.0e-6, atol=1.0e-6)
+            np.testing.assert_allclose(stability["pass_vs_prev_Y_mae"], 1.0, rtol=1.0e-6, atol=1.0e-6)
+            assert summary["application_stability_by_pass_index"] == {"1": stability}
+
+            pass0 = json.loads((rec_dir / "application_metrics_pass00.json").read_text(encoding="utf-8"))
+            pass1 = json.loads((rec_dir / "application_metrics_pass01.json").read_text(encoding="utf-8"))
+            for payload in (pass0, pass1):
+                assert "comparison" in payload
+                assert payload["comparison"]["paired_pathwise_samples"] is True
+                assert payload["comparison"]["same_input_source"] is False
+                assert "alpha_summary" in payload["controlled"]
+            assert "stability_vs_previous_pass" not in pass0
+            assert pass1["stability_vs_previous_pass"] == stability
+    finally:
+        orchestration.predict_recursive_stitched = original_predict
+        orchestration.plot_recursive_pass_logs_multi = original_plot_logs
+        orchestration.plot_recursive_stitched_predictions = original_plot_stitched
+        orchestration.plot_recursive_stitched_y_convergence = original_plot_convergence
+
+
 def test_print_recursive_pass_rejects_mismatched_eval_bundle_metadata() -> None:
     from . import orchestration
     from .model_specs import get_model_spec
@@ -6622,6 +7022,22 @@ def run_tests(argv: List[str] | None = None) -> int:
         "test_pascucci_physical_tail_and_stitching_diagnostics_contract",
     ) and ok
     ok = _run_subprocess_case(
+        "pascucci_controlled_uncontrolled_comparison_is_paired_and_sign_safe",
+        "test_pascucci_controlled_uncontrolled_comparison_is_paired_and_sign_safe",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_application_alpha_summary_is_controlled_only_and_plot_ready",
+        "test_pascucci_application_alpha_summary_is_controlled_only_and_plot_ready",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_stitched_diagnostics_report_component_boundary_drift",
+        "test_pascucci_stitched_diagnostics_report_component_boundary_drift",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_application_pass_stability_uses_same_grid_pathwise_deltas",
+        "test_pascucci_application_pass_stability_uses_same_grid_pathwise_deltas",
+    ) and ok
+    ok = _run_subprocess_case(
         "pascucci_cost_profile_default_is_exp_and_json_safe",
         "test_pascucci_cost_profile_default_is_exp_and_json_safe",
     ) and ok
@@ -6784,6 +7200,10 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "print_recursive_pass_saves_stitched_moment_traces",
         "test_print_recursive_pass_saves_stitched_moment_traces",
+    ) and ok
+    ok = _run_subprocess_case(
+        "print_recursive_pass_application_metrics_emit_comparison_and_stability",
+        "test_print_recursive_pass_application_metrics_emit_comparison_and_stability",
     ) and ok
     ok = _run_subprocess_case(
         "print_recursive_pass_rejects_mismatched_eval_bundle_metadata",

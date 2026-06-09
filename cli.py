@@ -12,6 +12,7 @@ import numpy as np
 import hashlib
 import json
 
+from .application_metrics import summarize_application_alpha, summarize_controlled_uncontrolled_comparison
 from .exact import compute_stitched_exact_bundle, save_exact_error_timeseries_csv
 from .io_utils import export_standard_parameter_blob, save_blob_npz, save_json, save_rows_csv, _to_serializable
 from .naming import _pass_index, _pass_label
@@ -41,11 +42,18 @@ def _run_config_sha256(config: dict) -> str:
 
 
 def _summarize_application_cost_result(result: dict) -> dict:
-    return {
+    payload = {
         "schema": result["schema"],
         "metadata": dict(result.get("metadata", {})),
         "summary": dict(result.get("summary", {})),
     }
+    pathwise = result.get("pathwise", {})
+    if "alpha" in pathwise:
+        payload["alpha_summary"] = summarize_application_alpha(
+            pathwise["alpha"],
+            baseline_mode=payload["metadata"].get("baseline_mode", ""),
+        )
+    return payload
 
 
 def _application_pathwise_npz(result: dict, prefix: str) -> dict:
@@ -74,6 +82,10 @@ def _save_application_cost_artifacts(
     if uncontrolled is not None:
         pathwise.update(_application_pathwise_npz(uncontrolled, "uncontrolled"))
         payload["uncontrolled"] = _summarize_application_cost_result(uncontrolled)
+        payload["comparison"] = summarize_controlled_uncontrolled_comparison(
+            controlled=controlled,
+            uncontrolled=uncontrolled,
+        )
 
     json_path = os.path.join(output_dir, f"{stem}.json")
     npz_path = os.path.join(output_dir, f"{stem}.npz")
@@ -1016,6 +1028,10 @@ def run_program(argv: Optional[List[str]] = None):
                     str(k): v for k, v in plot_summary.get("application_summary_by_pass", {}).items()
                 },
                 "by_pass_index": plot_summary.get("application_summary_by_pass_index", {}),
+                "stability_by_pass": {
+                    str(k): v for k, v in plot_summary.get("application_stability_by_pass", {}).items()
+                },
+                "stability_by_pass_index": plot_summary.get("application_stability_by_pass_index", {}),
                 "selected_pass_summary": plot_summary.get("selected_application_summary", None),
             }
         if exact_solution is None:
