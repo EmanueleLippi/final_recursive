@@ -6,6 +6,7 @@ Entry point unico:
 
 ```bash
 PYTHONPATH=code python -m final_recursive run --mode recursive
+PYTHONPATH=code python -m final_recursive plot --run_dir path/to/run
 PYTHONPATH=code python -m final_recursive test
 PYTHONPATH=code python -m final_recursive test --include-v1-parity
 ```
@@ -16,6 +17,7 @@ base env Anaconda:
 ```bash
 PYTHONPATH=code code/final_recursive/.venv/bin/python -m final_recursive test --include-v1-parity
 PYTHONPATH=code code/final_recursive/.venv/bin/python -m final_recursive run --mode recursive
+PYTHONPATH=code code/final_recursive/.venv/bin/python -m final_recursive plot --run_dir path/to/run
 ```
 
 La versione target di TensorFlow verificata via pip e `2.21.0`. Il file
@@ -61,3 +63,36 @@ Se `--visual_seed` vale `-1`, il seed viene derivato da `--eval_seed`. I plot
 `recursive_stitched_Y_exact*.png` e `recursive_stitched_Z_*_exact*.png` usano
 questi path visuali; le curve `recursive_stitched_abs_error*.png` e
 `recursive_stitched_Z_rel_error*.png` restano invece basate sul bundle grande.
+
+## Figure Pascucci Paper
+
+Il comando plot-only rigenera i grafici paper Pascucci #35-#40 da artifact gia'
+salvati, senza avviare training:
+
+```bash
+PYTHONPATH=code python -m final_recursive plot --run_dir path/to/run
+```
+
+Input attesi:
+
+- `run_config.json`
+- `recursive/stitched_predictions_final.npz`
+- `recursive/application_metrics_final.npz`
+
+Il `run_config.json` deve dichiarare `application_metric_schema =
+pascucci_application_metrics_v2`; gli artifact precedenti vanno rigenerati per
+ottenere le tracce cumulative `cost_J_running_cumulative` usate dal grafico
+`#37`. Nel grafico `#40` le barre indicano la mediana con intervallo q05-q95 e
+il diamante nero indica la media, cosi' le distribuzioni sbilanciate restano
+rappresentabili senza interpretare i quantili come intervallo di confidenza
+della media.
+
+Output default:
+
+- `recursive/plots/pascucci_paper/pascucci_paper_35_S_ou_band.png`
+- `recursive/plots/pascucci_paper/pascucci_paper_36_H_ou_band.png`
+- `recursive/plots/pascucci_paper/pascucci_paper_37_accumulated_cost.png`
+- `recursive/plots/pascucci_paper/pascucci_paper_38_alpha.png`
+- `recursive/plots/pascucci_paper/pascucci_paper_39_state_bands_S_V_Q.png`
+- `recursive/plots/pascucci_paper/pascucci_paper_40_controlled_uncontrolled.png`
+- `recursive/plots/pascucci_paper/pascucci_paper_plots_manifest.json`
