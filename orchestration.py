@@ -928,10 +928,10 @@ def predict_recursive_stitched(
         stitched[key] = np.concatenate(segments, axis=0).astype(np.float32)
     application_metric_schema = str(getattr(spec, "application_metric_schema", "none"))
     emit_boundary_jumps = bool(boundary_abs_jumps) and application_metric_schema != "none"
-    emit_signed_boundary_jumps = (
-        bool(boundary_signed_jumps)
-        and application_metric_schema == "pascucci_application_metrics_v1"
-    )
+    emit_signed_boundary_jumps = bool(boundary_signed_jumps) and application_metric_schema in {
+        "pascucci_application_metrics_v1",
+        "pascucci_application_metrics_v2",
+    }
     if emit_boundary_jumps:
         if emit_signed_boundary_jumps:
             stitched["stitch_X_boundary_signed_jump"] = np.stack(boundary_signed_jumps, axis=0).astype(np.float32)

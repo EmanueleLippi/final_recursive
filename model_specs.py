@@ -202,7 +202,7 @@ def get_model_spec(name: Optional[str] = None) -> ModelSpec:
             build_exact_solution=_build_pascucci_exact_solution,
             build_exact_initial_boundary_samples=None,
             moment_names=("mean_v", "mean_q", "mean_h_plus_v"),
-            application_metric_schema="pascucci_application_metrics_v1",
+            application_metric_schema="pascucci_application_metrics_v2",
             application_metric_names=(
                 "cost_J_running",
                 "cost_J_terminal",

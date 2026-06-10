@@ -1040,8 +1040,18 @@ class NN_Pascucci(FBSNN):
 
     def _application_summary_np(self, pathwise):
         summary = {}
-        for key in ("cost_J_running", "cost_J_terminal", "cost_J_total"):
-            values = np.asarray(pathwise[key], dtype=np.float32).reshape(-1)
+        for key in ("cost_J_running", "cost_J_terminal", "cost_J_total", "cost_J_running_cumulative"):
+            if key == "cost_J_running_cumulative":
+                cumulative = np.asarray(pathwise[key], dtype=np.float32)
+                if cumulative.ndim != 3:
+                    raise ValueError(f"{key} must have shape (M, n_steps, 1), got {cumulative.shape}")
+                if cumulative.shape[1] == 0:
+                    values = np.zeros((cumulative.shape[0], 1), dtype=np.float32)
+                else:
+                    values = cumulative[:, -1, :]
+            else:
+                values = np.asarray(pathwise[key], dtype=np.float32)
+            values = values.reshape(-1)
             summary[f"{key}_mean"] = float(np.mean(values))
             summary[f"{key}_std"] = float(np.std(values))
             summary[f"{key}_q05"] = float(np.quantile(values, 0.05))
@@ -1129,7 +1139,7 @@ class NN_Pascucci(FBSNN):
             "alpha": alpha.numpy().astype(np.float32),
         }
         return {
-            "schema": "pascucci_application_metrics_v1",
+            "schema": "pascucci_application_metrics_v2",
             "metadata": {
                 "baseline_mode": str(baseline_mode),
                 "aggregation": "left_riemann_f_plus_terminal_g",

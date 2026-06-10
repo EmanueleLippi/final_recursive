@@ -15,6 +15,7 @@ from .plotting import _PLOTTING_AVAILABLE, plt
 
 PAPER_PLOT_SCHEMA = "pascucci_paper_plots_v1"
 PAPER_PLOT_MANIFEST = "pascucci_paper_plots_manifest.json"
+APPLICATION_METRIC_SCHEMA = "pascucci_application_metrics_v2"
 
 
 def _require_plotting() -> None:
@@ -124,7 +125,7 @@ def _plot_state_with_ou(
     plt.figure(figsize=(10, 5))
     plt.fill_between(time, empirical["q05"], empirical["q95"], color="tab:blue", alpha=0.18, label="empirical q05-q95")
     plt.plot(time, empirical["q50"], color="tab:blue", linewidth=1.8, label="empirical median")
-    plt.fill_between(time, ou["lower"], ou["upper"], color="tab:orange", alpha=0.16, label="OU 95pct band")
+    plt.fill_between(time, ou["lower"], ou["upper"], color="tab:orange", alpha=0.16, label="OU +/-1.96 sigma_inf envelope")
     plt.plot(time, ou["mean"], color="tab:orange", linewidth=1.5, linestyle="--", label="OU mean")
     plt.title(title)
     plt.xlabel("Time")
@@ -207,19 +208,22 @@ def _plot_controlled_uncontrolled(
     values = [controlled_flat, uncontrolled_flat]
     means = [float(np.mean(v)) for v in values]
     q05 = [float(np.quantile(v, 0.05)) for v in values]
+    q50 = [float(np.quantile(v, 0.50)) for v in values]
     q95 = [float(np.quantile(v, 0.95)) for v in values]
     yerr = np.asarray(
-        [[means[i] - q05[i] for i in range(2)], [q95[i] - means[i] for i in range(2)]],
+        [[q50[i] - q05[i] for i in range(2)], [q95[i] - q50[i] for i in range(2)]],
         dtype=np.float32,
     )
     plt.figure(figsize=(8, 5))
     x = np.arange(2)
-    plt.bar(x, means, yerr=yerr, capsize=5, color=["tab:blue", "tab:red"], alpha=0.82)
+    plt.bar(x, q50, yerr=yerr, capsize=5, color=["tab:blue", "tab:red"], alpha=0.82, label="median q05-q95")
+    plt.scatter(x, means, color="black", marker="D", s=28, zorder=3, label="mean")
     plt.xticks(x, ["controlled", "uncontrolled"])
     plt.axhline(0.0, color="k", linewidth=0.8, alpha=0.35)
-    plt.title("Pascucci controlled vs uncontrolled total cost")
-    plt.ylabel("J total mean with q05-q95")
+    plt.title("Pascucci controlled vs uncontrolled total cost distribution")
+    plt.ylabel("J total median with q05-q95; diamonds show mean")
     plt.grid(True, axis="y", alpha=0.3)
+    plt.legend()
     plt.tight_layout()
     plt.savefig(path, dpi=160)
     plt.close()
@@ -287,12 +291,12 @@ def plot_pascucci_paper_bundle(
     plot_specs = {
         "#35": _story_entry(
             "pascucci_paper_35_S_ou_band.png",
-            "S with OU band",
+            "S with OU envelope",
             ("stitched.t", "stitched.X[:, :, S]", "run_config.params.params_S"),
         ),
         "#36": _story_entry(
             "pascucci_paper_36_H_ou_band.png",
-            "H with OU band",
+            "H with OU envelope",
             ("stitched.t", "stitched.X[:, :, H]", "run_config.params.params_H"),
         ),
         "#37": _story_entry(
@@ -325,7 +329,7 @@ def plot_pascucci_paper_bundle(
         values=X[:, :, 0],
         ou_params=params_S,
         ylabel="S",
-        title="Pascucci S with calibrated OU band",
+        title="Pascucci S with calibrated OU envelope",
         path=_story_path(plot_specs["#35"], out_dir),
     )
     _plot_state_with_ou(
@@ -333,7 +337,7 @@ def plot_pascucci_paper_bundle(
         values=X[:, :, 1],
         ou_params=params_H,
         ylabel="H",
-        title="Pascucci H with calibrated OU band",
+        title="Pascucci H with calibrated OU envelope",
         path=_story_path(plot_specs["#36"], out_dir),
     )
     _plot_accumulated_cost(
@@ -384,6 +388,15 @@ def _load_json(path: str) -> Dict[str, Any]:
         return json.load(handle)
 
 
+def _require_application_metric_schema(run_config: Dict[str, Any]) -> None:
+    schema = str(run_config.get("application_metric_schema", ""))
+    if schema != APPLICATION_METRIC_SCHEMA:
+        raise ValueError(
+            "Pascucci paper plots require run_config "
+            f"application_metric_schema='{APPLICATION_METRIC_SCHEMA}', got {schema!r}"
+        )
+
+
 def plot_pascucci_paper_bundle_from_artifacts(
     *,
     stitched_npz_path: str,
@@ -402,6 +415,7 @@ def plot_pascucci_paper_bundle_from_artifacts(
     model_name = str(run_config.get("model_name", ""))
     if model_name != "pascucci":
         raise ValueError(f"Pascucci paper plots require run_config model_name='pascucci', got {model_name!r}")
+    _require_application_metric_schema(run_config)
     artifact_blocks = blocks
     if artifact_blocks is None:
         artifact_blocks = run_config.get("blocks", None)

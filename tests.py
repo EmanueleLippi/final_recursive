@@ -1779,7 +1779,7 @@ def test_model_spec_application_metric_names() -> None:
     assert getattr(quadratic, "application_metric_schema", None) == "none", (
         "quadratic_coupled must keep application metrics disabled"
     )
-    assert getattr(pascucci, "application_metric_schema", None) == "pascucci_application_metrics_v1", (
+    assert getattr(pascucci, "application_metric_schema", None) == "pascucci_application_metrics_v2", (
         "Pascucci must declare the application metric schema used by artifacts"
     )
     assert getattr(pascucci, "application_metric_names", None) == (
@@ -1924,15 +1924,21 @@ def test_pascucci_application_cost_summary_has_quantiles_and_metadata() -> None:
             const_value=0.75,
             baseline_mode="controlled",
         )
-        assert result["schema"] == "pascucci_application_metrics_v1"
+        assert result["schema"] == "pascucci_application_metrics_v2"
         assert result["metadata"]["baseline_mode"] == "controlled"
         assert result["metadata"]["aggregation"] == "left_riemann_f_plus_terminal_g"
         assert result["metadata"]["control_law"] == "alpha_tf"
 
         summary = result["summary"]
-        for metric_name in ("cost_J_running", "cost_J_terminal", "cost_J_total"):
-            pathwise = _numpy_cost_result_pathwise(result, metric_name)
-            flat = pathwise[:, 0]
+        for metric_name in ("cost_J_running", "cost_J_terminal", "cost_J_total", "cost_J_running_cumulative"):
+            if metric_name == "cost_J_running_cumulative":
+                cumulative = np.asarray(result["pathwise"][metric_name], dtype=np.float32)
+                assert cumulative.ndim == 3
+                assert cumulative.shape[1] > 0
+                flat = cumulative[:, -1, :].reshape(-1)
+            else:
+                pathwise = _numpy_cost_result_pathwise(result, metric_name)
+                flat = pathwise[:, 0]
             expected = {
                 "mean": float(np.mean(flat)),
                 "std": float(np.std(flat)),
@@ -1946,6 +1952,34 @@ def test_pascucci_application_cost_summary_has_quantiles_and_metadata() -> None:
                 assert isinstance(summary[key], float)
                 assert np.isfinite(summary[key])
                 np.testing.assert_allclose(summary[key], expected_value, rtol=1.0e-6, atol=1.0e-6)
+    finally:
+        model.close()
+
+
+def test_pascucci_application_cost_summary_handles_zero_step_cumulative() -> None:
+    from .model_specs import get_model_spec
+    from .tf_backend import reset_backend_state, set_seed
+
+    reset_backend_state()
+    set_seed(1011)
+
+    spec = get_model_spec("pascucci")
+    params = spec.build_default_params(const=0.75)
+    model = _build_pascucci_recursive_unit_model(params, M=3)
+
+    try:
+        pathwise = {
+            "cost_J_running": np.zeros((3, 1), dtype=np.float32),
+            "cost_J_terminal": np.asarray([[1.0], [2.0], [3.0]], dtype=np.float32),
+            "cost_J_total": np.asarray([[1.0], [2.0], [3.0]], dtype=np.float32),
+            "cost_J_running_cumulative": np.zeros((3, 0, 1), dtype=np.float32),
+        }
+        summary = model._application_summary_np(pathwise)
+        for suffix in ("mean", "std", "q05", "q50", "q95"):
+            key = f"cost_J_running_cumulative_{suffix}"
+            assert key in summary
+            assert isinstance(summary[key], float)
+            np.testing.assert_allclose(summary[key], 0.0, rtol=0.0, atol=0.0)
     finally:
         model.close()
 
@@ -4322,8 +4356,8 @@ def test_exact_path_plot_outputs() -> None:
             assert path.stat().st_size > 0, name
 
 
-def _pascucci_paper_plot_smoke_inputs():
-    M = 5
+def _pascucci_paper_plot_smoke_inputs(M: int = 5):
+    M = int(M)
     T_steps = 6
     t_grid = np.linspace(0.0, 5.0, T_steps, dtype=np.float32)
     t = np.tile(t_grid.reshape(1, T_steps, 1), (M, 1, 1)).astype(np.float32)
@@ -4397,7 +4431,7 @@ def test_pascucci_paper_plot_bundle_from_artifacts_smoke() -> None:
                 "T_total": 5.0,
                 "params": fixture["params"],
                 "state_labels": ["S", "H", "V", "X_state"],
-                "application_metric_schema": "pascucci_application_metrics_v1",
+                "application_metric_schema": "pascucci_application_metrics_v2",
                 "run_config_sha256": "0" * 64,
                 "seed_manifest": {"eval_seed": 1234, "visual_seed_effective": 5678},
                 "blocks": fixture["blocks"],
@@ -4436,6 +4470,49 @@ def test_pascucci_paper_plot_bundle_from_artifacts_smoke() -> None:
             assert entry["filename"].startswith("pascucci_paper_"), story
 
 
+def test_pascucci_paper_plot_bundle_handles_skewed_total_costs() -> None:
+    from .plotting import _PLOTTING_AVAILABLE
+
+    if not _PLOTTING_AVAILABLE:
+        return
+
+    from .pascucci_plotting import plot_pascucci_paper_bundle
+
+    controlled = np.concatenate(
+        [
+            np.zeros((96, 1), dtype=np.float32),
+            np.full((4, 1), 1000.0, dtype=np.float32),
+        ],
+        axis=0,
+    )
+    uncontrolled = np.concatenate(
+        [
+            np.full((4, 1), -1000.0, dtype=np.float32),
+            np.zeros((96, 1), dtype=np.float32),
+        ],
+        axis=0,
+    )
+    assert float(np.mean(controlled)) > float(np.quantile(controlled.reshape(-1), 0.95))
+    assert float(np.mean(uncontrolled)) < float(np.quantile(uncontrolled.reshape(-1), 0.05))
+
+    fixture = _pascucci_paper_plot_smoke_inputs(M=100)
+    pathwise = dict(fixture["application_pathwise"])
+    pathwise["controlled_cost_J_total"] = controlled
+    pathwise["uncontrolled_cost_J_total"] = uncontrolled
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest = plot_pascucci_paper_bundle(
+            stitched=fixture["stitched"],
+            application_pathwise=pathwise,
+            params=fixture["params"],
+            out_dir=str(Path(tmp) / "paper_plots"),
+            blocks=fixture["blocks"],
+            source_metadata={"model_name": "pascucci"},
+        )
+        plot_path = Path(tmp) / "paper_plots" / manifest["plots"]["#40"]["path"]
+        assert plot_path.exists()
+        assert plot_path.stat().st_size > 0
+
+
 def test_pascucci_paper_plot_bundle_loads_blocks_from_recursive_results() -> None:
     from .io_utils import save_blob_npz, save_json
     from .plotting import _PLOTTING_AVAILABLE
@@ -4456,7 +4533,7 @@ def test_pascucci_paper_plot_bundle_loads_blocks_from_recursive_results() -> Non
                 "T_total": 5.0,
                 "params": fixture["params"],
                 "state_labels": ["S", "H", "V", "X_state"],
-                "application_metric_schema": "pascucci_application_metrics_v1",
+                "application_metric_schema": "pascucci_application_metrics_v2",
                 "run_config_sha256": "2" * 64,
                 "seed_manifest": {"eval_seed": 11, "visual_seed_effective": 22},
             },
@@ -4512,6 +4589,47 @@ def test_pascucci_paper_plot_bundle_rejects_non_pascucci_run_config() -> None:
             assert "quadratic_coupled" in str(exc)
         else:
             raise AssertionError("Pascucci paper plots must reject non-Pascucci run configs")
+
+
+def test_pascucci_paper_plot_bundle_rejects_incompatible_application_schema() -> None:
+    from .io_utils import save_blob_npz, save_json
+    from .plotting import _PLOTTING_AVAILABLE
+
+    if not _PLOTTING_AVAILABLE:
+        return
+
+    from .pascucci_plotting import plot_pascucci_paper_bundle_from_artifacts
+
+    fixture = _pascucci_paper_plot_smoke_inputs()
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        stitched_path = tmp_path / "stitched_predictions_final.npz"
+        application_npz_path = tmp_path / "application_metrics_final.npz"
+        run_config_path = tmp_path / "run_config.json"
+        save_blob_npz(fixture["stitched"], str(stitched_path))
+        save_blob_npz(fixture["application_pathwise"], str(application_npz_path))
+        save_json(
+            {
+                "model_name": "pascucci",
+                "params": fixture["params"],
+                "application_metric_schema": "pascucci_application_metrics_v1",
+            },
+            str(run_config_path),
+        )
+        try:
+            plot_pascucci_paper_bundle_from_artifacts(
+                stitched_npz_path=str(stitched_path),
+                application_npz_path=str(application_npz_path),
+                run_config_path=str(run_config_path),
+                out_dir=str(tmp_path / "paper_plots"),
+            )
+        except ValueError as exc:
+            message = str(exc)
+            assert "application_metric_schema" in message
+            assert "pascucci_application_metrics_v2" in message
+            assert "pascucci_application_metrics_v1" in message
+        else:
+            raise AssertionError("Pascucci paper plots must reject incompatible application metric schemas")
 
 
 def test_pascucci_paper_plot_bundle_rejects_legacy_artifacts_without_cumulative_cost() -> None:
@@ -4571,7 +4689,7 @@ def test_cli_plot_pascucci_paper_from_artifacts_does_not_train() -> None:
                     "T_total": 5.0,
                     "params": fixture["params"],
                     "state_labels": ["S", "H", "V", "X_state"],
-                    "application_metric_schema": "pascucci_application_metrics_v1",
+                    "application_metric_schema": "pascucci_application_metrics_v2",
                     "run_config_sha256": "1" * 64,
                     "seed_manifest": {"eval_seed": 11, "visual_seed_effective": 22},
                     "blocks": fixture["blocks"],
@@ -5381,7 +5499,7 @@ def test_print_recursive_pass_saves_stitched_moment_traces() -> None:
                     assert not any(key.startswith(("params_", "weights_")) for key in keys)
             for filename in ("application_metrics_pass00.json", "application_metrics_final.json"):
                 payload = json.loads((rec_dir / filename).read_text(encoding="utf-8"))
-                assert payload["schema"] == "pascucci_application_metrics_v1"
+                assert payload["schema"] == "pascucci_application_metrics_v2"
                 assert payload["model_name"] == "pascucci"
                 assert payload["controlled"]["metadata"]["baseline_mode"] == "controlled"
                 assert payload["uncontrolled"]["metadata"]["baseline_mode"] == "uncontrolled"
@@ -5431,14 +5549,19 @@ def test_print_recursive_pass_application_metrics_emit_comparison_and_stability(
     z_v_index = 1
 
     class FakeApplicationModel:
-        def _summary(self, running, terminal, total):
+        def _summary(self, running, terminal, total, running_cumulative):
             summary = {}
             for key, values in (
                 ("cost_J_running", running),
                 ("cost_J_terminal", terminal),
                 ("cost_J_total", total),
+                ("cost_J_running_cumulative", running_cumulative),
             ):
-                flat = np.asarray(values, dtype=np.float32).reshape(-1)
+                values_np = np.asarray(values, dtype=np.float32)
+                if key == "cost_J_running_cumulative":
+                    flat = values_np[:, -1, :].reshape(-1) if values_np.shape[1] > 0 else np.zeros((values_np.shape[0],), dtype=np.float32)
+                else:
+                    flat = values_np.reshape(-1)
                 summary[f"{key}_mean"] = float(np.mean(flat))
                 summary[f"{key}_std"] = float(np.std(flat))
                 summary[f"{key}_q05"] = float(np.quantile(flat, 0.05))
@@ -5448,11 +5571,17 @@ def test_print_recursive_pass_application_metrics_emit_comparison_and_stability(
 
         def _result(self, *, t, cost_seed, alpha, baseline_mode, control_law, paired_inputs):
             M_local = int(alpha.shape[0])
+            steps = int(alpha.shape[1])
             running = np.full((M_local, 1), np.float32(cost_seed), dtype=np.float32)
+            if steps > 0:
+                running_step = np.full((M_local, steps, 1), np.float32(cost_seed / steps), dtype=np.float32)
+                running_cumulative = np.cumsum(running_step, axis=1).astype(np.float32)
+            else:
+                running_cumulative = np.zeros((M_local, 0, 1), dtype=np.float32)
             terminal = np.full((M_local, 1), np.float32(0.25), dtype=np.float32)
             total = running + terminal
             return {
-                "schema": "pascucci_application_metrics_v1",
+                "schema": "pascucci_application_metrics_v2",
                 "metadata": {
                     "baseline_mode": baseline_mode,
                     "aggregation": "left_riemann_f_plus_terminal_g",
@@ -5463,9 +5592,10 @@ def test_print_recursive_pass_application_metrics_emit_comparison_and_stability(
                     "cost_J_running": running,
                     "cost_J_terminal": terminal,
                     "cost_J_total": total,
+                    "cost_J_running_cumulative": running_cumulative,
                     "alpha": alpha.astype(np.float32),
                 },
-                "summary": self._summary(running, terminal, total),
+                "summary": self._summary(running, terminal, total, running_cumulative),
             }
 
         def application_cost_from_path(self, t, X, Y, Z, const_value=None, baseline_mode="controlled", **kwargs):
@@ -5511,7 +5641,7 @@ def test_print_recursive_pass_application_metrics_emit_comparison_and_stability(
         build_exact_solution=lambda *args, **kwargs: None,
         build_exact_initial_boundary_samples=None,
         moment_names=base.moment_names,
-        application_metric_schema="pascucci_application_metrics_v1",
+        application_metric_schema="pascucci_application_metrics_v2",
         application_metric_names=base.application_metric_names,
         application_metric_aggregation=base.application_metric_aggregation,
     )
@@ -5821,14 +5951,32 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
             terminal = np.full((M, 1), base + np.float32(0.25), dtype=np.float32)
             total = running + terminal
             alpha = np.zeros((M, steps, 1), dtype=np.float32)
+            if steps > 0:
+                running_cumulative = np.cumsum(
+                    np.full((M, steps, 1), base / np.float32(steps), dtype=np.float32),
+                    axis=1,
+                ).astype(np.float32)
+            else:
+                running_cumulative = np.zeros((M, 0, 1), dtype=np.float32)
             pathwise = {
                 "cost_J_running": running,
                 "cost_J_terminal": terminal,
                 "cost_J_total": total,
+                "cost_J_running_cumulative": running_cumulative,
                 "alpha": alpha,
             }
+            summary = {}
+            for metric, values in pathwise.items():
+                if not metric.startswith("cost_J_"):
+                    continue
+                values_np = np.asarray(values, dtype=np.float32)
+                if metric == "cost_J_running_cumulative":
+                    flat = values_np[:, -1, :].reshape(-1) if values_np.shape[1] > 0 else np.zeros((values_np.shape[0],), dtype=np.float32)
+                else:
+                    flat = values_np.reshape(-1)
+                summary[f"{metric}_mean"] = float(flat.mean())
             return {
-                "schema": "pascucci_application_metrics_v1",
+                "schema": "pascucci_application_metrics_v2",
                 "metadata": {
                     "baseline_mode": mode,
                     "aggregation": "left_riemann_f_plus_terminal_g",
@@ -5836,12 +5984,7 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
                     "paired_inputs": "same_t_W_Xi",
                 },
                 "pathwise": pathwise,
-                "summary": {
-                    f"{metric}_{suffix}": float(np.asarray(values).reshape(-1).mean())
-                    for metric, values in pathwise.items()
-                    if metric.startswith("cost_J_")
-                    for suffix in ("mean",)
-                },
+                "summary": summary,
             }
 
     standard_calls = []
@@ -6021,7 +6164,7 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
                     assert config["application_metric_names"] == []
                     assert config["application_metric_aggregation"] == "none"
                 else:
-                    assert config["application_metric_schema"] == "pascucci_application_metrics_v1"
+                    assert config["application_metric_schema"] == "pascucci_application_metrics_v2"
                     assert config["application_metric_names"] == [
                         "cost_J_running",
                         "cost_J_terminal",
@@ -6191,14 +6334,32 @@ def test_cli_records_application_metric_manifest_in_run_config() -> None:
             running = np.full((M, 1), base, dtype=np.float32)
             terminal = np.full((M, 1), base + np.float32(0.25), dtype=np.float32)
             total = running + terminal
+            if steps > 0:
+                running_cumulative = np.cumsum(
+                    np.full((M, steps, 1), base / np.float32(steps), dtype=np.float32),
+                    axis=1,
+                ).astype(np.float32)
+            else:
+                running_cumulative = np.zeros((M, 0, 1), dtype=np.float32)
             pathwise = {
                 "cost_J_running": running,
                 "cost_J_terminal": terminal,
                 "cost_J_total": total,
+                "cost_J_running_cumulative": running_cumulative,
                 "alpha": np.zeros((M, steps, 1), dtype=np.float32),
             }
+            summary = {}
+            for metric, values in pathwise.items():
+                if not metric.startswith("cost_J_"):
+                    continue
+                values_np = np.asarray(values, dtype=np.float32)
+                if metric == "cost_J_running_cumulative":
+                    flat = values_np[:, -1, :].reshape(-1) if values_np.shape[1] > 0 else np.zeros((values_np.shape[0],), dtype=np.float32)
+                else:
+                    flat = values_np.reshape(-1)
+                summary[f"{metric}_mean"] = float(flat.mean())
             return {
-                "schema": "pascucci_application_metrics_v1",
+                "schema": "pascucci_application_metrics_v2",
                 "metadata": {
                     "baseline_mode": mode,
                     "aggregation": "left_riemann_f_plus_terminal_g",
@@ -6206,11 +6367,7 @@ def test_cli_records_application_metric_manifest_in_run_config() -> None:
                     "paired_inputs": "same_t_W_Xi",
                 },
                 "pathwise": pathwise,
-                "summary": {
-                    f"{metric}_mean": float(np.asarray(values).reshape(-1).mean())
-                    for metric, values in pathwise.items()
-                    if metric.startswith("cost_J_")
-                },
+                "summary": summary,
             }
 
     def fake_run_standard_reference(**kwargs):
@@ -6273,7 +6430,7 @@ def test_cli_records_application_metric_manifest_in_run_config() -> None:
             runs = sorted(out_dir.glob("run_*"))
             assert len(runs) == 1
             config = json.loads((runs[0] / "run_config.json").read_text(encoding="utf-8"))
-            assert config["application_metric_schema"] == "pascucci_application_metrics_v1"
+            assert config["application_metric_schema"] == "pascucci_application_metrics_v2"
             assert config["application_metric_names"] == [
                 "cost_J_running",
                 "cost_J_terminal",
@@ -6298,7 +6455,7 @@ def test_cli_records_application_metric_manifest_in_run_config() -> None:
             assert app_json.exists()
             assert app_npz.exists()
             payload = json.loads(app_json.read_text(encoding="utf-8"))
-            assert payload["schema"] == "pascucci_application_metrics_v1"
+            assert payload["schema"] == "pascucci_application_metrics_v2"
             assert payload["controlled"]["metadata"]["baseline_mode"] == "controlled"
             assert payload["uncontrolled"]["metadata"]["baseline_mode"] == "uncontrolled"
             assert payload["horizon"]["eval_seed"] == 222
@@ -6321,7 +6478,7 @@ def test_run_config_sha256_excludes_timestamp_metadata() -> None:
         "model_name": "pascucci",
         "M": 4,
         "N": 2,
-        "application_metric_schema": "pascucci_application_metrics_v1",
+        "application_metric_schema": "pascucci_application_metrics_v2",
     }
     config_b = dict(config_a)
     config_b["timestamp"] = "run_20260609_120001"
@@ -6508,7 +6665,7 @@ def test_cli_records_pascucci_cost_profile_params_in_recursive_run_config() -> N
             assert len(runs) == 1
             config = json.loads((runs[0] / "run_config.json").read_text(encoding="utf-8"))
             assert config["mode"] == "recursive"
-            assert config["application_metric_schema"] == "pascucci_application_metrics_v1"
+            assert config["application_metric_schema"] == "pascucci_application_metrics_v2"
             assert config["application_metric_names"] == [
                 "cost_J_running",
                 "cost_J_terminal",
@@ -7267,6 +7424,10 @@ def run_tests(argv: List[str] | None = None) -> int:
             test_pascucci_paper_plot_bundle_from_artifacts_smoke,
         ),
         (
+            "pascucci_paper_plot_bundle_handles_skewed_total_costs",
+            test_pascucci_paper_plot_bundle_handles_skewed_total_costs,
+        ),
+        (
             "cli_plot_pascucci_paper_from_artifacts_does_not_train",
             test_cli_plot_pascucci_paper_from_artifacts_does_not_train,
         ),
@@ -7277,6 +7438,10 @@ def run_tests(argv: List[str] | None = None) -> int:
         (
             "pascucci_paper_plot_bundle_rejects_non_pascucci_run_config",
             test_pascucci_paper_plot_bundle_rejects_non_pascucci_run_config,
+        ),
+        (
+            "pascucci_paper_plot_bundle_rejects_incompatible_application_schema",
+            test_pascucci_paper_plot_bundle_rejects_incompatible_application_schema,
         ),
         (
             "pascucci_paper_plot_bundle_rejects_legacy_artifacts_without_cumulative_cost",
@@ -7310,6 +7475,10 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "pascucci_application_cost_summary_has_quantiles_and_metadata",
         "test_pascucci_application_cost_summary_has_quantiles_and_metadata",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_application_cost_summary_handles_zero_step_cumulative",
+        "test_pascucci_application_cost_summary_handles_zero_step_cumulative",
     ) and ok
     ok = _run_subprocess_case(
         "pascucci_application_cost_functional_restores_const_state",
