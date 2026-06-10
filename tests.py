@@ -1786,6 +1786,7 @@ def test_model_spec_application_metric_names() -> None:
         "cost_J_running",
         "cost_J_terminal",
         "cost_J_total",
+        "cost_J_running_cumulative",
     ), "Pascucci must declare cost J components before metrics are emitted"
     assert set(pascucci.moment_names).isdisjoint(pascucci.application_metric_names)
 
@@ -1891,6 +1892,11 @@ def test_pascucci_application_cost_functional_decomposes_to_f_plus_g() -> None:
             rtol=1.0e-6,
             atol=1.0e-6,
         )
+        expected_cumulative = np.cumsum(np.stack(running_terms, axis=1), axis=1).astype(np.float32)
+        cumulative = np.asarray(result["pathwise"]["cost_J_running_cumulative"], dtype=np.float32)
+        assert cumulative.shape == (t_batch.shape[0], t_batch.shape[1] - 1, 1)
+        np.testing.assert_allclose(cumulative, expected_cumulative, rtol=1.0e-6, atol=1.0e-6)
+        np.testing.assert_allclose(cumulative[:, -1, :], expected_running, rtol=1.0e-6, atol=1.0e-6)
     finally:
         model.close()
 
@@ -4316,6 +4322,279 @@ def test_exact_path_plot_outputs() -> None:
             assert path.stat().st_size > 0, name
 
 
+def _pascucci_paper_plot_smoke_inputs():
+    M = 5
+    T_steps = 6
+    t_grid = np.linspace(0.0, 5.0, T_steps, dtype=np.float32)
+    t = np.tile(t_grid.reshape(1, T_steps, 1), (M, 1, 1)).astype(np.float32)
+    path_offsets = np.linspace(-0.08, 0.08, M, dtype=np.float32).reshape(M, 1)
+    X = np.zeros((M, T_steps, 4), dtype=np.float32)
+    X[:, :, 0] = 1.0 + 0.04 * t_grid.reshape(1, -1) + path_offsets
+    X[:, :, 1] = -0.4 + 0.05 * np.sin(t_grid.reshape(1, -1)) + path_offsets
+    X[:, :, 2] = 0.2 + 0.03 * t_grid.reshape(1, -1) + 0.5 * path_offsets
+    X[:, :, 3] = 4.0 + 0.15 * t_grid.reshape(1, -1) + 2.0 * path_offsets
+    Y = np.zeros((M, T_steps, 1), dtype=np.float32)
+    Z = np.zeros((M, T_steps, 4), dtype=np.float32)
+    Z[:, :, 2] = 0.1 + 0.02 * t_grid.reshape(1, -1)
+    steps = T_steps - 1
+    alpha_time = np.linspace(-0.4, 0.4, steps, dtype=np.float32).reshape(1, steps, 1)
+    controlled_alpha = alpha_time + path_offsets.reshape(M, 1, 1)
+    uncontrolled_alpha = np.zeros_like(controlled_alpha)
+    controlled_increment = (0.2 + np.abs(controlled_alpha)).astype(np.float32)
+    uncontrolled_increment = (0.3 + 0.1 * np.ones_like(uncontrolled_alpha)).astype(np.float32)
+    controlled_cumulative = np.cumsum(controlled_increment, axis=1).astype(np.float32)
+    uncontrolled_cumulative = np.cumsum(uncontrolled_increment, axis=1).astype(np.float32)
+    controlled_terminal = np.full((M, 1), 0.25, dtype=np.float32)
+    uncontrolled_terminal = np.full((M, 1), 0.35, dtype=np.float32)
+    application_pathwise = {
+        "controlled_cost_J_running": controlled_cumulative[:, -1, :],
+        "controlled_cost_J_terminal": controlled_terminal,
+        "controlled_cost_J_total": controlled_cumulative[:, -1, :] + controlled_terminal,
+        "controlled_cost_J_running_cumulative": controlled_cumulative,
+        "controlled_alpha": controlled_alpha,
+        "uncontrolled_cost_J_running": uncontrolled_cumulative[:, -1, :],
+        "uncontrolled_cost_J_terminal": uncontrolled_terminal,
+        "uncontrolled_cost_J_total": uncontrolled_cumulative[:, -1, :] + uncontrolled_terminal,
+        "uncontrolled_cost_J_running_cumulative": uncontrolled_cumulative,
+        "uncontrolled_alpha": uncontrolled_alpha,
+    }
+    params = _default_pascucci_params(const=0.75)
+    params["params_S"]["a0_day"] = np.float32(1.1)
+    params["params_S"]["a0_night"] = np.float32(0.9)
+    params["params_H"]["a0_day"] = np.float32(-0.3)
+    params["params_H"]["a0_night"] = np.float32(-0.5)
+    return {
+        "stitched": {"t": t, "X": X, "Y": Y, "Z": Z},
+        "application_pathwise": application_pathwise,
+        "params": params,
+        "blocks": [{"idx": 0, "t_start": 0.0, "t_end": 5.0, "T_block": 5.0}],
+    }
+
+
+def test_pascucci_paper_plot_bundle_from_artifacts_smoke() -> None:
+    from .io_utils import save_blob_npz, save_json
+    from .plotting import _PLOTTING_AVAILABLE
+
+    if not _PLOTTING_AVAILABLE:
+        return
+
+    try:
+        from .pascucci_plotting import plot_pascucci_paper_bundle_from_artifacts
+    except ImportError as exc:
+        raise AssertionError("Sprint 19 needs a Pascucci paper-plot artifact pipeline") from exc
+
+    fixture = _pascucci_paper_plot_smoke_inputs()
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        stitched_path = tmp_path / "stitched_predictions_final.npz"
+        application_npz_path = tmp_path / "application_metrics_final.npz"
+        run_config_path = tmp_path / "run_config.json"
+        save_blob_npz(fixture["stitched"], str(stitched_path))
+        save_blob_npz(fixture["application_pathwise"], str(application_npz_path))
+        save_json(
+            {
+                "model_name": "pascucci",
+                "T_total": 5.0,
+                "params": fixture["params"],
+                "state_labels": ["S", "H", "V", "X_state"],
+                "application_metric_schema": "pascucci_application_metrics_v1",
+                "run_config_sha256": "0" * 64,
+                "seed_manifest": {"eval_seed": 1234, "visual_seed_effective": 5678},
+                "blocks": fixture["blocks"],
+            },
+            str(run_config_path),
+        )
+
+        manifest = plot_pascucci_paper_bundle_from_artifacts(
+            stitched_npz_path=str(stitched_path),
+            application_npz_path=str(application_npz_path),
+            run_config_path=str(run_config_path),
+            out_dir=str(tmp_path / "paper_plots"),
+            source_label="synthetic_smoke",
+        )
+
+        assert manifest["schema"] == "pascucci_paper_plots_v1"
+        assert manifest["model_name"] == "pascucci"
+        assert manifest["source"]["source_label"] == "synthetic_smoke"
+        assert manifest["source"]["run_config_sha256"] == "0" * 64
+        assert manifest["cost_trace_source"] == "cost_J_running_cumulative"
+        assert manifest["controlled_uncontrolled_available"] is True
+        assert manifest["plot_path_policy"] == "relative_to_manifest_dir"
+        assert manifest["blocks"] == fixture["blocks"]
+        expected_stories = {"#35", "#36", "#37", "#38", "#39", "#40"}
+        assert set(manifest["plots"]) == expected_stories
+        manifest_path = tmp_path / "paper_plots" / "pascucci_paper_plots_manifest.json"
+        assert manifest_path.exists()
+        saved_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert saved_manifest["plots"].keys() == manifest["plots"].keys()
+        for story, entry in manifest["plots"].items():
+            assert not Path(entry["path"]).is_absolute(), story
+            assert entry["path_relative_to"] == "manifest_dir", story
+            plot_path = manifest_path.parent / entry["path"]
+            assert plot_path.exists(), story
+            assert plot_path.stat().st_size > 0, story
+            assert entry["filename"].startswith("pascucci_paper_"), story
+
+
+def test_pascucci_paper_plot_bundle_loads_blocks_from_recursive_results() -> None:
+    from .io_utils import save_blob_npz, save_json
+    from .plotting import _PLOTTING_AVAILABLE
+
+    if not _PLOTTING_AVAILABLE:
+        return
+
+    from .pascucci_plotting import plot_pascucci_paper_bundle_from_artifacts
+
+    fixture = _pascucci_paper_plot_smoke_inputs()
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = Path(tmp) / "run_20260610_000000"
+        rec_dir = run_dir / "recursive"
+        rec_dir.mkdir(parents=True)
+        save_json(
+            {
+                "model_name": "pascucci",
+                "T_total": 5.0,
+                "params": fixture["params"],
+                "state_labels": ["S", "H", "V", "X_state"],
+                "application_metric_schema": "pascucci_application_metrics_v1",
+                "run_config_sha256": "2" * 64,
+                "seed_manifest": {"eval_seed": 11, "visual_seed_effective": 22},
+            },
+            str(run_dir / "run_config.json"),
+        )
+        save_json({"blocks": fixture["blocks"]}, str(rec_dir / "results.json"))
+        save_blob_npz(fixture["stitched"], str(rec_dir / "stitched_predictions_final.npz"))
+        save_blob_npz(fixture["application_pathwise"], str(rec_dir / "application_metrics_final.npz"))
+
+        manifest = plot_pascucci_paper_bundle_from_artifacts(
+            stitched_npz_path=str(rec_dir / "stitched_predictions_final.npz"),
+            application_npz_path=str(rec_dir / "application_metrics_final.npz"),
+            run_config_path=str(run_dir / "run_config.json"),
+            out_dir=str(rec_dir / "plots" / "pascucci_paper"),
+        )
+
+        assert manifest["blocks"] == fixture["blocks"]
+
+
+def test_pascucci_paper_plot_bundle_rejects_non_pascucci_run_config() -> None:
+    from .io_utils import save_blob_npz, save_json
+    from .plotting import _PLOTTING_AVAILABLE
+
+    if not _PLOTTING_AVAILABLE:
+        return
+
+    from .pascucci_plotting import plot_pascucci_paper_bundle_from_artifacts
+
+    fixture = _pascucci_paper_plot_smoke_inputs()
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        stitched_path = tmp_path / "stitched_predictions_final.npz"
+        application_npz_path = tmp_path / "application_metrics_final.npz"
+        run_config_path = tmp_path / "run_config.json"
+        save_blob_npz(fixture["stitched"], str(stitched_path))
+        save_blob_npz(fixture["application_pathwise"], str(application_npz_path))
+        save_json(
+            {
+                "model_name": "quadratic_coupled",
+                "params": fixture["params"],
+            },
+            str(run_config_path),
+        )
+        try:
+            plot_pascucci_paper_bundle_from_artifacts(
+                stitched_npz_path=str(stitched_path),
+                application_npz_path=str(application_npz_path),
+                run_config_path=str(run_config_path),
+                out_dir=str(tmp_path / "paper_plots"),
+            )
+        except ValueError as exc:
+            assert "model_name='pascucci'" in str(exc)
+            assert "quadratic_coupled" in str(exc)
+        else:
+            raise AssertionError("Pascucci paper plots must reject non-Pascucci run configs")
+
+
+def test_pascucci_paper_plot_bundle_rejects_legacy_artifacts_without_cumulative_cost() -> None:
+    from .plotting import _PLOTTING_AVAILABLE
+
+    if not _PLOTTING_AVAILABLE:
+        return
+
+    from .pascucci_plotting import plot_pascucci_paper_bundle
+
+    fixture = _pascucci_paper_plot_smoke_inputs()
+    legacy_pathwise = dict(fixture["application_pathwise"])
+    del legacy_pathwise["controlled_cost_J_running_cumulative"]
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            plot_pascucci_paper_bundle(
+                stitched=fixture["stitched"],
+                application_pathwise=legacy_pathwise,
+                params=fixture["params"],
+                out_dir=str(Path(tmp) / "paper_plots"),
+                blocks=fixture["blocks"],
+                source_metadata={"model_name": "pascucci"},
+            )
+        except ValueError as exc:
+            message = str(exc)
+            assert "controlled_cost_J_running_cumulative" in message
+            assert "pascucci_paper_plots_v1" in message
+            assert "Sprint 19 cumulative running-cost traces" in message
+        else:
+            raise AssertionError("legacy Pascucci artifacts without cumulative cost must fail clearly")
+
+
+def test_cli_plot_pascucci_paper_from_artifacts_does_not_train() -> None:
+    from . import cli
+    from .io_utils import save_blob_npz, save_json
+    from .plotting import _PLOTTING_AVAILABLE
+
+    if not _PLOTTING_AVAILABLE:
+        return
+
+    fixture = _pascucci_paper_plot_smoke_inputs()
+    original_run_program = cli.run_program
+
+    def forbidden_run_program(argv=None):
+        del argv
+        raise AssertionError("plot-only command must not call run_program or start training")
+
+    cli.run_program = forbidden_run_program
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run_20260610_000000"
+            rec_dir = run_dir / "recursive"
+            rec_dir.mkdir(parents=True)
+            save_json(
+                {
+                    "model_name": "pascucci",
+                    "T_total": 5.0,
+                    "params": fixture["params"],
+                    "state_labels": ["S", "H", "V", "X_state"],
+                    "application_metric_schema": "pascucci_application_metrics_v1",
+                    "run_config_sha256": "1" * 64,
+                    "seed_manifest": {"eval_seed": 11, "visual_seed_effective": 22},
+                    "blocks": fixture["blocks"],
+                },
+                str(run_dir / "run_config.json"),
+            )
+            save_blob_npz(fixture["stitched"], str(rec_dir / "stitched_predictions_final.npz"))
+            save_blob_npz(fixture["application_pathwise"], str(rec_dir / "application_metrics_final.npz"))
+            exit_code = cli.main(["plot", "--run_dir", str(run_dir)])
+            assert exit_code == 0
+            manifest_path = rec_dir / "plots" / "pascucci_paper" / "pascucci_paper_plots_manifest.json"
+            assert manifest_path.exists()
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            assert set(manifest["plots"]) == {"#35", "#36", "#37", "#38", "#39", "#40"}
+            assert manifest["source"]["run_dir"] == str(run_dir)
+            assert manifest["blocks"] == fixture["blocks"]
+            for entry in manifest["plots"].values():
+                assert not Path(entry["path"]).is_absolute()
+                assert (manifest_path.parent / entry["path"]).exists()
+    finally:
+        cli.run_program = original_run_program
+
+
 def test_tf2_model_smoke_and_blob_roundtrip() -> None:
     from .models import NN_Quadratic_Coupled_Recursive
     from .tf_backend import set_seed, tf
@@ -5122,14 +5401,18 @@ def test_print_recursive_pass_saves_stitched_moment_traces() -> None:
                         "controlled_cost_J_running",
                         "controlled_cost_J_terminal",
                         "controlled_cost_J_total",
+                        "controlled_cost_J_running_cumulative",
                         "controlled_alpha",
                         "uncontrolled_cost_J_running",
                         "uncontrolled_cost_J_terminal",
                         "uncontrolled_cost_J_total",
+                        "uncontrolled_cost_J_running_cumulative",
                         "uncontrolled_alpha",
                     }.issubset(keys)
                     assert data["controlled_cost_J_total"].shape == (4, 1)
                     assert data["uncontrolled_cost_J_total"].shape == (4, 1)
+                    assert data["controlled_cost_J_running_cumulative"].shape == (4, 2, 1)
+                    assert data["uncontrolled_cost_J_running_cumulative"].shape == (4, 2, 1)
     finally:
         orchestration.predict_recursive_stitched = original_predict
         orchestration.plot_recursive_pass_logs_multi = original_plot_logs
@@ -5743,6 +6026,7 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
                         "cost_J_running",
                         "cost_J_terminal",
                         "cost_J_total",
+                        "cost_J_running_cumulative",
                     ]
                     assert config["application_metric_aggregation"] == "left_riemann_f_plus_terminal_g"
 
@@ -5994,6 +6278,7 @@ def test_cli_records_application_metric_manifest_in_run_config() -> None:
                 "cost_J_running",
                 "cost_J_terminal",
                 "cost_J_total",
+                "cost_J_running_cumulative",
             ]
             assert config["application_metric_aggregation"] == "left_riemann_f_plus_terminal_g"
             assert config["seed_manifest"] == {
@@ -6228,6 +6513,7 @@ def test_cli_records_pascucci_cost_profile_params_in_recursive_run_config() -> N
                 "cost_J_running",
                 "cost_J_terminal",
                 "cost_J_total",
+                "cost_J_running_cumulative",
             ]
             assert config["application_metric_aggregation"] == "left_riemann_f_plus_terminal_g"
             assert config["seed_manifest"]["eval_seed"] == 1234
@@ -6976,6 +7262,26 @@ def run_tests(argv: List[str] | None = None) -> int:
         ),
         ("model_spec_params_overlay_preserves_solver_flags", test_model_spec_params_overlay_preserves_solver_flags),
         ("exact_path_plot_outputs", test_exact_path_plot_outputs),
+        (
+            "pascucci_paper_plot_bundle_from_artifacts_smoke",
+            test_pascucci_paper_plot_bundle_from_artifacts_smoke,
+        ),
+        (
+            "cli_plot_pascucci_paper_from_artifacts_does_not_train",
+            test_cli_plot_pascucci_paper_from_artifacts_does_not_train,
+        ),
+        (
+            "pascucci_paper_plot_bundle_loads_blocks_from_recursive_results",
+            test_pascucci_paper_plot_bundle_loads_blocks_from_recursive_results,
+        ),
+        (
+            "pascucci_paper_plot_bundle_rejects_non_pascucci_run_config",
+            test_pascucci_paper_plot_bundle_rejects_non_pascucci_run_config,
+        ),
+        (
+            "pascucci_paper_plot_bundle_rejects_legacy_artifacts_without_cumulative_cost",
+            test_pascucci_paper_plot_bundle_rejects_legacy_artifacts_without_cumulative_cost,
+        ),
     ]
 
     ok = True

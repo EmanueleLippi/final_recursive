@@ -16,6 +16,7 @@ from .application_metrics import summarize_application_alpha, summarize_controll
 from .exact import compute_stitched_exact_bundle, save_exact_error_timeseries_csv
 from .io_utils import export_standard_parameter_blob, save_blob_npz, save_json, save_rows_csv, _to_serializable
 from .naming import _pass_index, _pass_label
+from .pascucci_plotting import plot_pascucci_paper_bundle_from_artifacts
 from .plotting import plot_recursive_exact_comparison, plot_stage_logs, _PLOTTING_AVAILABLE
 from .sampling import build_blocks, build_stitched_rollout_inputs, summarize_boundary_samples
 from .schedules import load_training_plan_csv, parse_float_sequence_arg, resolve_coarse_curriculum_schedule
@@ -1065,11 +1066,59 @@ def run_program(argv: Optional[List[str]] = None):
         save_json(rec_summary, os.path.join(rec_dir, "results.json"))
 
 
+def plot_program(argv: Optional[List[str]] = None) -> dict:
+    parser = argparse.ArgumentParser(description="Generate Pascucci paper plots from saved artifacts")
+    parser.add_argument("--run_dir", type=str, required=True, help="Run directory containing run_config.json")
+    parser.add_argument(
+        "--recursive_dir",
+        type=str,
+        default="",
+        help="Optional recursive artifact directory. Defaults to RUN_DIR/recursive.",
+    )
+    parser.add_argument(
+        "--out_dir",
+        type=str,
+        default="",
+        help="Output directory. Defaults to RECURSIVE_DIR/plots/pascucci_paper.",
+    )
+    parser.add_argument(
+        "--source_label",
+        type=str,
+        default="plot_command",
+        help="Reader-facing source label recorded in the plot manifest.",
+    )
+    args = parser.parse_args(argv)
+
+    run_dir = os.path.abspath(os.path.expanduser(args.run_dir))
+    recursive_dir = (
+        os.path.abspath(os.path.expanduser(args.recursive_dir))
+        if str(args.recursive_dir or "").strip()
+        else os.path.join(run_dir, "recursive")
+    )
+    out_dir = (
+        os.path.abspath(os.path.expanduser(args.out_dir))
+        if str(args.out_dir or "").strip()
+        else os.path.join(recursive_dir, "plots", "pascucci_paper")
+    )
+    manifest = plot_pascucci_paper_bundle_from_artifacts(
+        stitched_npz_path=os.path.join(recursive_dir, "stitched_predictions_final.npz"),
+        application_npz_path=os.path.join(recursive_dir, "application_metrics_final.npz"),
+        run_config_path=os.path.join(run_dir, "run_config.json"),
+        out_dir=out_dir,
+        source_label=str(args.source_label),
+    )
+    print(f"[Plot] Pascucci paper plots written to {out_dir}")
+    return manifest
+
+
 def main(argv: Optional[List[str]] = None) -> int:
-    """Single access point: `run` executes the solver, `test` runs checks."""
+    """Single access point: `run` executes the solver, `plot` post-processes, `test` runs checks."""
     argv = list(sys.argv[1:] if argv is None else argv)
     if len(argv) > 0 and argv[0] == "test":
         return run_tests(argv[1:])
+    if len(argv) > 0 and argv[0] == "plot":
+        plot_program(argv[1:])
+        return 0
     if len(argv) > 0 and argv[0] == "run":
         argv = argv[1:]
     run_program(argv)
