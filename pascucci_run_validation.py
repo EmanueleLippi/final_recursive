@@ -30,6 +30,12 @@ EXPECTED_PAPER_PLOTS = (
     "pascucci_paper_39_state_bands_S_V_Q.png",
     "pascucci_paper_40_controlled_uncontrolled.png",
 )
+MAX_SELECTED_SCORE_RATIO_VS_PASS0 = 1.25
+MAX_SELECTED_SCORE_ABS_INCREASE_VS_PASS0 = 0.05
+MIN_FINAL_CONTROL_WIN_RATE = 0.5
+MAX_FINAL_DELTA_COST_MEAN = 0.0
+MAX_FINAL_VIOLATION_RATE = 0.2
+MAX_FINAL_VIOLATION_RATE_INCREASE_VS_PASS0 = 0.1
 
 
 def _read_json(path: Path, failures: Optional[list[str]] = None) -> Optional[dict]:
@@ -105,6 +111,107 @@ def _check_csv_logs(path: Path, failures: list[str]) -> None:
                 value = float("nan")
             if not math.isfinite(value):
                 failures.append(f"{path}:{field} non-finite in block {row.get('block')}")
+
+
+def _load_csv_logs(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _score_log_rows(rows: list[dict[str, str]], loss_key: str = "eval_mean_loss_per_sample") -> Optional[float]:
+    scores: list[float] = []
+    for row in rows:
+        try:
+            value = float(row.get(loss_key, "nan"))
+        except ValueError:
+            return None
+        if not math.isfinite(value):
+            return None
+        scores.append(value)
+    if len(scores) == 0:
+        return None
+    return float(np.mean(scores) + 0.35 * max(scores))
+
+
+def _nested_float(payload: dict, keys: tuple[str, ...]) -> Optional[float]:
+    current: Any = payload
+    for key in keys:
+        if not isinstance(current, dict) or key not in current:
+            return None
+        current = current[key]
+    if not _is_finite_scalar(current):
+        return None
+    return float(current)
+
+
+def _check_science_gate(rec_dir: Path, results: Optional[dict], failures: list[str]) -> None:
+    if results is None:
+        return
+    selected_pass_id = results.get("selected_pass_id")
+    if selected_pass_id not in (1, 2):
+        return
+
+    pass0_rows = _load_csv_logs(rec_dir / "pass_00_logs.csv")
+    selected_rows = _load_csv_logs(rec_dir / f"pass_{int(selected_pass_id) - 1:02d}_logs.csv")
+    pass0_score = _score_log_rows(pass0_rows)
+    selected_score = _score_log_rows(selected_rows)
+    if pass0_score is not None and selected_score is not None and int(selected_pass_id) != 1:
+        allowed_score = max(
+            pass0_score * MAX_SELECTED_SCORE_RATIO_VS_PASS0,
+            pass0_score + MAX_SELECTED_SCORE_ABS_INCREASE_VS_PASS0,
+        )
+        if selected_score > allowed_score:
+            failures.append(
+                "science gate: selected pass is dominated by pass0 loss score "
+                f"(selected_pass_id={selected_pass_id}, selected_score={selected_score:.6g}, "
+                f"pass0_score={pass0_score:.6g}, allowed={allowed_score:.6g})"
+            )
+
+    pass0_metrics = _read_json(rec_dir / "application_metrics_pass00.json")
+    final_metrics = _read_json(rec_dir / "application_metrics_final.json")
+    if final_metrics is None:
+        return
+    final_delta = _nested_float(final_metrics, ("comparison", "delta_cost_J_total_mean"))
+    if final_delta is None:
+        failures.append("science gate: final comparison.delta_cost_J_total_mean missing or non-finite")
+    elif final_delta > MAX_FINAL_DELTA_COST_MEAN:
+        failures.append(
+            "science gate: selected pass controlled cost is worse than uncontrolled "
+            f"(delta_cost_J_total_mean={final_delta:.6g}, max={MAX_FINAL_DELTA_COST_MEAN:.6g})"
+        )
+    final_win_rate = _nested_float(final_metrics, ("comparison", "cost_J_total_control_win_rate"))
+    if final_win_rate is None:
+        failures.append("science gate: final comparison.cost_J_total_control_win_rate missing or non-finite")
+    elif final_win_rate < MIN_FINAL_CONTROL_WIN_RATE:
+        failures.append(
+            "science gate: selected pass controlled win-rate too low "
+            f"(win_rate={final_win_rate:.6g}, min={MIN_FINAL_CONTROL_WIN_RATE:.6g})"
+        )
+
+    for key in (
+        "q_lower_violation_rate",
+        "q_upper_violation_rate",
+        "v_lower_violation_rate",
+        "v_upper_violation_rate",
+    ):
+        final_rate = _nested_float(final_metrics, ("diagnostics", key))
+        pass0_rate = _nested_float(pass0_metrics or {}, ("diagnostics", key))
+        if final_rate is None:
+            failures.append(f"science gate: final diagnostics.{key} missing or non-finite")
+            continue
+        if final_rate > MAX_FINAL_VIOLATION_RATE:
+            failures.append(
+                "science gate: selected pass physical violation rate too high "
+                f"({key}={final_rate:.6g}, max={MAX_FINAL_VIOLATION_RATE:.6g})"
+            )
+        if pass0_rate is not None and final_rate > pass0_rate + MAX_FINAL_VIOLATION_RATE_INCREASE_VS_PASS0:
+            failures.append(
+                "science gate: selected pass worsens physical violations versus pass0 "
+                f"({key}={final_rate:.6g}, pass0={pass0_rate:.6g}, "
+                f"max_increase={MAX_FINAL_VIOLATION_RATE_INCREASE_VS_PASS0:.6g})"
+            )
 
 
 def _resolve_run_root(path: Path) -> Optional[Path]:
@@ -241,6 +348,8 @@ def validate_t12_gate_n13(path: str | Path) -> Dict[str, Any]:
             failures.append(f"missing plot {plot_path}")
         elif plot_path.stat().st_size <= 1000:
             failures.append(f"plot {plot_path} too small")
+
+    _check_science_gate(rec_dir, results, failures)
 
     status = _report_status(failures, incomplete, inconclusive)
     return {

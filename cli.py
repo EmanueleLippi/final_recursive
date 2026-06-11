@@ -1105,7 +1105,7 @@ def plot_program(argv: Optional[List[str]] = None) -> dict:
     )
     args = parser.parse_args(argv)
 
-    run_dir = os.path.abspath(os.path.expanduser(args.run_dir))
+    run_dir = _resolve_plot_run_dir(os.path.abspath(os.path.expanduser(args.run_dir)))
     recursive_dir = (
         os.path.abspath(os.path.expanduser(args.recursive_dir))
         if str(args.recursive_dir or "").strip()
@@ -1125,6 +1125,22 @@ def plot_program(argv: Optional[List[str]] = None) -> dict:
     )
     print(f"[Plot] Pascucci paper plots written to {out_dir}")
     return manifest
+
+
+def _resolve_plot_run_dir(path: str) -> str:
+    if os.path.isfile(os.path.join(path, "run_config.json")):
+        return path
+    try:
+        candidates = sorted(
+            os.path.join(path, name)
+            for name in os.listdir(path)
+            if name.startswith("run_") and os.path.isfile(os.path.join(path, name, "run_config.json"))
+        )
+    except OSError:
+        return path
+    if len(candidates) == 1:
+        return candidates[0]
+    return path
 
 
 def main(argv: Optional[List[str]] = None) -> int:

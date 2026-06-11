@@ -4713,6 +4713,46 @@ def test_cli_plot_pascucci_paper_from_artifacts_does_not_train() -> None:
         cli.run_program = original_run_program
 
 
+def test_cli_plot_pascucci_paper_resolves_single_nested_run_dir() -> None:
+    from . import cli
+    from .io_utils import save_blob_npz, save_json
+    from .plotting import _PLOTTING_AVAILABLE
+
+    if not _PLOTTING_AVAILABLE:
+        return
+
+    fixture = _pascucci_paper_plot_smoke_inputs()
+    with tempfile.TemporaryDirectory() as tmp:
+        wrapper_dir = Path(tmp) / "pascucci_T12_wrapper_job999999"
+        run_dir = wrapper_dir / "run_20260611_153158"
+        rec_dir = run_dir / "recursive"
+        rec_dir.mkdir(parents=True)
+        save_json(
+            {
+                "model_name": "pascucci",
+                "T_total": 5.0,
+                "params": fixture["params"],
+                "state_labels": ["S", "H", "V", "X_state"],
+                "application_metric_schema": "pascucci_application_metrics_v2",
+                "run_config_sha256": "3" * 64,
+                "seed_manifest": {"eval_seed": 11, "visual_seed_effective": 22},
+                "blocks": fixture["blocks"],
+            },
+            str(run_dir / "run_config.json"),
+        )
+        save_blob_npz(fixture["stitched"], str(rec_dir / "stitched_predictions_final.npz"))
+        save_blob_npz(fixture["application_pathwise"], str(rec_dir / "application_metrics_final.npz"))
+
+        exit_code = cli.main(["plot", "--run_dir", str(wrapper_dir), "--source_label", "wrapper_smoke"])
+
+        assert exit_code == 0
+        manifest_path = rec_dir / "plots" / "pascucci_paper" / "pascucci_paper_plots_manifest.json"
+        assert manifest_path.exists()
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert manifest["source"]["source_label"] == "wrapper_smoke"
+        assert manifest["source"]["run_dir"] == str(run_dir)
+
+
 def test_tf2_model_smoke_and_blob_roundtrip() -> None:
     from .models import NN_Quadratic_Coupled_Recursive
     from .tf_backend import set_seed, tf
@@ -6187,7 +6227,91 @@ def test_pascucci_t12_gate_validator_requires_results_manifest_without_nameerror
     assert "Xi_initial" not in joined
 
 
-def _write_minimal_t12_gate_artifacts(run_root: Path) -> None:
+def _application_summary_fixture(
+    *,
+    controlled_total_mean: float,
+    uncontrolled_total_mean: float,
+    control_win_rate: float,
+    q_lower_rate: float = 0.0,
+    q_upper_rate: float = 0.0,
+    v_lower_rate: float = 0.0,
+    v_upper_rate: float = 0.0,
+) -> Dict[str, object]:
+    delta = float(controlled_total_mean) - float(uncontrolled_total_mean)
+    return {
+        "schema": "pascucci_application_metrics_v2",
+        "model_name": "pascucci",
+        "horizon": {
+            "T_total": 12.0,
+            "n_steps": 78,
+            "n_time_points": 79,
+            "sample_paths": 10000,
+            "t_start": 0.0,
+            "t_end": 12.0,
+        },
+        "controlled": {
+            "summary": {
+                "cost_J_total_mean": float(controlled_total_mean),
+                "cost_J_total_q05": float(controlled_total_mean) - 1.0,
+                "cost_J_total_q50": float(controlled_total_mean),
+                "cost_J_total_q95": float(controlled_total_mean) + 1.0,
+                "cost_J_running_mean": float(controlled_total_mean),
+                "cost_J_terminal_mean": 0.0,
+            },
+            "alpha_summary": {
+                "alpha_mean": 0.0,
+                "alpha_std": 0.1,
+                "alpha_abs_mean": 0.1,
+                "alpha_abs_q95": 0.2,
+                "sample_count": 10000,
+            },
+        },
+        "uncontrolled": {
+            "summary": {
+                "cost_J_total_mean": float(uncontrolled_total_mean),
+                "cost_J_total_q05": float(uncontrolled_total_mean) - 1.0,
+                "cost_J_total_q50": float(uncontrolled_total_mean),
+                "cost_J_total_q95": float(uncontrolled_total_mean) + 1.0,
+                "cost_J_running_mean": float(uncontrolled_total_mean),
+                "cost_J_terminal_mean": 0.0,
+            },
+            "alpha_summary": {
+                "alpha_mean": 0.0,
+                "alpha_std": 0.0,
+                "alpha_abs_mean": 0.0,
+                "alpha_abs_q95": 0.0,
+                "sample_count": 10000,
+            },
+        },
+        "comparison": {
+            "delta_cost_J_total_mean": delta,
+            "delta_cost_J_total_q05": delta - 1.0,
+            "delta_cost_J_total_q50": delta,
+            "delta_cost_J_total_q95": delta + 1.0,
+            "cost_J_total_control_win_rate": float(control_win_rate),
+            "delta_cost_J_running_mean": delta,
+            "delta_cost_J_terminal_mean": 0.0,
+            "paired_sample_count": 10000,
+        },
+        "diagnostics": {
+            "q_lower_violation_mean": float(q_lower_rate),
+            "q_lower_violation_rate": float(q_lower_rate),
+            "q_upper_violation_mean": float(q_upper_rate),
+            "q_upper_violation_rate": float(q_upper_rate),
+            "v_lower_violation_mean": float(v_lower_rate),
+            "v_lower_violation_rate": float(v_lower_rate),
+            "v_upper_violation_mean": float(v_upper_rate),
+            "v_upper_violation_rate": float(v_upper_rate),
+            "stitch_Y_boundary_mean_abs_jump": 0.01,
+            "stitch_Y_boundary_max_abs_jump": 0.1,
+            "stitch_Z_boundary_mean_abs_jump": 0.001,
+            "stitch_Z_boundary_max_abs_jump": 0.01,
+        },
+        "pathwise_npz_keys": [],
+    }
+
+
+def _write_minimal_t12_gate_artifacts(run_root: Path, *, dominated_final_pass: bool = False) -> None:
     rec_dir = run_root / "recursive"
     plot_dir = rec_dir / "plots" / "pascucci_paper"
     plot_dir.mkdir(parents=True)
@@ -6209,6 +6333,43 @@ def _write_minimal_t12_gate_artifacts(run_root: Path) -> None:
         ),
         encoding="utf-8",
     )
+    if dominated_final_pass:
+        pass0_per = [0.07] * 6
+        pass1_per = [5.5, 0.13, 0.001, 0.001, 0.001, 0.001]
+        selected_score = 2.893916666666667
+        pass0_metrics = _application_summary_fixture(
+            controlled_total_mean=-4.0,
+            uncontrolled_total_mean=-2.0,
+            control_win_rate=0.70,
+            v_lower_rate=0.01,
+            v_upper_rate=0.01,
+        )
+        pass1_metrics = _application_summary_fixture(
+            controlled_total_mean=3.6,
+            uncontrolled_total_mean=-2.0,
+            control_win_rate=0.15,
+            q_lower_rate=0.28,
+            q_upper_rate=0.06,
+            v_lower_rate=0.23,
+            v_upper_rate=0.27,
+        )
+    else:
+        pass0_per = [0.10] * 6
+        pass1_per = [0.08] * 6
+        selected_score = 0.108
+        pass0_metrics = _application_summary_fixture(
+            controlled_total_mean=-3.0,
+            uncontrolled_total_mean=-2.0,
+            control_win_rate=0.60,
+            v_lower_rate=0.02,
+        )
+        pass1_metrics = _application_summary_fixture(
+            controlled_total_mean=-4.0,
+            uncontrolled_total_mean=-2.0,
+            control_win_rate=0.70,
+            v_lower_rate=0.01,
+        )
+
     (rec_dir / "results.json").write_text(
         json.dumps(
             {
@@ -6216,7 +6377,11 @@ def _write_minimal_t12_gate_artifacts(run_root: Path) -> None:
                 "passes": [{"pass_id": 1}, {"pass_id": 2}],
                 "evaluation_bundle_M": 10000,
                 "selected_pass_id": 2,
-                "selected_score": 0.125,
+                "selected_score": selected_score,
+                "loss_pass_scores": {
+                    "1": float(np.mean(pass0_per) + 0.35 * max(pass0_per)),
+                    "2": float(np.mean(pass1_per) + 0.35 * max(pass1_per)),
+                },
                 "pass_invalid_reasons": {},
             },
             sort_keys=True,
@@ -6232,10 +6397,17 @@ def _write_minimal_t12_gate_artifacts(run_root: Path) -> None:
         block_t_end=np.asarray([2, 4, 6, 8, 10, 12], dtype=np.float32),
     )
 
-    header = "block,eval_mean_loss,eval_mean_loss_per_sample,eval_mean_y0\n"
-    rows = "".join(f"{idx},{1.0 + idx:.6f},{0.1 + 0.01 * idx:.6f},0.0\n" for idx in range(6))
-    for filename in ("pass_00_logs.csv", "pass_01_logs.csv"):
-        (rec_dir / filename).write_text(header + rows, encoding="utf-8")
+    header = "pass,block,t_start,t_end,eval_mean_loss,eval_mean_loss_per_sample,eval_mean_y0\n"
+    pass0_rows = "".join(
+        f"1,{idx},{2.0 * idx:.1f},{2.0 * (idx + 1):.1f},{per * 10000.0:.6f},{per:.6f},0.0\n"
+        for idx, per in enumerate(pass0_per)
+    )
+    pass1_rows = "".join(
+        f"2,{idx},{2.0 * idx:.1f},{2.0 * (idx + 1):.1f},{per * 10000.0:.6f},{per:.6f},0.0\n"
+        for idx, per in enumerate(pass1_per)
+    )
+    (rec_dir / "pass_00_logs.csv").write_text(header + pass0_rows, encoding="utf-8")
+    (rec_dir / "pass_01_logs.csv").write_text(header + pass1_rows, encoding="utf-8")
 
     stitched = {
         "t": np.linspace(0.0, 12.0, 7, dtype=np.float32).reshape(1, 7, 1),
@@ -6250,15 +6422,18 @@ def _write_minimal_t12_gate_artifacts(run_root: Path) -> None:
     }
     for stem in ("stitched_predictions_pass00", "stitched_predictions_pass01", "stitched_predictions_final"):
         np.savez_compressed(rec_dir / f"{stem}.npz", **stitched)
-    for stem in ("application_metrics_pass00", "application_metrics_pass01", "application_metrics_final"):
+    application_summaries = {
+        "application_metrics_pass00": pass0_metrics,
+        "application_metrics_pass01": pass1_metrics,
+        "application_metrics_final": {
+            **pass1_metrics,
+            "selected_from_pass_id": 2,
+            "selected_from_pass_index": 1,
+        },
+    }
+    for stem, summary in application_summaries.items():
         (rec_dir / f"{stem}.json").write_text(
-            json.dumps(
-                {
-                    "schema": "pascucci_application_metrics_v2",
-                    "total_cost": {"mean": 0.0, "std": 0.0},
-                },
-                sort_keys=True,
-            ),
+            json.dumps(summary, sort_keys=True),
             encoding="utf-8",
         )
         np.savez_compressed(rec_dir / f"{stem}.npz", **application)
@@ -6296,6 +6471,22 @@ def test_pascucci_t12_gate_validator_green_contract_and_numeric_scalars() -> Non
     assert report["failures"] == []
     assert report["incomplete"] == []
     assert report["inconclusive"] == []
+
+
+def test_pascucci_t12_gate_validator_rejects_science_red_selected_pass() -> None:
+    from .pascucci_run_validation import validate_t12_gate_n13
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp)
+        _write_minimal_t12_gate_artifacts(run_root, dominated_final_pass=True)
+
+        report = validate_t12_gate_n13(run_root)
+
+    assert report["status"] == "FAILED"
+    joined = "\n".join(report["failures"])
+    assert "science" in joined.lower()
+    assert "selected pass" in joined.lower()
+    assert "pass0" in joined.lower()
 
 
 def test_pascucci_t12_gate_validator_reports_malformed_json_without_exception() -> None:
@@ -8167,6 +8358,10 @@ def run_tests(argv: List[str] | None = None) -> int:
             test_cli_plot_pascucci_paper_from_artifacts_does_not_train,
         ),
         (
+            "cli_plot_pascucci_paper_resolves_single_nested_run_dir",
+            test_cli_plot_pascucci_paper_resolves_single_nested_run_dir,
+        ),
+        (
             "pascucci_paper_plot_bundle_loads_blocks_from_recursive_results",
             test_pascucci_paper_plot_bundle_loads_blocks_from_recursive_results,
         ),
@@ -8438,6 +8633,10 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "pascucci_t12_gate_validator_green_contract_and_numeric_scalars",
         "test_pascucci_t12_gate_validator_green_contract_and_numeric_scalars",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_t12_gate_validator_rejects_science_red_selected_pass",
+        "test_pascucci_t12_gate_validator_rejects_science_red_selected_pass",
     ) and ok
     ok = _run_subprocess_case(
         "pascucci_t12_gate_validator_reports_malformed_json_without_exception",
