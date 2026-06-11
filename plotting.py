@@ -142,8 +142,7 @@ def score_pass_logs(
     worst_block_weight: float = 0.35,
 ) -> float:
     losses = np.array([float(r.get(loss_key, np.nan)) for r in (rows or [])], dtype=np.float64)
-    losses = losses[np.isfinite(losses)]
-    if losses.size == 0:
+    if losses.size == 0 or not np.isfinite(losses).all():
         return float("inf")
     return float(np.mean(losses) + worst_block_weight * np.max(losses))
 

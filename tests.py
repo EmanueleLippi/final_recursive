@@ -5741,6 +5741,574 @@ def test_print_recursive_pass_application_metrics_emit_comparison_and_stability(
         orchestration.plot_recursive_stitched_y_convergence = original_plot_convergence
 
 
+def test_score_pass_logs_rejects_nonfinite_rows() -> None:
+    from .plotting import score_pass_logs
+
+    finite_rows = [
+        {"eval_mean_loss_per_sample": 0.20},
+        {"eval_mean_loss_per_sample": 0.10},
+        {"eval_mean_loss_per_sample": 0.30},
+    ]
+    finite_score = score_pass_logs(finite_rows)
+    np.testing.assert_allclose(finite_score, np.mean([0.20, 0.10, 0.30]) + 0.35 * 0.30)
+
+    mixed_rows = [
+        {"eval_mean_loss_per_sample": 0.0001},
+        {"eval_mean_loss_per_sample": np.nan},
+        {"eval_mean_loss_per_sample": 0.0002},
+    ]
+    assert np.isinf(score_pass_logs(mixed_rows))
+    assert np.isinf(score_pass_logs([{"eval_mean_loss_per_sample": np.nan}]))
+    assert np.isinf(score_pass_logs([{}]))
+
+
+def test_resolve_pass_selection_rejects_no_finite_loss_scores() -> None:
+    from .orchestration import resolve_pass_selection
+
+    try:
+        resolve_pass_selection(
+            pass_scores_by_loss={1: float("inf"), 2: np.nan},
+            exact_summary_by_pass={},
+            selection_metric="loss",
+        )
+    except RuntimeError as exc:
+        assert "finite" in str(exc).lower()
+        assert "pass" in str(exc).lower()
+    else:
+        raise AssertionError("selection should reject all-nonfinite loss candidates")
+
+
+def test_print_recursive_pass_rejects_invalid_candidate_without_rewriting_final_artifacts() -> None:
+    from . import orchestration
+    from .model_specs import ModelSpec, get_model_spec
+
+    base = get_model_spec("pascucci")
+    M = 4
+    D = 4
+    layers = [5, 8, 1]
+    z_v_index = 2
+
+    class FakeApplicationModel:
+        def _summary(self, running, terminal, total, running_cumulative):
+            summary = {}
+            for key, values in (
+                ("cost_J_running", running),
+                ("cost_J_terminal", terminal),
+                ("cost_J_total", total),
+                ("cost_J_running_cumulative", running_cumulative),
+            ):
+                values_np = np.asarray(values, dtype=np.float32)
+                if key == "cost_J_running_cumulative":
+                    flat = (
+                        values_np[:, -1, :].reshape(-1)
+                        if values_np.shape[1] > 0
+                        else np.zeros((values_np.shape[0],), dtype=np.float32)
+                    )
+                else:
+                    flat = values_np.reshape(-1)
+                summary[f"{key}_mean"] = float(np.mean(flat))
+                summary[f"{key}_std"] = float(np.std(flat))
+                summary[f"{key}_q05"] = float(np.quantile(flat, 0.05))
+                summary[f"{key}_q50"] = float(np.quantile(flat, 0.50))
+                summary[f"{key}_q95"] = float(np.quantile(flat, 0.95))
+            return summary
+
+        def _result(self, *, t, cost_seed, alpha, baseline_mode, control_law, paired_inputs):
+            del t
+            M_local = int(alpha.shape[0])
+            steps = int(alpha.shape[1])
+            running = np.full((M_local, 1), np.float32(cost_seed), dtype=np.float32)
+            running_step = np.full(
+                (M_local, steps, 1),
+                np.float32(cost_seed / max(steps, 1)),
+                dtype=np.float32,
+            )
+            running_cumulative = np.cumsum(running_step, axis=1).astype(np.float32)
+            terminal = np.full((M_local, 1), np.float32(0.25), dtype=np.float32)
+            total = running + terminal
+            return {
+                "schema": "pascucci_application_metrics_v2",
+                "metadata": {
+                    "baseline_mode": baseline_mode,
+                    "aggregation": "left_riemann_f_plus_terminal_g",
+                    "control_law": control_law,
+                    "paired_inputs": paired_inputs,
+                },
+                "pathwise": {
+                    "cost_J_running": running,
+                    "cost_J_terminal": terminal,
+                    "cost_J_total": total,
+                    "cost_J_running_cumulative": running_cumulative,
+                    "alpha": alpha.astype(np.float32),
+                },
+                "summary": self._summary(running, terminal, total, running_cumulative),
+            }
+
+        def application_cost_from_path(self, t, X, Y, Z, const_value=None, baseline_mode="controlled", **kwargs):
+            del Y, const_value, kwargs
+            cost_seed = float(np.asarray(X, dtype=np.float32)[0, 0, 0]) + 1.0
+            alpha = np.asarray(Z, dtype=np.float32)[:, :-1, [z_v_index]]
+            return self._result(
+                t=t,
+                cost_seed=cost_seed,
+                alpha=alpha,
+                baseline_mode=str(baseline_mode),
+                control_law="alpha_tf",
+                paired_inputs="stitched_XYZ",
+            )
+
+        def application_cost_functional(self, t, W, Xi, const_value=None, baseline_mode="uncontrolled"):
+            del W, const_value
+            steps = int(np.asarray(t).shape[1]) - 1
+            alpha = np.zeros((int(np.asarray(Xi).shape[0]), steps, 1), dtype=np.float32)
+            return self._result(
+                t=t,
+                cost_seed=3.0,
+                alpha=alpha,
+                baseline_mode=str(baseline_mode),
+                control_law="alpha_zero",
+                paired_inputs="same_t_W_Xi",
+            )
+
+        def close(self):
+            pass
+
+    spec = ModelSpec(
+        name="pascucci_invalid_pass_stub",
+        state_dim=4,
+        state_labels=base.state_labels,
+        z_labels=base.z_labels,
+        build_default_params=base.build_default_params,
+        build_layers=base.build_layers,
+        xi_generator=base.xi_generator,
+        deterministic_xi=base.deterministic_xi,
+        standard_model_factory=lambda **kwargs: None,
+        recursive_model_factory=lambda **kwargs: FakeApplicationModel(),
+        build_exact_solution=lambda *args, **kwargs: None,
+        build_exact_initial_boundary_samples=None,
+        moment_names=base.moment_names,
+        application_metric_schema=base.application_metric_schema,
+        application_metric_names=base.application_metric_names,
+        application_metric_aggregation=base.application_metric_aggregation,
+    )
+    params = spec.build_default_params(const=0.75)
+    blocks = [
+        {"idx": 0, "t_start": 0.0, "t_end": 0.25, "T_block": 0.25},
+        {"idx": 1, "t_start": 0.25, "t_end": 0.50, "T_block": 0.25},
+    ]
+    pass_entries = [
+        {
+            "pass_id": 1,
+            "logs": [
+                {
+                    "pass": 1,
+                    "block": 0,
+                    "t_start": 0.0,
+                    "t_end": 0.25,
+                    "T_block": 0.25,
+                    "eval_mean_loss": 100.0,
+                    "eval_std_loss": 0.0,
+                    "eval_mean_loss_per_sample": 0.10,
+                    "eval_std_loss_per_sample": 0.0,
+                    "eval_mean_y0": 0.0,
+                    "precision_target": None,
+                    "refine_rounds": 0,
+                },
+                {
+                    "pass": 1,
+                    "block": 1,
+                    "t_start": 0.25,
+                    "t_end": 0.50,
+                    "T_block": 0.25,
+                    "eval_mean_loss": 120.0,
+                    "eval_std_loss": 0.0,
+                    "eval_mean_loss_per_sample": 0.12,
+                    "eval_std_loss_per_sample": 0.0,
+                    "eval_mean_y0": 0.0,
+                    "precision_target": None,
+                    "refine_rounds": 0,
+                },
+            ],
+            "blobs": [_make_blob(layers), _make_blob(layers)],
+        },
+        {
+            "pass_id": 2,
+            "logs": [
+                {
+                    "pass": 2,
+                    "block": 0,
+                    "t_start": 0.0,
+                    "t_end": 0.25,
+                    "T_block": 0.25,
+                    "eval_mean_loss": np.nan,
+                    "eval_std_loss": np.nan,
+                    "eval_mean_loss_per_sample": np.nan,
+                    "eval_std_loss_per_sample": np.nan,
+                    "eval_mean_y0": np.nan,
+                    "precision_target": None,
+                    "refine_rounds": 0,
+                },
+                {
+                    "pass": 2,
+                    "block": 1,
+                    "t_start": 0.25,
+                    "t_end": 0.50,
+                    "T_block": 0.25,
+                    "eval_mean_loss": 1.0,
+                    "eval_std_loss": 0.0,
+                    "eval_mean_loss_per_sample": 0.0001,
+                    "eval_std_loss_per_sample": 0.0,
+                    "eval_mean_y0": -0.9,
+                    "precision_target": None,
+                    "refine_rounds": 0,
+                },
+            ],
+            "blobs": [_make_blob(layers), _make_blob(layers)],
+        },
+    ]
+
+    predict_call = {"count": 0}
+
+    def fake_predict_recursive_stitched(**kwargs):
+        predict_call["count"] += 1
+        rollout_inputs = kwargs["rollout_inputs"]
+        t_segments = []
+        for idx, (t_block, _W_block) in enumerate(rollout_inputs):
+            t_np = np.asarray(t_block, dtype=np.float32)
+            t_segments.append(t_np if idx == 0 else t_np[:, 1:, :])
+        t = np.concatenate(t_segments, axis=1).astype(np.float32)
+        X = np.zeros((M, t.shape[1], D), dtype=np.float32)
+        X[:, :, 3] = 5.0
+        Y = np.full((M, t.shape[1], 1), np.float32(predict_call["count"] - 1), dtype=np.float32)
+        Z = np.zeros((M, t.shape[1], D), dtype=np.float32)
+        if predict_call["count"] == 2:
+            Y[:] = np.nan
+            Z[:] = np.nan
+        jumps_x = np.zeros((len(blocks) - 1, M, D), dtype=np.float32)
+        jumps_y = np.zeros((len(blocks) - 1, M, 1), dtype=np.float32)
+        jumps_z = np.zeros((len(blocks) - 1, M, D), dtype=np.float32)
+        return {
+            "t": t,
+            "X": X,
+            "Y": Y,
+            "Z": Z,
+            "stitch_X_boundary_signed_jump": jumps_x,
+            "stitch_X_boundary_abs_jump": jumps_x,
+            "stitch_Y_boundary_signed_jump": jumps_y,
+            "stitch_Y_boundary_abs_jump": jumps_y,
+            "stitch_Z_boundary_signed_jump": jumps_z,
+            "stitch_Z_boundary_abs_jump": jumps_z,
+        }
+
+    original_predict = orchestration.predict_recursive_stitched
+    original_plot_logs = orchestration.plot_recursive_pass_logs_multi
+    original_plot_stitched = orchestration.plot_recursive_stitched_predictions
+    original_plot_convergence = orchestration.plot_recursive_stitched_y_convergence
+    orchestration.predict_recursive_stitched = fake_predict_recursive_stitched
+    orchestration.plot_recursive_pass_logs_multi = lambda *args, **kwargs: None
+    orchestration.plot_recursive_stitched_predictions = lambda *args, **kwargs: None
+    orchestration.plot_recursive_stitched_y_convergence = lambda *args, **kwargs: None
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            rec_dir = Path(tmp)
+            stale_json = rec_dir / "application_metrics_final.json"
+            stale_npz = rec_dir / "stitched_predictions_final.npz"
+            stale_json.write_text('{"stale": true}\n', encoding="utf-8")
+            np.savez(stale_npz, sentinel=np.asarray([123], dtype=np.int32))
+
+            try:
+                orchestration.print_recursive_pass(
+                    pass_entries=pass_entries,
+                    blocks=blocks,
+                    rec_dir=str(rec_dir),
+                    params=params,
+                    N_per_block=2,
+                    D=D,
+                    layers=layers,
+                    T_total=0.50,
+                    exact_solution=None,
+                    selection_metric="loss",
+                    eval_bundle_path=str(rec_dir / "evaluation_bundle.npz"),
+                    eval_seed=101,
+                    eval_min_paths=M,
+                    sample_paths=0,
+                    print_compact_logs=False,
+                    exclude_pass_ids_from_selection=[1],
+                    model_spec=spec,
+                )
+            except RuntimeError as exc:
+                message = str(exc).lower()
+                assert "finite" in message
+                assert "pass" in message
+            else:
+                raise AssertionError("invalid pass candidate should stop final artifact selection")
+
+            assert json.loads(stale_json.read_text(encoding="utf-8")) == {"stale": True}
+            with np.load(stale_npz) as data:
+                np.testing.assert_array_equal(data["sentinel"], np.asarray([123], dtype=np.int32))
+            assert not (rec_dir / "application_metrics_pass01.json").exists()
+            assert not (rec_dir / "application_metrics_final.npz").exists()
+    finally:
+        orchestration.predict_recursive_stitched = original_predict
+        orchestration.plot_recursive_pass_logs_multi = original_plot_logs
+        orchestration.plot_recursive_stitched_predictions = original_plot_stitched
+        orchestration.plot_recursive_stitched_y_convergence = original_plot_convergence
+
+
+def test_print_recursive_pass_can_skip_intermediate_final_promotion() -> None:
+    from . import orchestration
+    from .model_specs import get_model_spec
+
+    spec = get_model_spec("pascucci")
+    params = spec.build_default_params(const=0.75)
+    M = 4
+    D = 4
+    layers = [5, 8, 1]
+    blocks = [{"idx": 0, "t_start": 0.0, "t_end": 0.25, "T_block": 0.25}]
+    pass_entries = [
+        {
+            "pass_id": 1,
+            "logs": [
+                {
+                    "pass": 1,
+                    "block": 0,
+                    "t_start": 0.0,
+                    "t_end": 0.25,
+                    "T_block": 0.25,
+                    "eval_mean_loss": 1.0,
+                    "eval_std_loss": 0.0,
+                    "eval_mean_loss_per_sample": 0.25,
+                    "eval_std_loss_per_sample": 0.0,
+                    "eval_mean_y0": 0.0,
+                    "precision_target": None,
+                    "refine_rounds": 0,
+                }
+            ],
+            "blobs": [_make_blob(layers)],
+        }
+    ]
+
+    def fake_predict_recursive_stitched(**kwargs):
+        rollout_inputs = kwargs["rollout_inputs"]
+        t = np.asarray(rollout_inputs[0][0], dtype=np.float32)
+        X = np.zeros((M, t.shape[1], D), dtype=np.float32)
+        X[:, :, 3] = 5.0
+        Y = np.zeros((M, t.shape[1], 1), dtype=np.float32)
+        Z = np.zeros((M, t.shape[1], D), dtype=np.float32)
+        return {"t": t, "X": X, "Y": Y, "Z": Z}
+
+    original_predict = orchestration.predict_recursive_stitched
+    original_plot_logs = orchestration.plot_recursive_pass_logs_multi
+    original_plot_stitched = orchestration.plot_recursive_stitched_predictions
+    original_plot_convergence = orchestration.plot_recursive_stitched_y_convergence
+    orchestration.predict_recursive_stitched = fake_predict_recursive_stitched
+    orchestration.plot_recursive_pass_logs_multi = lambda *args, **kwargs: None
+    orchestration.plot_recursive_stitched_predictions = lambda *args, **kwargs: None
+    orchestration.plot_recursive_stitched_y_convergence = lambda *args, **kwargs: None
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            rec_dir = Path(tmp)
+            summary = orchestration.print_recursive_pass(
+                pass_entries=pass_entries,
+                blocks=blocks,
+                rec_dir=str(rec_dir),
+                params=params,
+                N_per_block=2,
+                D=D,
+                layers=layers,
+                T_total=0.25,
+                exact_solution=None,
+                selection_metric="loss",
+                eval_bundle_path=str(rec_dir / "evaluation_bundle.npz"),
+                eval_seed=101,
+                eval_min_paths=M,
+                sample_paths=0,
+                print_compact_logs=False,
+                promote_final_artifacts=False,
+                model_spec=spec,
+            )
+
+            assert summary["selected_pass_id"] == 1
+            assert summary["promoted_final_artifacts"] is False
+            assert (rec_dir / "stitched_predictions_pass00.npz").exists()
+            assert not (rec_dir / "stitched_predictions_final.npz").exists()
+            assert not (rec_dir / "application_metrics_final.json").exists()
+            assert not (rec_dir / "application_metrics_final.npz").exists()
+    finally:
+        orchestration.predict_recursive_stitched = original_predict
+        orchestration.plot_recursive_pass_logs_multi = original_plot_logs
+        orchestration.plot_recursive_stitched_predictions = original_plot_stitched
+        orchestration.plot_recursive_stitched_y_convergence = original_plot_convergence
+
+
+def test_pascucci_t12_gate_validator_requires_results_manifest_without_nameerror() -> None:
+    from .pascucci_run_validation import validate_t12_gate_n13
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp)
+        rec_dir = run_root / "recursive"
+        rec_dir.mkdir(parents=True)
+        (run_root / "run_config.json").write_text(
+            json.dumps(
+                {
+                    "model_name": "pascucci",
+                    "M": 10000,
+                    "N": 13,
+                    "D": 4,
+                    "T_total": 12.0,
+                    "block_size": 2.0,
+                    "passes": 2,
+                    "state_labels": ["S", "H", "V", "X_state"],
+                    "z_labels": ["Z_S", "Z_H", "Z_V", "Z_X"],
+                    "application_metric_schema": "pascucci_application_metrics_v2",
+                }
+            ),
+            encoding="utf-8",
+        )
+        np.savez(
+            rec_dir / "evaluation_bundle.npz",
+            Xi_initial=np.zeros((10000, 4), dtype=np.float32),
+            t_bundle=np.zeros((6, 10000, 14, 1), dtype=np.float32),
+            W_bundle=np.zeros((6, 10000, 14, 4), dtype=np.float32),
+            block_t_start=np.asarray([0, 2, 4, 6, 8, 10], dtype=np.float32),
+            block_t_end=np.asarray([2, 4, 6, 8, 10, 12], dtype=np.float32),
+        )
+
+        report = validate_t12_gate_n13(run_root)
+
+    assert report["status"] == "FAILED"
+    joined = "\n".join(report["failures"] + report["incomplete"])
+    assert "results.json" in joined
+    assert "Xi_initial" not in joined
+
+
+def _write_minimal_t12_gate_artifacts(run_root: Path) -> None:
+    rec_dir = run_root / "recursive"
+    plot_dir = rec_dir / "plots" / "pascucci_paper"
+    plot_dir.mkdir(parents=True)
+    (run_root / "run_config.json").write_text(
+        json.dumps(
+            {
+                "model_name": "pascucci",
+                "M": 10000,
+                "N": 13,
+                "D": 4,
+                "T_total": 12.0,
+                "block_size": 2.0,
+                "passes": 2,
+                "state_labels": ["S", "H", "V", "X_state"],
+                "z_labels": ["Z_S", "Z_H", "Z_V", "Z_X"],
+                "application_metric_schema": "pascucci_application_metrics_v2",
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    (rec_dir / "results.json").write_text(
+        json.dumps(
+            {
+                "blocks": [{"idx": i, "t_start": 2.0 * i, "t_end": 2.0 * (i + 1)} for i in range(6)],
+                "passes": [{"pass_id": 1}, {"pass_id": 2}],
+                "evaluation_bundle_M": 10000,
+                "selected_pass_id": 2,
+                "selected_score": 0.125,
+                "pass_invalid_reasons": {},
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    np.savez_compressed(
+        rec_dir / "evaluation_bundle.npz",
+        Xi_initial=np.zeros((10000, 4), dtype=np.float32),
+        t_bundle=np.zeros((6, 10000, 14, 1), dtype=np.float32),
+        W_bundle=np.zeros((6, 10000, 14, 4), dtype=np.float32),
+        block_t_start=np.asarray([0, 2, 4, 6, 8, 10], dtype=np.float32),
+        block_t_end=np.asarray([2, 4, 6, 8, 10, 12], dtype=np.float32),
+    )
+
+    header = "block,eval_mean_loss,eval_mean_loss_per_sample,eval_mean_y0\n"
+    rows = "".join(f"{idx},{1.0 + idx:.6f},{0.1 + 0.01 * idx:.6f},0.0\n" for idx in range(6))
+    for filename in ("pass_00_logs.csv", "pass_01_logs.csv"):
+        (rec_dir / filename).write_text(header + rows, encoding="utf-8")
+
+    stitched = {
+        "t": np.linspace(0.0, 12.0, 7, dtype=np.float32).reshape(1, 7, 1),
+        "X": np.zeros((1, 7, 4), dtype=np.float32),
+        "Y": np.zeros((1, 7, 1), dtype=np.float32),
+        "Z": np.zeros((1, 7, 4), dtype=np.float32),
+    }
+    application = {
+        "running_cost": np.zeros((1, 6), dtype=np.float32),
+        "terminal_cost": np.zeros((1,), dtype=np.float32),
+        "cumulative_cost": np.zeros((1, 7), dtype=np.float32),
+    }
+    for stem in ("stitched_predictions_pass00", "stitched_predictions_pass01", "stitched_predictions_final"):
+        np.savez_compressed(rec_dir / f"{stem}.npz", **stitched)
+    for stem in ("application_metrics_pass00", "application_metrics_pass01", "application_metrics_final"):
+        (rec_dir / f"{stem}.json").write_text(
+            json.dumps(
+                {
+                    "schema": "pascucci_application_metrics_v2",
+                    "total_cost": {"mean": 0.0, "std": 0.0},
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        np.savez_compressed(rec_dir / f"{stem}.npz", **application)
+
+    (plot_dir / "pascucci_paper_plots_manifest.json").write_text(
+        json.dumps({"schema": "pascucci_paper_plots_v1", "plots": []}, sort_keys=True),
+        encoding="utf-8",
+    )
+    for filename in (
+        "pascucci_paper_35_S_ou_band.png",
+        "pascucci_paper_36_H_ou_band.png",
+        "pascucci_paper_37_accumulated_cost.png",
+        "pascucci_paper_38_alpha.png",
+        "pascucci_paper_39_state_bands_S_V_Q.png",
+        "pascucci_paper_40_controlled_uncontrolled.png",
+    ):
+        (plot_dir / filename).write_bytes(b"0" * 1001)
+
+
+def test_pascucci_t12_gate_validator_green_contract_and_numeric_scalars() -> None:
+    from .pascucci_run_validation import _is_finite_scalar, validate_t12_gate_n13
+
+    assert _is_finite_scalar(np.float64(0.25))
+    assert _is_finite_scalar(np.int64(2))
+    assert not _is_finite_scalar(np.float64(np.nan))
+    assert not _is_finite_scalar(True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp)
+        _write_minimal_t12_gate_artifacts(run_root)
+
+        report = validate_t12_gate_n13(run_root)
+
+    assert report["status"] == "GREEN"
+    assert report["failures"] == []
+    assert report["incomplete"] == []
+    assert report["inconclusive"] == []
+
+
+def test_pascucci_t12_gate_validator_reports_malformed_json_without_exception() -> None:
+    from .pascucci_run_validation import validate_t12_gate_n13
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp)
+        _write_minimal_t12_gate_artifacts(run_root)
+        (run_root / "recursive" / "results.json").write_text("{", encoding="utf-8")
+
+        report = validate_t12_gate_n13(run_root)
+
+    assert report["status"] == "FAILED"
+    assert any("malformed JSON" in failure for failure in report["failures"])
+
+
 def test_print_recursive_pass_rejects_mismatched_eval_bundle_metadata() -> None:
     from . import orchestration
     from .model_specs import get_model_spec
@@ -7679,6 +8247,34 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "print_recursive_pass_application_metrics_emit_comparison_and_stability",
         "test_print_recursive_pass_application_metrics_emit_comparison_and_stability",
+    ) and ok
+    ok = _run_subprocess_case(
+        "score_pass_logs_rejects_nonfinite_rows",
+        "test_score_pass_logs_rejects_nonfinite_rows",
+    ) and ok
+    ok = _run_subprocess_case(
+        "resolve_pass_selection_rejects_no_finite_loss_scores",
+        "test_resolve_pass_selection_rejects_no_finite_loss_scores",
+    ) and ok
+    ok = _run_subprocess_case(
+        "print_recursive_pass_rejects_invalid_candidate_without_rewriting_final_artifacts",
+        "test_print_recursive_pass_rejects_invalid_candidate_without_rewriting_final_artifacts",
+    ) and ok
+    ok = _run_subprocess_case(
+        "print_recursive_pass_can_skip_intermediate_final_promotion",
+        "test_print_recursive_pass_can_skip_intermediate_final_promotion",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_t12_gate_validator_requires_results_manifest_without_nameerror",
+        "test_pascucci_t12_gate_validator_requires_results_manifest_without_nameerror",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_t12_gate_validator_green_contract_and_numeric_scalars",
+        "test_pascucci_t12_gate_validator_green_contract_and_numeric_scalars",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_t12_gate_validator_reports_malformed_json_without_exception",
+        "test_pascucci_t12_gate_validator_reports_malformed_json_without_exception",
     ) and ok
     ok = _run_subprocess_case(
         "print_recursive_pass_rejects_mismatched_eval_bundle_metadata",

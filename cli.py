@@ -41,6 +41,13 @@ def _run_config_sha256(config: dict) -> str:
     encoded = json.dumps(_to_serializable(payload), sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
+def _json_safe_score(value) -> Optional[float]:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return None
+    return score if np.isfinite(score) else None
+
 
 def _summarize_application_cost_result(result: dict) -> dict:
     payload = {
@@ -895,6 +902,7 @@ def run_program(argv: Optional[List[str]] = None):
                 visual_seed=visual_seed_requested,
                 enforce_exact_regression_guardrail=is_last_requested_pass,
                 print_compact_logs=is_last_requested_pass,
+                promote_final_artifacts=is_last_requested_pass,
                 exclude_pass_ids_from_selection=excluded_pass_ids_from_selection,
                 coupling_const=float(recursive_const),
                 model_spec=model_spec,
@@ -1010,6 +1018,9 @@ def run_program(argv: Optional[List[str]] = None):
             },
             "selection_excluded_pass_ids": plot_summary.get("excluded_pass_ids_from_selection", []),
             "selection_excluded_pass_indices": plot_summary.get("excluded_pass_indices_from_selection", []),
+            "pass_invalid_reasons": plot_summary.get("pass_invalid_reasons", {}),
+            "pass_invalid_reasons_by_index": plot_summary.get("pass_invalid_reasons_by_index", {}),
+            "promoted_final_artifacts": bool(plot_summary.get("promoted_final_artifacts", False)),
             "selected_pass_id": int(plot_summary["selected_pass_id"]),
             "selected_pass_index": int(plot_summary["selected_pass_index"]),
             "selected_score_metric": plot_summary["selected_score_metric"],
@@ -1017,9 +1028,12 @@ def run_program(argv: Optional[List[str]] = None):
             "selected_scores_by_pass": plot_summary["selected_scores_by_pass"],
             "selected_scores_by_pass_index": plot_summary["selected_scores_by_pass_index"],
             "loss_score_metric": plot_summary["score_key"],
-            "loss_pass_scores": {str(k): float(v) for k, v in plot_summary["pass_scores_loss"].items()},
+            "loss_pass_scores": {
+                str(k): _json_safe_score(v) for k, v in plot_summary["pass_scores_loss"].items()
+            },
             "loss_pass_scores_by_index": {
-                str(k): float(v) for k, v in plot_summary["pass_scores_loss_by_index"].items()
+                str(k): _json_safe_score(v)
+                for k, v in plot_summary["pass_scores_loss_by_index"].items()
             },
         }
         if plot_summary.get("application_summary_by_pass", {}):
