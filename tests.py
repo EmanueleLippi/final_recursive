@@ -6127,10 +6127,13 @@ def test_print_recursive_pass_can_skip_intermediate_final_promotion() -> None:
                 sample_paths=0,
                 print_compact_logs=False,
                 promote_final_artifacts=False,
+                exclude_pass_ids_from_selection=[1],
                 model_spec=spec,
             )
 
-            assert summary["selected_pass_id"] == 1
+            assert summary["selection_finalized"] is False
+            assert summary["selected_pass_id"] is None
+            assert summary["excluded_pass_ids_from_selection"] == []
             assert summary["promoted_final_artifacts"] is False
             assert (rec_dir / "stitched_predictions_pass00.npz").exists()
             assert not (rec_dir / "stitched_predictions_final.npz").exists()
@@ -6762,6 +6765,170 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
         orchestration.print_recursive_pass = original_print_recursive_pass
         cli.export_standard_parameter_blob = original_export_standard_parameter_blob
         cli.plot_stage_logs = original_plot_stage_logs
+
+
+def test_cli_recursive_two_pass_callbacks_finalize_selection_only_at_last_pass() -> None:
+    import json
+
+    from . import cli, orchestration
+    from .naming import _pass_index
+    from .sampling import build_blocks
+    from .tf_backend import require_tensorflow
+
+    require_tensorflow()
+
+    print_calls = []
+
+    def make_pass_entry(pass_id: int, blocks: list[dict]) -> dict:
+        logs = [
+            {
+                "pass": pass_id,
+                "block": int(block["idx"]),
+                "t_start": float(block["t_start"]),
+                "t_end": float(block["t_end"]),
+                "T_block": float(block["T_block"]),
+                "eval_mean_loss": 1.0 / float(pass_id),
+                "eval_std_loss": 0.0,
+                "eval_mean_loss_per_sample": 0.25 / float(pass_id),
+                "eval_std_loss_per_sample": 0.0,
+                "eval_mean_y0": 0.0,
+                "precision_target": None,
+                "refine_rounds": 0,
+            }
+            for block in blocks
+        ]
+        return {
+            "pass_id": int(pass_id),
+            "reference_loss": float(pass_id),
+            "logs": logs,
+            "blobs": [_make_blob([5, 8, 1]) for _ in blocks],
+            "models_dir": "unused",
+            "pass_init_mode": "base",
+            "boundary_source": "base_xi" if int(pass_id) == 1 else "previous_pass",
+            "is_bootstrap_pass": int(pass_id) == 1,
+            "active_set_summary": {},
+        }
+
+    def fake_run_recursive_training(**kwargs):
+        blocks = build_blocks(T_total=kwargs["T_total"], block_size=kwargs["block_size"])
+        pass1 = make_pass_entry(1, blocks)
+        pass2 = make_pass_entry(2, blocks)
+        on_pass_end = kwargs.get("on_pass_end")
+        assert on_pass_end is not None
+        on_pass_end({"pass_id": 1, "passes": [pass1], "blocks": blocks})
+        on_pass_end({"pass_id": 2, "passes": [pass1, pass2], "blocks": blocks})
+        return {
+            "blocks": blocks,
+            "passes": [pass1, pass2],
+            "pass1": {
+                "logs": pass1["logs"],
+                "reference_loss": pass1["reference_loss"],
+                "blobs": pass1["blobs"],
+            },
+            "boundary_samples": [
+                np.zeros((kwargs["M"], kwargs["D"]), dtype=np.float32)
+                for _ in range(len(blocks) + 1)
+            ],
+        }
+
+    def fake_print_recursive_pass(**kwargs):
+        print_calls.append(kwargs)
+        eval_bundle_path = Path(kwargs["eval_bundle_path"])
+        eval_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(eval_bundle_path, Xi_initial=np.zeros((4, kwargs["D"]), dtype=np.float32))
+        pass_ids = [int(entry["pass_id"]) for entry in kwargs["pass_entries"]]
+        is_final = bool(kwargs.get("promote_final_artifacts", True))
+        selected_pass_id = 2 if is_final else None
+        return {
+            "processed_pass_ids": pass_ids,
+            "processed_pass_indices": [_pass_index(pid) for pid in pass_ids],
+            "score_key": "eval_mean_loss_per_sample",
+            "pass_scores_loss": {pid: 0.25 / float(pid) for pid in pass_ids},
+            "pass_scores_loss_by_index": {
+                str(_pass_index(pid)): 0.25 / float(pid) for pid in pass_ids
+            },
+            "pass_invalid_reasons": {},
+            "pass_invalid_reasons_by_index": {},
+            "selection_finalized": is_final,
+            "promoted_final_artifacts": is_final,
+            "excluded_pass_ids_from_selection": [1] if is_final else [],
+            "excluded_pass_indices_from_selection": [0] if is_final else [],
+            "selected_pass_id": selected_pass_id,
+            "selected_pass_index": _pass_index(selected_pass_id) if selected_pass_id is not None else None,
+            "selected_score_metric": "loss.eval_mean_loss_per_sample" if is_final else None,
+            "selected_score": 0.125 if is_final else None,
+            "selected_scores_by_pass": {2: 0.125} if is_final else {},
+            "selected_scores_by_pass_index": {"1": 0.125} if is_final else {},
+            "exact_summary_by_pass": {},
+            "exact_summary_by_pass_index": {},
+            "application_summary_by_pass": {},
+            "application_summary_by_pass_index": {},
+            "application_stability_by_pass": {},
+            "application_stability_by_pass_index": {},
+            "selected_application_summary": None,
+            "eval_bundle_path": str(eval_bundle_path),
+            "evaluation_bundle_M": 4,
+            "visual_sample_paths": int(kwargs.get("visual_sample_paths", 0)),
+            "visual_seed": int(kwargs.get("visual_seed") or 0),
+        }
+
+    original_run_recursive_training = orchestration.run_recursive_training
+    original_print_recursive_pass = orchestration.print_recursive_pass
+    orchestration.run_recursive_training = fake_run_recursive_training
+    orchestration.print_recursive_pass = fake_print_recursive_pass
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            exit_code = cli.main(
+                [
+                    "run",
+                    "--mode",
+                    "recursive",
+                    "--model",
+                    "pascucci",
+                    "--M",
+                    "4",
+                    "--N",
+                    "2",
+                    "--T_standard",
+                    "0.25",
+                    "--T_total",
+                    "0.25",
+                    "--block_size",
+                    "0.25",
+                    "--passes",
+                    "2",
+                    "--pass1_init",
+                    "base",
+                    "--visual_sample_paths",
+                    "1",
+                    "--output_dir",
+                    str(out_dir),
+                ]
+            )
+            assert exit_code == 0
+            assert len(print_calls) == 2
+            first_call, final_call = print_calls
+            assert first_call["promote_final_artifacts"] is False
+            assert first_call["exclude_pass_ids_from_selection"] == []
+            assert [int(entry["pass_id"]) for entry in first_call["pass_entries"]] == [1]
+            assert final_call["promote_final_artifacts"] is True
+            assert final_call["exclude_pass_ids_from_selection"] == [1]
+            assert [int(entry["pass_id"]) for entry in final_call["pass_entries"]] == [1, 2]
+
+            runs = sorted(out_dir.glob("run_*"))
+            assert len(runs) == 1
+            result_path = runs[0] / "recursive" / "results.json"
+            assert result_path.exists()
+            results = json.loads(result_path.read_text(encoding="utf-8"))
+            assert results["selection_excluded_pass_ids"] == [1]
+            assert results["selected_pass_id"] == 2
+            assert results["selected_pass_index"] == 1
+            assert results["promoted_final_artifacts"] is True
+    finally:
+        orchestration.run_recursive_training = original_run_recursive_training
+        orchestration.print_recursive_pass = original_print_recursive_pass
 
 
 def test_cli_records_pascucci_cost_profile_params_in_run_config() -> None:
@@ -8287,6 +8454,10 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "cli_tiny_standard_and_both_model_spec_outputs",
         "test_cli_tiny_standard_and_both_model_spec_outputs",
+    ) and ok
+    ok = _run_subprocess_case(
+        "cli_recursive_two_pass_callbacks_finalize_selection_only_at_last_pass",
+        "test_cli_recursive_two_pass_callbacks_finalize_selection_only_at_last_pass",
     ) and ok
     ok = _run_subprocess_case(
         "cli_records_pascucci_cost_profile_params_in_run_config",

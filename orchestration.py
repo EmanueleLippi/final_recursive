@@ -579,6 +579,54 @@ def print_recursive_pass(
                 prev_id = pass_id
                 prev_val = curr_val
 
+    if not bool(promote_final_artifacts):
+        plot_recursive_stitched_y_convergence(
+            stitched_by_pass=stitched_by_pass,
+            blocks=blocks,
+            out_dir=plots_dir,
+            sample_paths=sample_paths,
+        )
+        return {
+            "processed_pass_ids": sorted(pass_logs_by_pass.keys()),
+            "processed_pass_indices": sorted(_pass_index(pid) for pid in pass_logs_by_pass.keys()),
+            "score_key": score_key,
+            "pass_scores_loss": pass_scores_loss,
+            "pass_scores_loss_by_index": {
+                str(_pass_index(k)): float(v) for k, v in pass_scores_loss.items()
+            },
+            "pass_invalid_reasons": pass_invalid_reasons,
+            "pass_invalid_reasons_by_index": {
+                str(_pass_index(k)): v for k, v in pass_invalid_reasons.items()
+            },
+            "selection_finalized": False,
+            "promoted_final_artifacts": False,
+            "excluded_pass_ids_from_selection": [],
+            "excluded_pass_indices_from_selection": [],
+            "selected_pass_id": None,
+            "selected_pass_index": None,
+            "selected_score_metric": None,
+            "selected_score": None,
+            "selected_scores_by_pass": {},
+            "selected_scores_by_pass_index": {},
+            "exact_summary_by_pass": exact_summary_by_pass,
+            "exact_summary_by_pass_index": {
+                str(_pass_index(k)): v for k, v in exact_summary_by_pass.items()
+            },
+            "application_summary_by_pass": application_summary_by_pass,
+            "application_summary_by_pass_index": {
+                str(_pass_index(k)): v for k, v in application_summary_by_pass.items()
+            },
+            "application_stability_by_pass": application_stability_by_pass,
+            "application_stability_by_pass_index": {
+                str(_pass_index(k)): v for k, v in application_stability_by_pass.items()
+            },
+            "selected_application_summary": None,
+            "eval_bundle_path": eval_bundle_path,
+            "evaluation_bundle_M": int(Xi_stitched.shape[0]),
+            "visual_sample_paths": int(max(0, visual_path_count)),
+            "visual_seed": int(visual_seed_effective),
+        }
+
     finite_pass_scores_loss = {
         int(pass_id): float(score)
         for pass_id, score in pass_scores_loss.items()
@@ -596,7 +644,7 @@ def print_recursive_pass(
     excluded_pass_ids_effective = sorted(
         int(pid)
         for pid in {int(x) for x in (exclude_pass_ids_from_selection or [])}
-        if int(pid) in pass_scores_loss
+        if bool(promote_final_artifacts) and int(pid) in pass_scores_loss
     )
     pass_scores_loss_for_selection = {
         int(pass_id): float(score)
@@ -714,6 +762,7 @@ def print_recursive_pass(
         "pass_invalid_reasons_by_index": {
             str(_pass_index(k)): v for k, v in pass_invalid_reasons.items()
         },
+        "selection_finalized": True,
         "promoted_final_artifacts": bool(promote_final_artifacts),
         "excluded_pass_ids_from_selection": excluded_pass_ids_effective,
         "excluded_pass_indices_from_selection": [

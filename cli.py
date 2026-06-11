@@ -903,7 +903,9 @@ def run_program(argv: Optional[List[str]] = None):
                 enforce_exact_regression_guardrail=is_last_requested_pass,
                 print_compact_logs=is_last_requested_pass,
                 promote_final_artifacts=is_last_requested_pass,
-                exclude_pass_ids_from_selection=excluded_pass_ids_from_selection,
+                exclude_pass_ids_from_selection=(
+                    excluded_pass_ids_from_selection if is_last_requested_pass else []
+                ),
                 coupling_const=float(recursive_const),
                 model_spec=model_spec,
             )
