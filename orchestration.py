@@ -83,6 +83,38 @@ def _prefixed_eval_diagnostics(eval_stats: Dict[str, Any]) -> Dict[str, float]:
             diagnostics[f"eval_{key_str}"] = scalar
     return diagnostics
 
+def _require_finite_schedule_scalar(value: Any, *, label: str, phase: str, key: str) -> float:
+    scalar = float(np.asarray(value))
+    if not np.isfinite(scalar):
+        raise RuntimeError(f"{label} {phase} produced non-finite {key}: {scalar}")
+    return scalar
+
+def _require_finite_schedule_stats(
+    stats: Dict[str, Any],
+    *,
+    label: str,
+    phase: str,
+    keys: Tuple[str, ...],
+) -> None:
+    for key in keys:
+        if key in stats and stats[key] is not None:
+            _require_finite_schedule_scalar(stats[key], label=label, phase=phase, key=key)
+
+def _nonfinite_stitched_reason(stitched: Dict[str, np.ndarray], *, pass_label: str) -> Optional[str]:
+    required = ("t", "X", "Y", "Z")
+    for key in required:
+        if key not in stitched:
+            return f"{pass_label} stitched predictions missing required key '{key}'"
+    for key, value in stitched.items():
+        arr = np.asarray(value)
+        if arr.dtype.kind not in "fciu":
+            continue
+        if arr.size == 0:
+            return f"{pass_label} stitched predictions key '{key}' is empty"
+        if not np.isfinite(arr).all():
+            return f"{pass_label} stitched predictions key '{key}' contains non-finite values"
+    return None
+
 
 def _stitch_rollout_inputs(
     rollout_inputs: List[Tuple[np.ndarray, np.ndarray]],
@@ -251,6 +283,7 @@ def print_recursive_pass(
     visual_seed: Optional[int] = None,
     enforce_exact_regression_guardrail: bool = True,
     print_compact_logs: bool = True,
+    promote_final_artifacts: bool = True,
     exclude_pass_ids_from_selection: Optional[List[int]] = None,
     coupling_const: float = 1.0,
     model_spec: Optional[ModelSpec] = None,
@@ -309,29 +342,11 @@ def print_recursive_pass(
     }
     if len(pass_scores_loss) == 0:
         raise RuntimeError("No pass logs available for pass selection")
-    best_pass_by_loss = int(min(pass_scores_loss, key=pass_scores_loss.get))
-    print(
-        f"[Selection:loss] metric={score_key}, best={_pass_label(best_pass_by_loss)}, "
-        f"score={pass_scores_loss[best_pass_by_loss]:.6e}"
-    )
-    excluded_pass_ids_effective = sorted(
-        int(pid)
-        for pid in {int(x) for x in (exclude_pass_ids_from_selection or [])}
-        if int(pid) in pass_scores_loss
-    )
-    pass_scores_loss_for_selection = {
-        int(pass_id): float(score)
+    pass_invalid_reasons = {
+        int(pass_id): f"{_pass_label(int(pass_id))} has non-finite or missing {score_key}"
         for pass_id, score in pass_scores_loss.items()
-        if int(pass_id) not in excluded_pass_ids_effective
+        if not np.isfinite(float(score))
     }
-    if len(pass_scores_loss_for_selection) == 0:
-        pass_scores_loss_for_selection = dict(pass_scores_loss)
-        excluded_pass_ids_effective = []
-    elif len(excluded_pass_ids_effective) > 0:
-        print(
-            "[Selection] excluding passes from final choice: "
-            + ", ".join(_pass_label(pid) for pid in excluded_pass_ids_effective)
-        )
 
     eval_bundle_path = str(eval_bundle_path or "").strip()
     if eval_bundle_path == "":
@@ -408,6 +423,9 @@ def print_recursive_pass(
     for p in pass_entries:
         pass_id = int(p["pass_id"])
         pass_tag = _pass_tag(pass_id)
+        if pass_id in pass_invalid_reasons:
+            print(f"[PassValidity] {_pass_label(pass_id)} invalid: {pass_invalid_reasons[pass_id]}")
+            continue
         stitched_pred = predict_recursive_stitched(
             block_blobs=p["blobs"],
             blocks=blocks,
@@ -427,6 +445,15 @@ def print_recursive_pass(
             stitched_pred,
             os.path.join(rec_dir, f"stitched_predictions_{pass_tag}.npz"),
         )
+        stitched_invalid_reason = _nonfinite_stitched_reason(
+            stitched_pred,
+            pass_label=_pass_label(pass_id),
+        )
+        if stitched_invalid_reason is not None:
+            pass_scores_loss[pass_id] = float("inf")
+            pass_invalid_reasons[pass_id] = stitched_invalid_reason
+            print(f"[PassValidity] {_pass_label(pass_id)} invalid: {stitched_invalid_reason}")
+            continue
         plot_recursive_stitched_predictions(
             stitched=stitched_pred,
             blocks=blocks,
@@ -569,6 +596,84 @@ def print_recursive_pass(
                 prev_id = pass_id
                 prev_val = curr_val
 
+    if not bool(promote_final_artifacts):
+        plot_recursive_stitched_y_convergence(
+            stitched_by_pass=stitched_by_pass,
+            blocks=blocks,
+            out_dir=plots_dir,
+            sample_paths=sample_paths,
+        )
+        return {
+            "processed_pass_ids": sorted(pass_logs_by_pass.keys()),
+            "processed_pass_indices": sorted(_pass_index(pid) for pid in pass_logs_by_pass.keys()),
+            "score_key": score_key,
+            "pass_scores_loss": pass_scores_loss,
+            "pass_scores_loss_by_index": {
+                str(_pass_index(k)): float(v) for k, v in pass_scores_loss.items()
+            },
+            "pass_invalid_reasons": pass_invalid_reasons,
+            "pass_invalid_reasons_by_index": {
+                str(_pass_index(k)): v for k, v in pass_invalid_reasons.items()
+            },
+            "selection_finalized": False,
+            "promoted_final_artifacts": False,
+            "excluded_pass_ids_from_selection": [],
+            "excluded_pass_indices_from_selection": [],
+            "selected_pass_id": None,
+            "selected_pass_index": None,
+            "selected_score_metric": None,
+            "selected_score": None,
+            "selected_scores_by_pass": {},
+            "selected_scores_by_pass_index": {},
+            "exact_summary_by_pass": exact_summary_by_pass,
+            "exact_summary_by_pass_index": {
+                str(_pass_index(k)): v for k, v in exact_summary_by_pass.items()
+            },
+            "application_summary_by_pass": application_summary_by_pass,
+            "application_summary_by_pass_index": {
+                str(_pass_index(k)): v for k, v in application_summary_by_pass.items()
+            },
+            "application_stability_by_pass": application_stability_by_pass,
+            "application_stability_by_pass_index": {
+                str(_pass_index(k)): v for k, v in application_stability_by_pass.items()
+            },
+            "selected_application_summary": None,
+            "eval_bundle_path": eval_bundle_path,
+            "evaluation_bundle_M": int(Xi_stitched.shape[0]),
+            "visual_sample_paths": int(max(0, visual_path_count)),
+            "visual_seed": int(visual_seed_effective),
+        }
+
+    finite_pass_scores_loss = {
+        int(pass_id): float(score)
+        for pass_id, score in pass_scores_loss.items()
+        if np.isfinite(float(score))
+    }
+    if len(finite_pass_scores_loss) > 0:
+        best_pass_by_loss = int(min(finite_pass_scores_loss, key=finite_pass_scores_loss.get))
+        print(
+            f"[Selection:loss] metric={score_key}, best={_pass_label(best_pass_by_loss)}, "
+            f"score={finite_pass_scores_loss[best_pass_by_loss]:.6e}"
+        )
+    else:
+        print(f"[Selection:loss] metric={score_key}, no finite pass scores")
+
+    excluded_pass_ids_effective = sorted(
+        int(pid)
+        for pid in {int(x) for x in (exclude_pass_ids_from_selection or [])}
+        if bool(promote_final_artifacts) and int(pid) in pass_scores_loss
+    )
+    pass_scores_loss_for_selection = {
+        int(pass_id): float(score)
+        for pass_id, score in finite_pass_scores_loss.items()
+        if int(pass_id) not in excluded_pass_ids_effective
+    }
+    if len(excluded_pass_ids_effective) > 0:
+        print(
+            "[Selection] excluding passes from final choice: "
+            + ", ".join(_pass_label(pid) for pid in excluded_pass_ids_effective)
+        )
+
     exact_summary_by_pass_for_selection = {
         int(pass_id): summary
         for pass_id, summary in exact_summary_by_pass.items()
@@ -590,69 +695,70 @@ def print_recursive_pass(
     selected_visual_stitched = visual_stitched_by_pass.get(selected_pass_id, None)
     selected_visual_exact_bundle = visual_exact_bundle_by_pass.get(selected_pass_id, None)
     selected_application_summary = application_summary_by_pass.get(selected_pass_id, None)
-    save_blob_npz(
-        selected_stitched,
-        os.path.join(rec_dir, "stitched_predictions_final.npz"),
-    )
-    plot_recursive_stitched_predictions(
-        stitched=selected_stitched,
-        blocks=blocks,
-        out_dir=plots_dir,
-        sample_paths=sample_paths,
-        file_suffix="",
-    )
-
-    if exact_solution is not None and selected_exact_bundle is not None:
-        save_json(
-            {
-                "summary": selected_exact_bundle["summary"],
-                "timeseries": selected_exact_bundle["timeseries"],
-            },
-            os.path.join(rec_dir, "exact_metrics_final.json"),
+    if promote_final_artifacts:
+        save_blob_npz(
+            selected_stitched,
+            os.path.join(rec_dir, "stitched_predictions_final.npz"),
         )
-        save_exact_error_timeseries_csv(
-            selected_exact_bundle["timeseries"],
-            os.path.join(rec_dir, "exact_errors_final.csv"),
-        )
-        plot_recursive_exact_comparison(
+        plot_recursive_stitched_predictions(
             stitched=selected_stitched,
-            Y_exact=selected_exact_bundle["Y_exact"],
-            Z_exact=selected_exact_bundle["Z_exact"],
             blocks=blocks,
             out_dir=plots_dir,
             sample_paths=sample_paths,
             file_suffix="",
-            include_path_plots=False,
-            include_error_plots=True,
         )
-        if selected_visual_stitched is not None and selected_visual_exact_bundle is not None:
-            save_blob_npz(
-                selected_visual_stitched,
-                os.path.join(rec_dir, "visual_stitched_predictions_final.npz"),
+
+        if exact_solution is not None and selected_exact_bundle is not None:
+            save_json(
+                {
+                    "summary": selected_exact_bundle["summary"],
+                    "timeseries": selected_exact_bundle["timeseries"],
+                },
+                os.path.join(rec_dir, "exact_metrics_final.json"),
+            )
+            save_exact_error_timeseries_csv(
+                selected_exact_bundle["timeseries"],
+                os.path.join(rec_dir, "exact_errors_final.csv"),
             )
             plot_recursive_exact_comparison(
-                stitched=selected_visual_stitched,
-                Y_exact=selected_visual_exact_bundle["Y_exact"],
-                Z_exact=selected_visual_exact_bundle["Z_exact"],
+                stitched=selected_stitched,
+                Y_exact=selected_exact_bundle["Y_exact"],
+                Z_exact=selected_exact_bundle["Z_exact"],
                 blocks=blocks,
                 out_dir=plots_dir,
-                sample_paths=visual_path_count,
+                sample_paths=sample_paths,
                 file_suffix="",
-                include_path_plots=True,
-                include_error_plots=False,
+                include_path_plots=False,
+                include_error_plots=True,
             )
+            if selected_visual_stitched is not None and selected_visual_exact_bundle is not None:
+                save_blob_npz(
+                    selected_visual_stitched,
+                    os.path.join(rec_dir, "visual_stitched_predictions_final.npz"),
+                )
+                plot_recursive_exact_comparison(
+                    stitched=selected_visual_stitched,
+                    Y_exact=selected_visual_exact_bundle["Y_exact"],
+                    Z_exact=selected_visual_exact_bundle["Z_exact"],
+                    blocks=blocks,
+                    out_dir=plots_dir,
+                    sample_paths=visual_path_count,
+                    file_suffix="",
+                    include_path_plots=True,
+                    include_error_plots=False,
+                )
 
-    if selected_application_summary is not None:
-        application_final_json_path = os.path.join(rec_dir, "application_metrics_final.json")
-        application_final_npz_path = os.path.join(rec_dir, "application_metrics_final.npz")
-        application_final_summary = dict(selected_application_summary)
-        application_final_summary["selected_from_pass_id"] = int(selected_pass_id)
-        application_final_summary["selected_from_pass_index"] = int(_pass_index(selected_pass_id))
-        application_final_summary["output_path"] = application_final_json_path
-        application_final_summary["pathwise_npz_path"] = application_final_npz_path
-        save_blob_npz(application_pathwise_by_pass[selected_pass_id], application_final_npz_path)
-        save_json(application_final_summary, application_final_json_path)
-        selected_application_summary = application_final_summary
+        if selected_application_summary is not None:
+            application_final_json_path = os.path.join(rec_dir, "application_metrics_final.json")
+            application_final_npz_path = os.path.join(rec_dir, "application_metrics_final.npz")
+            application_final_summary = dict(selected_application_summary)
+            application_final_summary["selected_from_pass_id"] = int(selected_pass_id)
+            application_final_summary["selected_from_pass_index"] = int(_pass_index(selected_pass_id))
+            application_final_summary["output_path"] = application_final_json_path
+            application_final_summary["pathwise_npz_path"] = application_final_npz_path
+            save_blob_npz(application_pathwise_by_pass[selected_pass_id], application_final_npz_path)
+            save_json(application_final_summary, application_final_json_path)
+            selected_application_summary = application_final_summary
 
     plot_recursive_stitched_y_convergence(
         stitched_by_pass=stitched_by_pass,
@@ -669,6 +775,12 @@ def print_recursive_pass(
         "pass_scores_loss_by_index": {
             str(_pass_index(k)): float(v) for k, v in pass_scores_loss.items()
         },
+        "pass_invalid_reasons": pass_invalid_reasons,
+        "pass_invalid_reasons_by_index": {
+            str(_pass_index(k)): v for k, v in pass_invalid_reasons.items()
+        },
+        "selection_finalized": True,
+        "promoted_final_artifacts": bool(promote_final_artifacts),
         "excluded_pass_ids_from_selection": excluded_pass_ids_effective,
         "excluded_pass_indices_from_selection": [
             int(_pass_index(pid)) for pid in excluded_pass_ids_effective
@@ -708,10 +820,17 @@ def resolve_pass_selection(
     loss_metric_label: str = "eval_mean_loss_per_sample",
 ) -> Tuple[int, str, float, Dict[str, float]]:
     if len(pass_scores_by_loss) == 0:
-        raise RuntimeError("resolve_pass_selection called with empty pass_scores_by_loss")
+        raise RuntimeError("No finite pass scores available for pass selection")
+    finite_loss_scores = {
+        int(pass_id): float(score)
+        for pass_id, score in pass_scores_by_loss.items()
+        if np.isfinite(float(score))
+    }
+    if len(finite_loss_scores) == 0:
+        raise RuntimeError("No finite pass scores available for pass selection")
 
     metric = str(selection_metric or "auto").strip().lower()
-    selected_by_loss = int(min(pass_scores_by_loss, key=pass_scores_by_loss.get))
+    selected_by_loss = int(min(finite_loss_scores, key=finite_loss_scores.get))
 
     if metric in ("", "auto"):
         if len(exact_summary_by_pass) > 0:
@@ -723,16 +842,16 @@ def resolve_pass_selection(
         return (
             selected_by_loss,
             f"{loss_metric_label}+0.35*worst_block",
-            float(pass_scores_by_loss[selected_by_loss]),
-            {str(k): float(v) for k, v in pass_scores_by_loss.items()},
+            float(finite_loss_scores[selected_by_loss]),
+            {str(k): float(v) for k, v in finite_loss_scores.items()},
         )
     if metric == "last":
-        selected_last = int(max(pass_scores_by_loss))
+        selected_last = int(max(finite_loss_scores))
         return (
             selected_last,
             "last_pass",
-            float(pass_scores_by_loss[selected_last]),
-            {str(k): float(v) for k, v in pass_scores_by_loss.items()},
+            float(finite_loss_scores[selected_last]),
+            {str(k): float(v) for k, v in finite_loss_scores.items()},
         )
 
     metric_extractors = {
@@ -759,7 +878,11 @@ def resolve_pass_selection(
     label, extractor = metric_extractors[metric]
     scores = {}
     for pass_id, summary in exact_summary_by_pass.items():
-        scores[int(pass_id)] = float(extractor(summary))
+        score = float(extractor(summary))
+        if np.isfinite(score):
+            scores[int(pass_id)] = score
+    if len(scores) == 0:
+        raise RuntimeError(f"No finite exact scores available for selection_metric='{metric}'")
     selected_pass = int(min(scores, key=scores.get))
     return (
         selected_pass,
@@ -966,6 +1089,25 @@ def train_with_standard_schedule(
             t0 = time.time()
             train_stats = model.train(N_Iter=n_iter, learning_rate=lr, const_value=level)
             eval_stats = model.evaluate(const_value=level, n_batches=eval_batches)
+            _require_finite_schedule_stats(
+                train_stats,
+                label=label,
+                phase=f"train lr={lr:.1e}",
+                keys=("last_loss", "best_score"),
+            )
+            _require_finite_schedule_stats(
+                eval_stats,
+                label=label,
+                phase=f"eval lr={lr:.1e}",
+                keys=(
+                    "mean_loss",
+                    "std_loss",
+                    "mean_loss_per_sample",
+                    "std_loss_per_sample",
+                    "mean_y0",
+                    "std_y0",
+                ),
+            )
             elapsed = time.time() - t0
             stage_logs.append(
                 {
@@ -1006,6 +1148,25 @@ def train_with_standard_schedule(
             restore_best=True,
         )
         eval_stats = model.evaluate(const_value=float(coupling_const), n_batches=eval_batches)
+        _require_finite_schedule_stats(
+            train_stats,
+            label=label,
+            phase=f"train lr={lr:.1e}",
+            keys=("last_loss", "best_score"),
+        )
+        _require_finite_schedule_stats(
+            eval_stats,
+            label=label,
+            phase=f"eval lr={lr:.1e}",
+            keys=(
+                "mean_loss",
+                "std_loss",
+                "mean_loss_per_sample",
+                "std_loss_per_sample",
+                "mean_y0",
+                "std_y0",
+            ),
+        )
         elapsed = time.time() - t0
         stage_logs.append(
             {
@@ -1049,7 +1210,7 @@ def train_with_standard_schedule(
             f"loss={eval_stats['mean_loss']:.3e} > target={precision_target:.3e}"
         )
         for n_iter, lr in local_refine_plan:
-            model.train(
+            train_stats = model.train(
                 N_Iter=n_iter,
                 learning_rate=lr,
                 const_value=float(coupling_const),
@@ -1060,7 +1221,26 @@ def train_with_standard_schedule(
                 min_delta=1e-3,
                 restore_best=True,
             )
+            _require_finite_schedule_stats(
+                train_stats,
+                label=label,
+                phase=f"refine train lr={lr:.1e}",
+                keys=("last_loss", "best_score"),
+            )
         eval_stats = model.evaluate(const_value=float(coupling_const), n_batches=eval_batches)
+        _require_finite_schedule_stats(
+            eval_stats,
+            label=label,
+            phase=f"refine eval round={refine_rounds}",
+            keys=(
+                "mean_loss",
+                "std_loss",
+                "mean_loss_per_sample",
+                "std_loss_per_sample",
+                "mean_y0",
+                "std_y0",
+            ),
+        )
 
     return {
         "stage_logs": stage_logs,

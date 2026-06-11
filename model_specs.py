@@ -135,6 +135,7 @@ class ModelSpec:
     application_metric_schema: str = "none"
     application_metric_names: tuple[str, ...] = ()
     application_metric_aggregation: str = "none"
+    exclude_bootstrap_pass_from_selection: bool = False
 
     def validate_state_dim(self, D: int) -> None:
         if int(D) != int(self.state_dim):
@@ -185,6 +186,7 @@ def get_model_spec(name: Optional[str] = None) -> ModelSpec:
             recursive_model_factory=_build_quadratic_recursive_model,
             build_exact_solution=build_exact_solution_functions,
             build_exact_initial_boundary_samples=build_exact_initial_boundary_samples,
+            exclude_bootstrap_pass_from_selection=True,
         )
 
     if requested == "pascucci":
@@ -210,6 +212,7 @@ def get_model_spec(name: Optional[str] = None) -> ModelSpec:
                 "cost_J_running_cumulative",
             ),
             application_metric_aggregation="left_riemann_f_plus_terminal_g",
+            exclude_bootstrap_pass_from_selection=False,
         )
 
     raise ValueError(
