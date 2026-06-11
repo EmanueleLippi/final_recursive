@@ -83,6 +83,23 @@ def _prefixed_eval_diagnostics(eval_stats: Dict[str, Any]) -> Dict[str, float]:
             diagnostics[f"eval_{key_str}"] = scalar
     return diagnostics
 
+def _require_finite_schedule_scalar(value: Any, *, label: str, phase: str, key: str) -> float:
+    scalar = float(np.asarray(value))
+    if not np.isfinite(scalar):
+        raise RuntimeError(f"{label} {phase} produced non-finite {key}: {scalar}")
+    return scalar
+
+def _require_finite_schedule_stats(
+    stats: Dict[str, Any],
+    *,
+    label: str,
+    phase: str,
+    keys: Tuple[str, ...],
+) -> None:
+    for key in keys:
+        if key in stats and stats[key] is not None:
+            _require_finite_schedule_scalar(stats[key], label=label, phase=phase, key=key)
+
 def _nonfinite_stitched_reason(stitched: Dict[str, np.ndarray], *, pass_label: str) -> Optional[str]:
     required = ("t", "X", "Y", "Z")
     for key in required:
@@ -1072,6 +1089,25 @@ def train_with_standard_schedule(
             t0 = time.time()
             train_stats = model.train(N_Iter=n_iter, learning_rate=lr, const_value=level)
             eval_stats = model.evaluate(const_value=level, n_batches=eval_batches)
+            _require_finite_schedule_stats(
+                train_stats,
+                label=label,
+                phase=f"train lr={lr:.1e}",
+                keys=("last_loss", "best_score"),
+            )
+            _require_finite_schedule_stats(
+                eval_stats,
+                label=label,
+                phase=f"eval lr={lr:.1e}",
+                keys=(
+                    "mean_loss",
+                    "std_loss",
+                    "mean_loss_per_sample",
+                    "std_loss_per_sample",
+                    "mean_y0",
+                    "std_y0",
+                ),
+            )
             elapsed = time.time() - t0
             stage_logs.append(
                 {
@@ -1112,6 +1148,25 @@ def train_with_standard_schedule(
             restore_best=True,
         )
         eval_stats = model.evaluate(const_value=float(coupling_const), n_batches=eval_batches)
+        _require_finite_schedule_stats(
+            train_stats,
+            label=label,
+            phase=f"train lr={lr:.1e}",
+            keys=("last_loss", "best_score"),
+        )
+        _require_finite_schedule_stats(
+            eval_stats,
+            label=label,
+            phase=f"eval lr={lr:.1e}",
+            keys=(
+                "mean_loss",
+                "std_loss",
+                "mean_loss_per_sample",
+                "std_loss_per_sample",
+                "mean_y0",
+                "std_y0",
+            ),
+        )
         elapsed = time.time() - t0
         stage_logs.append(
             {
@@ -1155,7 +1210,7 @@ def train_with_standard_schedule(
             f"loss={eval_stats['mean_loss']:.3e} > target={precision_target:.3e}"
         )
         for n_iter, lr in local_refine_plan:
-            model.train(
+            train_stats = model.train(
                 N_Iter=n_iter,
                 learning_rate=lr,
                 const_value=float(coupling_const),
@@ -1166,7 +1221,26 @@ def train_with_standard_schedule(
                 min_delta=1e-3,
                 restore_best=True,
             )
+            _require_finite_schedule_stats(
+                train_stats,
+                label=label,
+                phase=f"refine train lr={lr:.1e}",
+                keys=("last_loss", "best_score"),
+            )
         eval_stats = model.evaluate(const_value=float(coupling_const), n_batches=eval_batches)
+        _require_finite_schedule_stats(
+            eval_stats,
+            label=label,
+            phase=f"refine eval round={refine_rounds}",
+            keys=(
+                "mean_loss",
+                "std_loss",
+                "mean_loss_per_sample",
+                "std_loss_per_sample",
+                "mean_y0",
+                "std_y0",
+            ),
+        )
 
     return {
         "stage_logs": stage_logs,

@@ -865,7 +865,11 @@ def run_program(argv: Optional[List[str]] = None):
 
         excluded_pass_ids_from_selection = (
             [1]
-            if (pass1_init_mode == "base" and int(args.passes) > 1)
+            if (
+                bool(model_spec.exclude_bootstrap_pass_from_selection)
+                and pass1_init_mode == "base"
+                and int(args.passes) > 1
+            )
             else []
         )
 

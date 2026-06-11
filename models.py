@@ -518,6 +518,12 @@ class FBSNN(tf.Module, ABC):
         self.const = np.float32(const_value)
         self.const_tf.assign(np.float32(const_value))
 
+    def _require_finite_training_scalar(self, value, label: str) -> float:
+        scalar = float(np.asarray(value))
+        if not np.isfinite(scalar):
+            raise RuntimeError(f"non-finite training scalar {label}: {scalar}")
+        return scalar
+
     @tf.function(reduce_retracing=True)
     def _train_step_tensor(self, t_batch, W_batch, Xi_batch, const_value):
         with tf.GradientTape() as tape:
@@ -527,12 +533,17 @@ class FBSNN(tf.Module, ABC):
                 Xi_batch,
                 const_value=const_value,
             )
+        tf.debugging.assert_all_finite(loss_value, "non-finite training loss")
         variables = self.trainable_variables
         gradients = tape.gradient(loss_value, variables)
         grads_and_vars = [(g, v) for g, v in zip(gradients, variables) if g is not None]
+        for grad, _ in grads_and_vars:
+            tf.debugging.assert_all_finite(grad, "non-finite training gradient")
         if self.clip_grad_norm is not None and grads_and_vars:
             grads, vars_ = zip(*grads_and_vars)
             clipped, _ = tf.clip_by_global_norm(grads, self.clip_grad_norm)
+            for grad in clipped:
+                tf.debugging.assert_all_finite(grad, "non-finite clipped training gradient")
             grads_and_vars = list(zip(clipped, vars_))
         self.optimizer.apply_gradients(grads_and_vars)
         return loss_value
@@ -563,12 +574,19 @@ class FBSNN(tf.Module, ABC):
 
         for it in range(int(N_Iter)):
             t_batch, W_batch, Xi_batch = self.fetch_minibatch()
-            self._train_step_tensor(
-                tf.convert_to_tensor(t_batch, dtype=tf.float32),
-                tf.convert_to_tensor(W_batch, dtype=tf.float32),
-                tf.convert_to_tensor(Xi_batch, dtype=tf.float32),
-                tf.constant(current_const, dtype=tf.float32),
-            )
+            try:
+                train_loss = self._train_step_tensor(
+                    tf.convert_to_tensor(t_batch, dtype=tf.float32),
+                    tf.convert_to_tensor(W_batch, dtype=tf.float32),
+                    tf.convert_to_tensor(Xi_batch, dtype=tf.float32),
+                    tf.constant(current_const, dtype=tf.float32),
+                )
+                self._require_finite_training_scalar(
+                    train_loss.numpy(),
+                    f"loss before update at it={it}",
+                )
+            except tf.errors.InvalidArgumentError as exc:
+                raise RuntimeError(f"non-finite training step at it={it}: {exc.message}") from exc
 
             if it % 50 == 0:
                 elapsed = time.time() - start_time
@@ -578,8 +596,14 @@ class FBSNN(tf.Module, ABC):
                     Xi_batch,
                     const_value=current_const,
                 )
-                last_loss = float(loss_value.numpy())
-                mean_Y0 = np.mean(Y_value.numpy()[:, 0, 0])
+                last_loss = self._require_finite_training_scalar(
+                    loss_value.numpy(),
+                    f"loss after update at it={it}",
+                )
+                mean_Y0 = self._require_finite_training_scalar(
+                    np.mean(Y_value.numpy()[:, 0, 0]),
+                    f"mean_Y0 after update at it={it}",
+                )
                 print(
                     "It: %d, Loss: %.3e, Mean Y0: %.3f, Time: %.2f, Learning Rate: %.3e"
                     % (it, last_loss, mean_Y0, elapsed, float(learning_rate))
@@ -589,7 +613,10 @@ class FBSNN(tf.Module, ABC):
             if (it % int(eval_every) == 0) or (it == int(N_Iter) - 1):
                 eval_stats = self.evaluate(const_value=current_const, n_batches=val_batches)
                 if early_stopping_metric == "loss":
-                    score = eval_stats["mean_loss"]
+                    score = self._require_finite_training_scalar(
+                        eval_stats["mean_loss"],
+                        f"eval {early_stopping_metric} at it={it}",
+                    )
                 else:
                     raise ValueError(f"Unsupported early_stopping_metric='{early_stopping_metric}'")
 

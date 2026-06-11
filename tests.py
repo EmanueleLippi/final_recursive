@@ -310,6 +310,7 @@ def test_model_spec_contract() -> None:
     assert spec.state_labels == ("S", "H", "V", "X_state")
     assert spec.z_labels == ("Z_S", "Z_H", "Z_V", "Z_X")
     assert spec.build_layers(4) == [5, 256, 256, 256, 256, 1]
+    assert spec.exclude_bootstrap_pass_from_selection is True
 
     params = spec.build_default_params(const=0.75)
     expected = _default_params(const=0.75)
@@ -323,6 +324,7 @@ def test_model_spec_contract() -> None:
     assert pascucci_spec.state_labels == ("S", "H", "V", "X_state")
     assert pascucci_spec.z_labels == ("Z_S", "Z_H", "Z_V", "Z_X")
     assert pascucci_spec.build_layers(4) == [5, 256, 256, 256, 256, 1]
+    assert pascucci_spec.exclude_bootstrap_pass_from_selection is False
 
     pascucci_params = pascucci_spec.build_default_params(const=0.55)
     assert pascucci_params["const"] == np.float32(0.55)
@@ -4828,6 +4830,72 @@ def test_tf2_model_smoke_and_blob_roundtrip() -> None:
     model2.close()
 
 
+def test_model_train_rejects_nonfinite_loss() -> None:
+    from .models import NN_Quadratic_Coupled_Recursive
+    from .tf_backend import set_seed, tf
+
+    set_seed(23)
+    params = _default_params()
+    layers = [5, 8, 1]
+    model = NN_Quadratic_Coupled_Recursive(
+        Xi_generator=Xi_generator_default,
+        T=0.25,
+        M=4,
+        N=2,
+        D=4,
+        layers=layers,
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        normalize_time_input=True,
+    )
+
+    def nonfinite_loss_function(
+        t,
+        W,
+        Xi,
+        const_value=None,
+        return_components=False,
+        return_runtime_diagnostics=False,
+    ):
+        del W, const_value
+        batch_size = tf.shape(Xi)[0]
+        n_steps = tf.shape(t)[1]
+        loss = tf.reduce_sum(model.trainable_variables[0] * 0.0) + tf.constant(float("nan"), dtype=tf.float32)
+        X = tf.zeros((batch_size, n_steps, 4), dtype=tf.float32)
+        Y = tf.zeros((batch_size, n_steps, 1), dtype=tf.float32)
+        Z = tf.zeros((batch_size, n_steps, 4), dtype=tf.float32)
+        components = {"loss_total": loss}
+        diagnostics = {}
+        if return_components and return_runtime_diagnostics:
+            return loss, X, Y, Z, components, diagnostics
+        if return_components:
+            return loss, X, Y, Z, components
+        if return_runtime_diagnostics:
+            return loss, X, Y, Z, diagnostics
+        return loss, X, Y, Z
+
+    original_loss_function = model.loss_function
+    model.loss_function = nonfinite_loss_function
+    try:
+        try:
+            model.train(
+                N_Iter=2,
+                learning_rate=1.0e-3,
+                const_value=1.0,
+                eval_every=1,
+                val_batches=1,
+            )
+        except RuntimeError as exc:
+            assert "non-finite" in str(exc).lower()
+        else:
+            raise AssertionError("training should reject a non-finite loss")
+    finally:
+        model.loss_function = original_loss_function
+        model.close()
+
+
 def test_model_spec_recursive_factory_matches_direct_constructor() -> None:
     from .model_specs import get_model_spec
     from .models import NN_Quadratic_Coupled_Recursive
@@ -7029,7 +7097,8 @@ def test_cli_recursive_two_pass_callbacks_finalize_selection_only_at_last_pass()
         np.savez(eval_bundle_path, Xi_initial=np.zeros((4, kwargs["D"]), dtype=np.float32))
         pass_ids = [int(entry["pass_id"]) for entry in kwargs["pass_entries"]]
         is_final = bool(kwargs.get("promote_final_artifacts", True))
-        selected_pass_id = 2 if is_final else None
+        excluded_pass_ids = list(kwargs.get("exclude_pass_ids_from_selection", []) or [])
+        selected_pass_id = 1 if is_final and 1 not in excluded_pass_ids else (2 if is_final else None)
         return {
             "processed_pass_ids": pass_ids,
             "processed_pass_indices": [_pass_index(pid) for pid in pass_ids],
@@ -7042,14 +7111,24 @@ def test_cli_recursive_two_pass_callbacks_finalize_selection_only_at_last_pass()
             "pass_invalid_reasons_by_index": {},
             "selection_finalized": is_final,
             "promoted_final_artifacts": is_final,
-            "excluded_pass_ids_from_selection": [1] if is_final else [],
-            "excluded_pass_indices_from_selection": [0] if is_final else [],
+            "excluded_pass_ids_from_selection": excluded_pass_ids if is_final else [],
+            "excluded_pass_indices_from_selection": [
+                _pass_index(pid) for pid in excluded_pass_ids
+            ] if is_final else [],
             "selected_pass_id": selected_pass_id,
             "selected_pass_index": _pass_index(selected_pass_id) if selected_pass_id is not None else None,
             "selected_score_metric": "loss.eval_mean_loss_per_sample" if is_final else None,
-            "selected_score": 0.125 if is_final else None,
-            "selected_scores_by_pass": {2: 0.125} if is_final else {},
-            "selected_scores_by_pass_index": {"1": 0.125} if is_final else {},
+            "selected_score": (0.25 / float(selected_pass_id)) if is_final else None,
+            "selected_scores_by_pass": (
+                {selected_pass_id: 0.25 / float(selected_pass_id)}
+                if is_final
+                else {}
+            ),
+            "selected_scores_by_pass_index": (
+                {str(_pass_index(selected_pass_id)): 0.25 / float(selected_pass_id)}
+                if is_final
+                else {}
+            ),
             "exact_summary_by_pass": {},
             "exact_summary_by_pass_index": {},
             "application_summary_by_pass": {},
@@ -7070,53 +7149,59 @@ def test_cli_recursive_two_pass_callbacks_finalize_selection_only_at_last_pass()
 
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            out_dir = Path(tmp)
-            exit_code = cli.main(
-                [
-                    "run",
-                    "--mode",
-                    "recursive",
-                    "--model",
-                    "pascucci",
-                    "--M",
-                    "4",
-                    "--N",
-                    "2",
-                    "--T_standard",
-                    "0.25",
-                    "--T_total",
-                    "0.25",
-                    "--block_size",
-                    "0.25",
-                    "--passes",
-                    "2",
-                    "--pass1_init",
-                    "base",
-                    "--visual_sample_paths",
-                    "1",
-                    "--output_dir",
-                    str(out_dir),
-                ]
-            )
-            assert exit_code == 0
-            assert len(print_calls) == 2
-            first_call, final_call = print_calls
-            assert first_call["promote_final_artifacts"] is False
-            assert first_call["exclude_pass_ids_from_selection"] == []
-            assert [int(entry["pass_id"]) for entry in first_call["pass_entries"]] == [1]
-            assert final_call["promote_final_artifacts"] is True
-            assert final_call["exclude_pass_ids_from_selection"] == [1]
-            assert [int(entry["pass_id"]) for entry in final_call["pass_entries"]] == [1, 2]
+            cases = [
+                ("pascucci", [], 1, 0),
+                ("quadratic_coupled", [1], 2, 1),
+            ]
+            for model_name, expected_excluded, expected_selected_id, expected_selected_index in cases:
+                print_calls.clear()
+                out_dir = Path(tmp) / model_name
+                exit_code = cli.main(
+                    [
+                        "run",
+                        "--mode",
+                        "recursive",
+                        "--model",
+                        model_name,
+                        "--M",
+                        "4",
+                        "--N",
+                        "2",
+                        "--T_standard",
+                        "0.25",
+                        "--T_total",
+                        "0.25",
+                        "--block_size",
+                        "0.25",
+                        "--passes",
+                        "2",
+                        "--pass1_init",
+                        "base",
+                        "--visual_sample_paths",
+                        "1",
+                        "--output_dir",
+                        str(out_dir),
+                    ]
+                )
+                assert exit_code == 0
+                assert len(print_calls) == 2
+                first_call, final_call = print_calls
+                assert first_call["promote_final_artifacts"] is False
+                assert first_call["exclude_pass_ids_from_selection"] == []
+                assert [int(entry["pass_id"]) for entry in first_call["pass_entries"]] == [1]
+                assert final_call["promote_final_artifacts"] is True
+                assert final_call["exclude_pass_ids_from_selection"] == expected_excluded
+                assert [int(entry["pass_id"]) for entry in final_call["pass_entries"]] == [1, 2]
 
-            runs = sorted(out_dir.glob("run_*"))
-            assert len(runs) == 1
-            result_path = runs[0] / "recursive" / "results.json"
-            assert result_path.exists()
-            results = json.loads(result_path.read_text(encoding="utf-8"))
-            assert results["selection_excluded_pass_ids"] == [1]
-            assert results["selected_pass_id"] == 2
-            assert results["selected_pass_index"] == 1
-            assert results["promoted_final_artifacts"] is True
+                runs = sorted(out_dir.glob("run_*"))
+                assert len(runs) == 1
+                result_path = runs[0] / "recursive" / "results.json"
+                assert result_path.exists()
+                results = json.loads(result_path.read_text(encoding="utf-8"))
+                assert results["selection_excluded_pass_ids"] == expected_excluded
+                assert results["selected_pass_id"] == expected_selected_id
+                assert results["selected_pass_index"] == expected_selected_index
+                assert results["promoted_final_artifacts"] is True
     finally:
         orchestration.run_recursive_training = original_run_recursive_training
         orchestration.print_recursive_pass = original_print_recursive_pass
@@ -7999,6 +8084,109 @@ def test_terminal_blob_constants_survive_train_graph() -> None:
     model.close()
 
 
+def test_train_with_standard_schedule_rejects_nonfinite_stage() -> None:
+    from .orchestration import train_with_standard_schedule
+
+    class NonFiniteStageModel:
+        def __init__(self) -> None:
+            self.const = np.float32(1.0)
+            self.train_calls = 0
+            self.evaluate_calls = 0
+
+        def train(self, **kwargs):
+            self.train_calls += 1
+            return {
+                "last_loss": float("nan"),
+                "best_iter": -1,
+                "best_score": float("inf"),
+                "stopped_early": False,
+            }
+
+        def evaluate(self, **kwargs):
+            self.evaluate_calls += 1
+            return {
+                "mean_loss": float("nan"),
+                "std_loss": float("nan"),
+                "mean_loss_per_sample": float("nan"),
+                "std_loss_per_sample": float("nan"),
+                "mean_y0": float("nan"),
+                "std_y0": float("nan"),
+            }
+
+    model = NonFiniteStageModel()
+    try:
+        train_with_standard_schedule(
+            model,
+            stage_plan=[(1, 1.0e-4), (1, 5.0e-5)],
+            final_plan=[],
+            eval_batches=1,
+            label="pass1:block5",
+            coupling_const=1.0,
+        )
+    except RuntimeError as exc:
+        message = str(exc).lower()
+        assert "pass1:block5" in message
+        assert "non-finite" in message
+    else:
+        raise AssertionError("non-finite training stage should abort the schedule")
+    assert model.train_calls == 1
+    assert model.evaluate_calls == 1
+
+
+def test_train_with_standard_schedule_rejects_nonfinite_secondary_eval_stats() -> None:
+    from .orchestration import train_with_standard_schedule
+
+    class SecondaryNonFiniteEvalModel:
+        def __init__(self, bad_key: str) -> None:
+            self.bad_key = bad_key
+            self.const = np.float32(1.0)
+            self.train_calls = 0
+            self.evaluate_calls = 0
+
+        def train(self, **kwargs):
+            self.train_calls += 1
+            return {
+                "last_loss": 1.0,
+                "best_iter": 0,
+                "best_score": 1.0,
+                "stopped_early": False,
+            }
+
+        def evaluate(self, **kwargs):
+            self.evaluate_calls += 1
+            stats = {
+                "mean_loss": 1.0,
+                "std_loss": 0.0,
+                "mean_loss_per_sample": 0.25,
+                "std_loss_per_sample": 0.0,
+                "mean_y0": 0.0,
+                "std_y0": 0.0,
+            }
+            stats[self.bad_key] = float("nan")
+            return stats
+
+    for bad_key in ("std_loss_per_sample", "std_y0"):
+        model = SecondaryNonFiniteEvalModel(bad_key)
+        try:
+            train_with_standard_schedule(
+                model,
+                stage_plan=[(1, 1.0e-4), (1, 5.0e-5)],
+                final_plan=[],
+                eval_batches=1,
+                label=f"pass1:block5:{bad_key}",
+                coupling_const=1.0,
+            )
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            assert "pass1:block5" in message
+            assert "non-finite" in message
+            assert bad_key in message
+        else:
+            raise AssertionError(f"non-finite {bad_key} should abort the schedule")
+        assert model.train_calls == 1
+        assert model.evaluate_calls == 1
+
+
 def test_recursive_visual_bundle_acceptance() -> None:
     from .orchestration import print_recursive_pass
     from .plotting import _PLOTTING_AVAILABLE
@@ -8697,6 +8885,18 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "terminal_blob_constants_survive_train_graph",
         "test_terminal_blob_constants_survive_train_graph",
+    ) and ok
+    ok = _run_subprocess_case(
+        "model_train_rejects_nonfinite_loss",
+        "test_model_train_rejects_nonfinite_loss",
+    ) and ok
+    ok = _run_subprocess_case(
+        "train_with_standard_schedule_rejects_nonfinite_stage",
+        "test_train_with_standard_schedule_rejects_nonfinite_stage",
+    ) and ok
+    ok = _run_subprocess_case(
+        "train_with_standard_schedule_rejects_nonfinite_secondary_eval_stats",
+        "test_train_with_standard_schedule_rejects_nonfinite_secondary_eval_stats",
     ) and ok
     ok = _run_subprocess_case(
         "recursive_visual_bundle_acceptance",
