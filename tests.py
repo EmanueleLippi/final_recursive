@@ -131,6 +131,24 @@ def _fixed_validation_batch(
     return t_batch.astype(np.float32), W_batch.astype(np.float32), Xi.astype(np.float32)
 
 
+def _schedule_fixed_eval_batches(
+    *,
+    M: int = 2,
+    N: int = 1,
+    D: int = 4,
+    t_start: float = 0.0,
+    t_end: float = 0.25,
+):
+    t_batch = (
+        np.linspace(float(t_start), float(t_end), int(N) + 1, dtype=np.float32)
+        .reshape(1, int(N) + 1, 1)
+        .repeat(int(M), axis=0)
+    )
+    W_batch = np.zeros((int(M), int(N) + 1, int(D)), dtype=np.float32)
+    Xi_batch = np.zeros((int(M), int(D)), dtype=np.float32)
+    return [(t_batch, W_batch, Xi_batch)]
+
+
 def _pascucci_physical_violation_traces_from_x(X: np.ndarray, params: dict) -> dict[str, np.ndarray]:
     X = np.asarray(X, dtype=np.float32)
     V = X[:, :, [2]]
@@ -299,6 +317,101 @@ def test_evaluation_bundle_rejects_block_metadata_mismatch() -> None:
             assert "block" in message or "t_total" in message or "metadata" in message
         else:
             raise AssertionError("mismatched evaluation bundle metadata should be rejected")
+
+
+def test_evaluation_bundle_rejects_wrong_bundle_kind() -> None:
+    from .sampling import load_evaluation_bundle, save_evaluation_bundle
+
+    blocks = build_blocks(T_total=0.5, block_size=0.25)
+    Xi = np.zeros((4, 4), dtype=np.float32)
+    rollout = build_stitched_rollout_inputs(
+        blocks=blocks,
+        M=Xi.shape[0],
+        N_per_block=2,
+        D=4,
+        seed=124,
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "evaluation_bundle.npz"
+        save_evaluation_bundle(
+            path=str(path),
+            Xi_initial=Xi,
+            rollout_inputs=rollout,
+            blocks=blocks,
+            bundle_kind="evaluation",
+        )
+        try:
+            load_evaluation_bundle(
+                path=str(path),
+                n_blocks_expected=len(blocks),
+                N_per_block_expected=2,
+                D_expected=4,
+                blocks_expected=blocks,
+                T_total_expected=0.5,
+                bundle_kind_expected="boundary_rollout",
+            )
+        except ValueError as exc:
+            message = str(exc).lower()
+            assert "bundle_kind" in message
+            assert "boundary_rollout" in message
+        else:
+            raise AssertionError("evaluation bundle should not load as a boundary rollout bundle")
+
+
+def test_evaluation_bundle_loads_legacy_no_kind_as_evaluation_only() -> None:
+    from .sampling import load_evaluation_bundle
+
+    blocks = build_blocks(T_total=0.5, block_size=0.25)
+    Xi = np.zeros((4, 4), dtype=np.float32)
+    rollout = build_stitched_rollout_inputs(
+        blocks=blocks,
+        M=Xi.shape[0],
+        N_per_block=2,
+        D=4,
+        seed=125,
+    )
+    t_bundle = np.stack([pair[0] for pair in rollout], axis=0).astype(np.float32)
+    W_bundle = np.stack([pair[1] for pair in rollout], axis=0).astype(np.float32)
+    block_t_start = np.array([float(block["t_start"]) for block in blocks], dtype=np.float32)
+    block_t_end = np.array([float(block["t_end"]) for block in blocks], dtype=np.float32)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "legacy_evaluation_bundle.npz"
+        np.savez(
+            path,
+            Xi_initial=Xi,
+            t_bundle=t_bundle,
+            W_bundle=W_bundle,
+            block_t_start=block_t_start,
+            block_t_end=block_t_end,
+        )
+        loaded_xi, loaded_rollout = load_evaluation_bundle(
+            path=str(path),
+            n_blocks_expected=len(blocks),
+            N_per_block_expected=2,
+            D_expected=4,
+            blocks_expected=blocks,
+            T_total_expected=0.5,
+            bundle_kind_expected="evaluation",
+        )
+        np.testing.assert_allclose(loaded_xi, Xi)
+        assert len(loaded_rollout) == len(blocks)
+
+        try:
+            load_evaluation_bundle(
+                path=str(path),
+                n_blocks_expected=len(blocks),
+                N_per_block_expected=2,
+                D_expected=4,
+                blocks_expected=blocks,
+                T_total_expected=0.5,
+                bundle_kind_expected="boundary_rollout",
+            )
+        except ValueError as exc:
+            assert "missing bundle_kind" in str(exc)
+        else:
+            raise AssertionError("legacy evaluation bundle should not load as boundary rollout")
 
 
 def test_model_spec_contract() -> None:
@@ -4896,6 +5009,332 @@ def test_model_train_rejects_nonfinite_loss() -> None:
         model.close()
 
 
+def test_model_train_reports_gradient_norm_diagnostics() -> None:
+    from .models import NN_Quadratic_Coupled_Recursive
+    from .tf_backend import set_seed
+
+    set_seed(31)
+    params = _default_params()
+    model = NN_Quadratic_Coupled_Recursive(
+        Xi_generator=Xi_generator_default,
+        T=0.25,
+        M=4,
+        N=2,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        normalize_time_input=True,
+    )
+
+    try:
+        stats = model.train(
+            N_Iter=2,
+            learning_rate=1.0e-3,
+            const_value=1.0,
+            eval_every=1,
+            val_batches=1,
+            return_gradient_diagnostics=True,
+        )
+        for key in (
+            "train_grad_global_norm",
+            "train_grad_global_norm_clipped",
+            "train_grad_clip_ratio",
+            "train_grad_clip_norm",
+            "train_grad_clip_enabled",
+            "train_grad_global_norm_max",
+            "train_grad_global_norm_clipped_max",
+            "train_grad_clip_ratio_max",
+        ):
+            assert key in stats, f"{key} missing from train diagnostics"
+            assert np.isfinite(float(stats[key])), f"{key} must be finite"
+        assert stats["train_grad_global_norm"] >= 0.0
+        assert stats["train_grad_global_norm_clipped"] >= 0.0
+        assert stats["train_grad_global_norm_clipped"] <= stats["train_grad_global_norm"] + 1.0e-6
+        assert stats["train_grad_clip_ratio"] >= 0.0
+        assert stats["train_grad_clip_enabled"] == 1.0
+        assert stats["train_grad_global_norm_max"] >= stats["train_grad_global_norm"]
+        assert stats["train_grad_global_norm_clipped_max"] >= stats["train_grad_global_norm_clipped"]
+        assert stats["train_grad_clip_ratio_max"] >= stats["train_grad_clip_ratio"]
+    finally:
+        model.close()
+
+
+def test_model_train_gradient_diagnostics_marks_disabled_clipping() -> None:
+    from .models import NN_Quadratic_Coupled_Recursive
+    from .tf_backend import set_seed
+
+    set_seed(32)
+    params = _default_params()
+    model = NN_Quadratic_Coupled_Recursive(
+        Xi_generator=Xi_generator_default,
+        T=0.25,
+        M=4,
+        N=2,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        normalize_time_input=True,
+    )
+    model.clip_grad_norm = None
+
+    try:
+        stats = model.train(
+            N_Iter=1,
+            learning_rate=1.0e-3,
+            const_value=1.0,
+            eval_every=1,
+            val_batches=1,
+            return_gradient_diagnostics=True,
+        )
+        assert stats["train_grad_clip_enabled"] == 0.0
+        assert stats["train_grad_clip_norm"] == 0.0
+        assert stats["train_grad_clip_ratio"] == 1.0
+        np.testing.assert_allclose(
+            stats["train_grad_global_norm_clipped"],
+            stats["train_grad_global_norm"],
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+    finally:
+        model.close()
+
+
+def test_model_train_uses_fixed_evaluation_batches_for_best_snapshot() -> None:
+    from .models import NN_Quadratic_Coupled_Recursive
+    from .tf_backend import set_seed
+
+    set_seed(34)
+    params = _default_params()
+    model = NN_Quadratic_Coupled_Recursive(
+        Xi_generator=Xi_generator_default,
+        T=0.25,
+        M=4,
+        N=2,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        normalize_time_input=True,
+    )
+    fixed_batches = [
+        (
+            np.linspace(0.0, 0.25, 3, dtype=np.float32).reshape(1, 3, 1).repeat(4, axis=0),
+            np.zeros((4, 3, 4), dtype=np.float32),
+            np.zeros((4, 4), dtype=np.float32),
+        )
+    ]
+    eval_calls = []
+    eval_scores = [0.75, 0.25]
+
+    def fixed_evaluate(
+        const_value=None,
+        n_batches=5,
+        evaluation_batches=None,
+        moment_policy="batch_current",
+    ):
+        eval_calls.append(
+            {
+                "n_batches": n_batches,
+                "evaluation_batches": evaluation_batches,
+                "moment_policy": moment_policy,
+            }
+        )
+        score = eval_scores[len(eval_calls) - 1]
+        return {
+            "mean_loss": score,
+            "std_loss": 0.0,
+            "mean_loss_per_sample": score / 4.0,
+            "std_loss_per_sample": 0.0,
+            "mean_y0": 0.0,
+            "std_y0": 0.0,
+        }
+
+    model.evaluate = fixed_evaluate
+
+    try:
+        stats = model.train(
+            N_Iter=2,
+            learning_rate=1.0e-3,
+            const_value=1.0,
+            eval_every=1,
+            val_batches=7,
+            early_stopping_metric="loss",
+            restore_best=True,
+            evaluation_batches=fixed_batches,
+            moment_policy="fixed_evaluation_bundle",
+        )
+        assert stats["best_iter"] == 1
+        assert stats["best_score"] == 0.25
+        assert len(eval_calls) == 2
+        for call in eval_calls:
+            assert call["n_batches"] == len(fixed_batches)
+            assert call["moment_policy"] == "fixed_evaluation_bundle"
+            assert len(call["evaluation_batches"]) == len(fixed_batches)
+            for actual_batch, expected_batch in zip(call["evaluation_batches"], fixed_batches):
+                for actual, expected in zip(actual_batch, expected_batch):
+                    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=0.0)
+    finally:
+        model.close()
+
+
+def test_model_train_rejects_malformed_fixed_evaluation_batches() -> None:
+    from .models import NN_Quadratic_Coupled_Recursive
+    from .tf_backend import set_seed
+
+    set_seed(35)
+    params = _default_params()
+    model = NN_Quadratic_Coupled_Recursive(
+        Xi_generator=Xi_generator_default,
+        T=0.25,
+        M=4,
+        N=2,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        normalize_time_input=True,
+    )
+    t_batch = np.linspace(0.0, 0.25, 3, dtype=np.float32).reshape(1, 3, 1).repeat(4, axis=0)
+    W_batch = np.zeros((4, 3, 4), dtype=np.float32)
+    Xi_batch = np.zeros((4, 4), dtype=np.float32)
+
+    def assert_rejected(evaluation_batches, expected):
+        try:
+            model.train(
+                N_Iter=1,
+                learning_rate=1.0e-3,
+                const_value=1.0,
+                eval_every=1,
+                evaluation_batches=evaluation_batches,
+                moment_policy="fixed_evaluation_bundle",
+            )
+        except ValueError as exc:
+            assert expected in str(exc)
+        else:
+            raise AssertionError(f"train should reject malformed evaluation_batches: {expected}")
+
+    try:
+        assert_rejected([(t_batch, W_batch)], "triple")
+        assert_rejected([(t_batch, W_batch[:, :1, :], Xi_batch)], "time dimension")
+        assert_rejected([(t_batch, W_batch, Xi_batch[:, :3])], "state dimension")
+        assert_rejected([(t_batch[:2], W_batch[:2], Xi_batch[:2])], "batch size")
+        bad_t = t_batch.copy()
+        bad_t[:, 1, 0] = bad_t[:, 0, 0]
+        assert_rejected([(bad_t, W_batch, Xi_batch)], "strictly increasing")
+    finally:
+        model.close()
+
+
+def test_model_train_rejects_wrong_time_horizon_fixed_evaluation_batches() -> None:
+    from .models import NN_Quadratic_Coupled_Recursive
+    from .tf_backend import set_seed
+
+    set_seed(37)
+    params = _default_params()
+    model = NN_Quadratic_Coupled_Recursive(
+        Xi_generator=Xi_generator_default,
+        T=0.25,
+        M=4,
+        N=2,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        normalize_time_input=True,
+    )
+    Xi_batch = np.zeros((4, 4), dtype=np.float32)
+
+    def assert_rejected(time_points: int) -> None:
+        t_batch = (
+            np.linspace(0.0, 0.25, time_points, dtype=np.float32)
+            .reshape(1, time_points, 1)
+            .repeat(4, axis=0)
+        )
+        W_batch = np.zeros((4, time_points, 4), dtype=np.float32)
+        try:
+            model.train(
+                N_Iter=1,
+                learning_rate=1.0e-3,
+                const_value=1.0,
+                eval_every=1,
+                evaluation_batches=[(t_batch, W_batch, Xi_batch)],
+                moment_policy="fixed_evaluation_bundle",
+            )
+        except ValueError as exc:
+            assert "N+1=3" in str(exc)
+        else:
+            raise AssertionError("train should reject a fixed evaluation bundle with the wrong time horizon")
+
+    try:
+        assert_rejected(2)
+        assert_rejected(4)
+    finally:
+        model.close()
+
+
+def test_model_train_rejects_wrong_time_horizon_before_update() -> None:
+    from .models import NN_Quadratic_Coupled_Recursive
+    from .tf_backend import set_seed
+
+    set_seed(38)
+    params = _default_params()
+    model = NN_Quadratic_Coupled_Recursive(
+        Xi_generator=Xi_generator_default,
+        T=0.25,
+        M=4,
+        N=2,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        normalize_time_input=True,
+    )
+    t_batch = np.linspace(0.0, 0.25, 4, dtype=np.float32).reshape(1, 4, 1).repeat(4, axis=0)
+    W_batch = np.zeros((4, 4, 4), dtype=np.float32)
+    Xi_batch = np.zeros((4, 4), dtype=np.float32)
+    loss_calls = {"count": 0}
+    original_loss_function = model.loss_function
+
+    def fail_if_training_starts(*args, **kwargs):
+        loss_calls["count"] += 1
+        raise AssertionError("fixed evaluation validation should fail before the training loss is evaluated")
+
+    model.loss_function = fail_if_training_starts
+    try:
+        try:
+            model.train(
+                N_Iter=1,
+                learning_rate=1.0e-3,
+                const_value=1.0,
+                eval_every=1,
+                evaluation_batches=[(t_batch, W_batch, Xi_batch)],
+                moment_policy="fixed_evaluation_bundle",
+                return_gradient_diagnostics=True,
+            )
+        except ValueError as exc:
+            assert "N+1=3" in str(exc)
+        else:
+            raise AssertionError("train should fail fast on fixed evaluation time-horizon mismatch")
+        assert loss_calls["count"] == 0
+    finally:
+        model.loss_function = original_loss_function
+        model.close()
+
+
 def test_model_spec_recursive_factory_matches_direct_constructor() -> None:
     from .model_specs import get_model_spec
     from .models import NN_Quadratic_Coupled_Recursive
@@ -5849,6 +6288,988 @@ def test_print_recursive_pass_application_metrics_emit_comparison_and_stability(
         orchestration.plot_recursive_stitched_y_convergence = original_plot_convergence
 
 
+def test_rollout_boundaries_accepts_fixed_initial_and_rollout_inputs() -> None:
+    from . import orchestration
+    from .model_specs import ModelSpec, get_model_spec
+
+    base = get_model_spec("quadratic_coupled")
+    M = 3
+    D = 4
+    N = 2
+    layers = [5, 8, 1]
+    blocks = [
+        {"idx": 0, "t_start": 0.0, "t_end": 0.25, "T_block": 0.25},
+        {"idx": 1, "t_start": 0.25, "t_end": 0.50, "T_block": 0.25},
+    ]
+    Xi_initial = np.arange(M * D, dtype=np.float32).reshape(M, D) / np.float32(10.0)
+    rollout_inputs = []
+    for idx, block in enumerate(blocks):
+        t_block = (
+            np.linspace(block["t_start"], block["t_end"], N + 1, dtype=np.float32)
+            .reshape(1, N + 1, 1)
+            .repeat(M, axis=0)
+        )
+        W_block = np.full((M, N + 1, D), np.float32(idx + 1), dtype=np.float32)
+        W_block[:, 0, :] = 0.0
+        rollout_inputs.append((t_block, W_block))
+    predict_calls = []
+
+    class _Session:
+        def close(self):
+            pass
+
+    class _BoundaryModel:
+        def __init__(self, *, model_index: int, **kwargs):
+            self.model_index = int(model_index)
+            self.sess = _Session()
+
+        def import_parameter_blob(self, blob, strict=True):
+            self.blob = dict(blob)
+            self.strict = bool(strict)
+
+        def fetch_minibatch(self):
+            raise AssertionError("fixed rollout_inputs should be used instead of fetch_minibatch")
+
+        def predict(self, Xi_star, t_star, W_star, const_value=None):
+            predict_calls.append(
+                {
+                    "idx": self.model_index,
+                    "Xi": np.asarray(Xi_star, dtype=np.float32).copy(),
+                    "t": np.asarray(t_star, dtype=np.float32).copy(),
+                    "W": np.asarray(W_star, dtype=np.float32).copy(),
+                    "const": float(const_value),
+                }
+            )
+            X = np.repeat(np.asarray(Xi_star, dtype=np.float32)[:, None, :], np.asarray(t_star).shape[1], axis=1)
+            X[:, -1, :] += np.float32(10.0 * (self.model_index + 1))
+            Y = np.zeros((X.shape[0], X.shape[1], 1), dtype=np.float32)
+            Z = np.zeros((X.shape[0], X.shape[1], D), dtype=np.float32)
+            return X.astype(np.float32), Y, Z
+
+    model_counter = {"count": 0}
+
+    def build_model(**kwargs):
+        idx = model_counter["count"]
+        model_counter["count"] += 1
+        return _BoundaryModel(model_index=idx, **kwargs)
+
+    spec = ModelSpec(
+        name="boundary_replay_stub",
+        state_dim=D,
+        state_labels=base.state_labels,
+        z_labels=base.z_labels,
+        build_default_params=base.build_default_params,
+        build_layers=base.build_layers,
+        xi_generator=base.xi_generator,
+        deterministic_xi=base.deterministic_xi,
+        standard_model_factory=lambda **kwargs: None,
+        recursive_model_factory=build_model,
+        build_exact_solution=lambda *args, **kwargs: None,
+        build_exact_initial_boundary_samples=None,
+    )
+
+    def forbidden_generator(M_arg, D_arg):
+        raise AssertionError("fixed Xi_initial should be used instead of Xi_generator")
+
+    boundaries = orchestration.rollout_boundaries(
+        block_blobs=[_make_blob(layers), _make_blob(layers)],
+        blocks=blocks,
+        Xi_generator=forbidden_generator,
+        params=base.build_default_params(),
+        M_rollout=M,
+        N_per_block=N,
+        D=D,
+        layers=layers,
+        T_total=0.50,
+        coupling_const=0.75,
+        model_spec=spec,
+        Xi_initial=Xi_initial,
+        rollout_inputs=rollout_inputs,
+    )
+
+    assert len(boundaries) == 3
+    np.testing.assert_allclose(boundaries[0], Xi_initial, rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(boundaries[1], Xi_initial + np.float32(10.0), rtol=0.0, atol=1.0e-6)
+    np.testing.assert_allclose(boundaries[2], Xi_initial + np.float32(30.0), rtol=0.0, atol=1.0e-6)
+    assert [call["idx"] for call in predict_calls] == [0, 1]
+    np.testing.assert_allclose(predict_calls[0]["Xi"], boundaries[0], rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(predict_calls[1]["Xi"], boundaries[1], rtol=0.0, atol=0.0)
+    for idx, call in enumerate(predict_calls):
+        np.testing.assert_allclose(call["t"], rollout_inputs[idx][0], rtol=0.0, atol=0.0)
+        np.testing.assert_allclose(call["W"], rollout_inputs[idx][1], rtol=0.0, atol=0.0)
+        np.testing.assert_allclose(call["const"], 0.75, rtol=0.0, atol=0.0)
+
+
+def test_rollout_boundaries_rejects_fixed_input_shape_mismatch() -> None:
+    from . import orchestration
+    from .model_specs import get_model_spec
+
+    base = get_model_spec("quadratic_coupled")
+    M = 2
+    D = 4
+    N = 1
+    layers = [5, 8, 1]
+    blocks = [{"idx": 0, "t_start": 0.0, "t_end": 0.25, "T_block": 0.25}]
+    rollout_inputs = [
+        (
+            np.asarray([[[0.0], [0.25]], [[0.0], [0.25]]], dtype=np.float32),
+            np.zeros((M, N + 1, D), dtype=np.float32),
+        )
+    ]
+
+    try:
+        orchestration.rollout_boundaries(
+            block_blobs=[_make_blob(layers)],
+            blocks=blocks,
+            Xi_generator=base.xi_generator,
+            params=base.build_default_params(),
+            M_rollout=M,
+            N_per_block=N,
+            D=D,
+            layers=layers,
+            T_total=0.25,
+            model_spec=base,
+            Xi_initial=np.zeros((M, D + 1), dtype=np.float32),
+            rollout_inputs=rollout_inputs,
+        )
+    except ValueError as exc:
+        assert "Xi_initial" in str(exc)
+    else:
+        raise AssertionError("rollout_boundaries should reject invalid fixed Xi_initial shape")
+
+
+def test_rollout_boundaries_rejects_malformed_fixed_rollout_inputs() -> None:
+    from . import orchestration
+    from .model_specs import get_model_spec
+
+    base = get_model_spec("quadratic_coupled")
+    M = 2
+    D = 4
+    N = 1
+    layers = [5, 8, 1]
+    blocks = [{"idx": 0, "t_start": 0.0, "t_end": 0.25, "T_block": 0.25}]
+    Xi_initial = np.zeros((M, D), dtype=np.float32)
+    valid_t = np.asarray([[[0.0], [0.25]], [[0.0], [0.25]]], dtype=np.float32)
+    valid_W = np.zeros((M, N + 1, D), dtype=np.float32)
+
+    def assert_rejected(rollout_inputs, expected):
+        try:
+            orchestration.rollout_boundaries(
+                block_blobs=[_make_blob(layers)],
+                blocks=blocks,
+                Xi_generator=base.xi_generator,
+                params=base.build_default_params(),
+                M_rollout=M,
+                N_per_block=N,
+                D=D,
+                layers=layers,
+                T_total=0.25,
+                model_spec=base,
+                Xi_initial=Xi_initial,
+                rollout_inputs=rollout_inputs,
+            )
+        except ValueError as exc:
+            assert expected in str(exc)
+        else:
+            raise AssertionError(f"rollout_boundaries should reject malformed rollout_inputs: {expected}")
+
+    assert_rejected([], "one (t, W) pair per block")
+    assert_rejected([(valid_t[:, :1, :], valid_W)], "shape")
+    assert_rejected([(valid_t, valid_W[:, :, :3])], "shape")
+    bad_t = valid_t.copy()
+    bad_t[:, -1, 0] = np.float32(0.50)
+    assert_rejected([(bad_t, valid_W)], "t_end")
+    bad_W = valid_W.copy()
+    bad_W[:, 0, :] = np.float32(1.0)
+    assert_rejected([(valid_t, bad_W)], "W_start")
+
+
+def test_rollout_boundaries_rejects_nonmonotonic_rollout_times() -> None:
+    from . import orchestration
+    from .model_specs import get_model_spec
+
+    base = get_model_spec("quadratic_coupled")
+    M = 2
+    D = 4
+    N = 2
+    layers = [5, 8, 1]
+    blocks = [{"idx": 0, "t_start": 0.0, "t_end": 0.25, "T_block": 0.25}]
+    Xi_initial = np.zeros((M, D), dtype=np.float32)
+    bad_t = np.asarray([[[0.0], [0.25], [0.25]], [[0.0], [0.25], [0.25]]], dtype=np.float32)
+    W = np.zeros((M, N + 1, D), dtype=np.float32)
+
+    try:
+        orchestration.rollout_boundaries(
+            block_blobs=[_make_blob(layers)],
+            blocks=blocks,
+            Xi_generator=base.xi_generator,
+            params=base.build_default_params(),
+            M_rollout=M,
+            N_per_block=N,
+            D=D,
+            layers=layers,
+            T_total=0.25,
+            model_spec=base,
+            Xi_initial=Xi_initial,
+            rollout_inputs=[(bad_t, W)],
+        )
+    except ValueError as exc:
+        assert "strictly increasing" in str(exc)
+    else:
+        raise AssertionError("rollout_boundaries should reject nonmonotonic fixed rollout times")
+
+
+def test_rollout_boundaries_legacy_path_still_uses_generator_and_minibatch() -> None:
+    from . import orchestration
+    from .model_specs import ModelSpec, get_model_spec
+
+    base = get_model_spec("quadratic_coupled")
+    M = 2
+    D = 4
+    N = 1
+    layers = [5, 8, 1]
+    blocks = [{"idx": 0, "t_start": 0.0, "t_end": 0.25, "T_block": 0.25}]
+    Xi_from_generator = np.full((M, D), np.float32(3.0), dtype=np.float32)
+    calls = {"generator": 0, "fetch": 0}
+
+    class _Session:
+        def close(self):
+            pass
+
+    class _LegacyBoundaryModel:
+        def __init__(self, **kwargs):
+            self.sess = _Session()
+
+        def import_parameter_blob(self, blob, strict=True):
+            pass
+
+        def fetch_minibatch(self):
+            calls["fetch"] += 1
+            t = np.asarray([[[0.0], [0.25]], [[0.0], [0.25]]], dtype=np.float32)
+            W = np.zeros((M, N + 1, D), dtype=np.float32)
+            Xi = np.zeros((M, D), dtype=np.float32)
+            return t, W, Xi
+
+        def predict(self, Xi_star, t_star, W_star, const_value=None):
+            X = np.repeat(np.asarray(Xi_star, dtype=np.float32)[:, None, :], np.asarray(t_star).shape[1], axis=1)
+            X[:, -1, :] += np.float32(1.0)
+            Y = np.zeros((M, N + 1, 1), dtype=np.float32)
+            Z = np.zeros((M, N + 1, D), dtype=np.float32)
+            return X, Y, Z
+
+    spec = ModelSpec(
+        name="boundary_legacy_stub",
+        state_dim=D,
+        state_labels=base.state_labels,
+        z_labels=base.z_labels,
+        build_default_params=base.build_default_params,
+        build_layers=base.build_layers,
+        xi_generator=base.xi_generator,
+        deterministic_xi=base.deterministic_xi,
+        standard_model_factory=lambda **kwargs: None,
+        recursive_model_factory=lambda **kwargs: _LegacyBoundaryModel(**kwargs),
+        build_exact_solution=lambda *args, **kwargs: None,
+        build_exact_initial_boundary_samples=None,
+    )
+
+    def generator(M_arg, D_arg):
+        calls["generator"] += 1
+        assert int(M_arg) == M
+        assert int(D_arg) == D
+        return Xi_from_generator.copy()
+
+    boundaries = orchestration.rollout_boundaries(
+        block_blobs=[_make_blob(layers)],
+        blocks=blocks,
+        Xi_generator=generator,
+        params=base.build_default_params(),
+        M_rollout=M,
+        N_per_block=N,
+        D=D,
+        layers=layers,
+        T_total=0.25,
+        model_spec=spec,
+    )
+
+    assert calls == {"generator": 1, "fetch": 1}
+    np.testing.assert_allclose(boundaries[0], Xi_from_generator, rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(boundaries[1], Xi_from_generator + np.float32(1.0), rtol=0.0, atol=1.0e-6)
+
+
+def test_load_evaluation_bundle_rejects_nonfinite_payload() -> None:
+    from .sampling import load_evaluation_bundle, save_evaluation_bundle
+
+    D = 4
+    M = 3
+    N = 2
+    blocks = build_blocks(T_total=0.5, block_size=0.25)
+    Xi = np.zeros((M, D), dtype=np.float32)
+    rollout = build_stitched_rollout_inputs(blocks, M=M, N_per_block=N, D=D, seed=41)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        bundle_path = Path(tmp) / "evaluation_bundle.npz"
+        save_evaluation_bundle(
+            path=str(bundle_path),
+            Xi_initial=Xi,
+            rollout_inputs=rollout,
+            blocks=blocks,
+        )
+        with np.load(bundle_path, allow_pickle=False) as data:
+            payload = {key: np.asarray(data[key]) for key in data.files}
+
+        for key, index in (
+            ("Xi_initial", (0, 0)),
+            ("t_bundle", (0, 0, 1, 0)),
+            ("W_bundle", (0, 0, 1, 0)),
+        ):
+            corrupt = {name: value.copy() for name, value in payload.items()}
+            corrupt[key][index] = np.float32(np.nan)
+            corrupt_path = Path(tmp) / f"corrupt_{key}.npz"
+            np.savez(corrupt_path, **corrupt)
+            try:
+                load_evaluation_bundle(
+                    path=str(corrupt_path),
+                    n_blocks_expected=len(blocks),
+                    N_per_block_expected=N,
+                    D_expected=D,
+                    blocks_expected=blocks,
+                    T_total_expected=0.5,
+                )
+            except ValueError as exc:
+                assert "non-finite" in str(exc).lower()
+            else:
+                raise AssertionError(f"load_evaluation_bundle should reject non-finite {key}")
+
+
+def test_print_recursive_pass_fails_fast_on_nonfinite_eval_bundle_before_predict() -> None:
+    from . import orchestration
+    from .model_specs import get_model_spec
+    from .sampling import save_evaluation_bundle
+
+    spec = get_model_spec("quadratic_coupled")
+    D = 4
+    M = 3
+    N = 2
+    layers = [5, 8, 1]
+    blocks = build_blocks(T_total=0.5, block_size=0.25)
+    Xi = spec.deterministic_xi(M, D, seed=71)
+    rollout = build_stitched_rollout_inputs(blocks, M=M, N_per_block=N, D=D, seed=72)
+    bad_rollout = [(t.copy(), W.copy()) for t, W in rollout]
+    bad_rollout[0][1][0, 1, 0] = np.float32(np.nan)
+    logs = [
+        {
+            "pass": 1,
+            "block": idx,
+            "t_start": block["t_start"],
+            "t_end": block["t_end"],
+            "T_block": block["T_block"],
+            "eval_mean_loss": 1.0,
+            "eval_std_loss": 0.0,
+            "eval_mean_loss_per_sample": 0.25,
+            "eval_std_loss_per_sample": 0.0,
+            "eval_mean_y0": 0.0,
+            "precision_target": None,
+            "refine_rounds": 0,
+        }
+        for idx, block in enumerate(blocks)
+    ]
+    predict_calls = {"count": 0}
+
+    original_predict = orchestration.predict_recursive_stitched
+    original_plot_logs = orchestration.plot_recursive_pass_logs_multi
+    original_plot_convergence = orchestration.plot_recursive_stitched_y_convergence
+
+    def forbidden_predict(*args, **kwargs):
+        predict_calls["count"] += 1
+        raise AssertionError("corrupt evaluation bundle should fail before prediction")
+
+    orchestration.predict_recursive_stitched = forbidden_predict
+    orchestration.plot_recursive_pass_logs_multi = lambda *args, **kwargs: None
+    orchestration.plot_recursive_stitched_y_convergence = lambda *args, **kwargs: None
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_path = Path(tmp) / "evaluation_bundle.npz"
+            save_evaluation_bundle(
+                path=str(bundle_path),
+                Xi_initial=Xi,
+                rollout_inputs=bad_rollout,
+                blocks=blocks,
+            )
+            try:
+                orchestration.print_recursive_pass(
+                    pass_entries=[
+                        {
+                            "pass_id": 1,
+                            "logs": logs,
+                            "blobs": [
+                                _make_block_blob(layers, block["t_start"], block["t_end"], 0.5)
+                                for block in blocks
+                            ],
+                        }
+                    ],
+                    blocks=blocks,
+                    rec_dir=str(Path(tmp) / "recursive"),
+                    params=spec.build_default_params(),
+                    N_per_block=N,
+                    D=D,
+                    layers=layers,
+                    T_total=0.5,
+                    exact_solution=None,
+                    selection_metric="loss",
+                    eval_bundle_path=str(bundle_path),
+                    eval_seed=71,
+                    eval_min_paths=M,
+                    sample_paths=0,
+                    print_compact_logs=False,
+                    model_spec=spec,
+                )
+            except ValueError as exc:
+                assert "non-finite" in str(exc).lower()
+            else:
+                raise AssertionError("print_recursive_pass should reject non-finite evaluation bundles")
+            assert predict_calls["count"] == 0
+    finally:
+        orchestration.predict_recursive_stitched = original_predict
+        orchestration.plot_recursive_pass_logs_multi = original_plot_logs
+        orchestration.plot_recursive_stitched_y_convergence = original_plot_convergence
+
+
+def test_run_recursive_training_wires_fixed_eval_and_gradient_diagnostics_to_logs() -> None:
+    from . import orchestration
+    from .model_specs import ModelSpec, get_model_spec
+
+    base = get_model_spec("quadratic_coupled")
+    D = 4
+    M = 3
+    N = 2
+    T_total = 0.5
+    block_size = 0.25
+    layers = [5, 8, 1]
+    train_calls = []
+    frozen_eval_calls = []
+
+    class _Session:
+        def close(self):
+            pass
+
+    class _RecursiveModel:
+        def __init__(self, **kwargs):
+            self.kwargs = dict(kwargs)
+            self.M = int(kwargs["M"])
+            self.N = int(kwargs["N"])
+            self.D = int(kwargs["D"])
+            self.sess = _Session()
+
+        def import_parameter_blob(self, blob, strict=True):
+            self.blob = dict(blob)
+
+        def export_parameter_blob(self):
+            return _make_block_blob(
+                layers,
+                self.kwargs["t_start"],
+                self.kwargs["t_end"],
+                self.kwargs["T_total"],
+            )
+
+        def save_model(self, path: str) -> None:
+            Path(path).write_text("fake checkpoint\n", encoding="utf-8")
+
+        def evaluate(
+            self,
+            const_value=None,
+            n_batches=5,
+            evaluation_batches=None,
+            moment_policy="batch_current",
+        ):
+            frozen_eval_calls.append(
+                {
+                    "n_batches": n_batches,
+                    "evaluation_batches": evaluation_batches,
+                    "moment_policy": moment_policy,
+                }
+            )
+            return {
+                "mean_loss": 0.20,
+                "std_loss": 0.0,
+                "mean_loss_per_sample": 0.05,
+                "std_loss_per_sample": 0.0,
+                "mean_y0": 0.0,
+                "std_y0": 0.0,
+                "evaluation_batches": 1 if evaluation_batches is not None else 0,
+                "moment_policy": moment_policy,
+            }
+
+    spec = ModelSpec(
+        name="recursive_fixed_eval_stub",
+        state_dim=D,
+        state_labels=base.state_labels,
+        z_labels=base.z_labels,
+        build_default_params=base.build_default_params,
+        build_layers=base.build_layers,
+        xi_generator=base.xi_generator,
+        deterministic_xi=base.deterministic_xi,
+        standard_model_factory=lambda **kwargs: None,
+        recursive_model_factory=lambda **kwargs: _RecursiveModel(**kwargs),
+        build_exact_solution=lambda *args, **kwargs: None,
+        build_exact_initial_boundary_samples=None,
+    )
+
+    def fake_train_with_standard_schedule(**kwargs):
+        train_calls.append(kwargs)
+        eval_batches = kwargs["eval_batches"]
+        assert not isinstance(eval_batches, (int, np.integer))
+        assert kwargs["return_gradient_diagnostics"] is True
+        assert len(eval_batches) == 1
+        t_batch, W_batch, Xi_batch = eval_batches[0]
+        assert t_batch.shape == (M, N + 1, 1)
+        assert W_batch.shape == (M, N + 1, D)
+        assert Xi_batch.shape == (M, D)
+        assert np.isfinite(t_batch).all()
+        assert np.isfinite(W_batch).all()
+        assert np.isfinite(Xi_batch).all()
+        diagnostics = {
+            "train_grad_global_norm": 3.0,
+            "train_grad_global_norm_clipped": 2.0,
+            "train_grad_clip_ratio": 2.0 / 3.0,
+            "train_grad_clip_enabled": 1.0,
+            "train_gradient_variable_count": 4.0,
+        }
+        return {
+            "stage_logs": [],
+            "eval_stats": {
+                "mean_loss": 0.10,
+                "std_loss": 0.0,
+                "mean_loss_per_sample": 0.025,
+                "std_loss_per_sample": 0.0,
+                "mean_y0": 0.0,
+                "std_y0": 0.0,
+                "evaluation_batches": 1,
+                "moment_policy": "fixed_evaluation_bundle",
+            },
+            "refine_rounds": 0,
+            "precision_target": kwargs.get("precision_target"),
+            "gradient_diagnostics": diagnostics,
+        }
+
+    def fake_rollout_boundaries(**kwargs):
+        blocks = kwargs["blocks"]
+        return [
+            np.full((int(kwargs["M_rollout"]), int(kwargs["D"])), np.float32(idx), dtype=np.float32)
+            for idx in range(len(blocks) + 1)
+        ]
+
+    original_train = orchestration.train_with_standard_schedule
+    original_rollout = orchestration.rollout_boundaries
+    orchestration.train_with_standard_schedule = fake_train_with_standard_schedule
+    orchestration.rollout_boundaries = fake_rollout_boundaries
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = orchestration.run_recursive_training(
+                Xi_generator=base.xi_generator,
+                params=base.build_default_params(),
+                M=M,
+                N_per_block=N,
+                D=D,
+                T_total=T_total,
+                block_size=block_size,
+                layers=layers,
+                stage_plan=[(1, 1.0e-3)],
+                final_plan=[],
+                output_dir=tmp,
+                max_refine_rounds=0,
+                rollout_M=5,
+                save_tf_checkpoints=False,
+                n_passes=2,
+                empirical_jitter_scale=0.0,
+                freeze_stable_blocks_after_pass=1,
+                freeze_loss_threshold=999.0,
+                freeze_neighbor_radius=0,
+                fixed_eval_seed=91,
+                return_gradient_diagnostics=True,
+                model_spec=spec,
+            )
+    finally:
+        orchestration.train_with_standard_schedule = original_train
+        orchestration.rollout_boundaries = original_rollout
+
+    assert len(train_calls) == 3
+    assert len(frozen_eval_calls) == 1
+    train_batches_by_label = {
+        call["label"]: call["eval_batches"]
+        for call in train_calls
+    }
+    for left, right in (
+        ("pass0:block0", "pass1:block0"),
+    ):
+        for actual_batch, expected_batch in zip(
+            train_batches_by_label[left],
+            train_batches_by_label[right],
+        ):
+            for actual, expected in zip(actual_batch, expected_batch):
+                np.testing.assert_allclose(actual, expected, rtol=0.0, atol=0.0)
+    frozen_call = frozen_eval_calls[0]
+    assert frozen_call["moment_policy"] == "fixed_evaluation_bundle"
+    assert frozen_call["n_batches"] == 1
+    assert len(frozen_call["evaluation_batches"]) == 1
+    for actual, expected in zip(
+        frozen_call["evaluation_batches"][0],
+        train_batches_by_label["pass0:block1"][0],
+    ):
+        np.testing.assert_allclose(actual, expected, rtol=0.0, atol=0.0)
+    for pass_entry in result["passes"]:
+        for row in pass_entry["logs"]:
+            if bool(row.get("was_frozen", False)):
+                continue
+            for key in (
+                "train_grad_global_norm",
+                "train_grad_global_norm_clipped",
+                "train_grad_clip_ratio",
+                "train_grad_clip_enabled",
+                "train_gradient_variable_count",
+            ):
+                assert key in row, f"{key} missing from recursive block log"
+                assert np.isfinite(float(row[key]))
+
+
+def test_run_recursive_training_pass_boundary_rollouts_use_fixed_rollout_inputs() -> None:
+    from . import orchestration
+    from .model_specs import ModelSpec, get_model_spec
+
+    base = get_model_spec("quadratic_coupled")
+    D = 4
+    M = 3
+    N = 2
+    T_total = 0.5
+    block_size = 0.25
+    rollout_M = 5
+    layers = [5, 8, 1]
+    blocks = build_blocks(T_total=T_total, block_size=block_size)
+    fixed_Xi = base.deterministic_xi(rollout_M, D, seed=61)
+    fixed_rollout = build_stitched_rollout_inputs(
+        blocks=blocks,
+        M=rollout_M,
+        N_per_block=N,
+        D=D,
+        seed=62,
+    )
+    rollout_calls = []
+
+    class _Session:
+        def close(self):
+            pass
+
+    class _RecursiveModel:
+        def __init__(self, **kwargs):
+            self.kwargs = dict(kwargs)
+            self.M = int(kwargs["M"])
+            self.N = int(kwargs["N"])
+            self.D = int(kwargs["D"])
+            self.sess = _Session()
+
+        def import_parameter_blob(self, blob, strict=True):
+            pass
+
+        def export_parameter_blob(self):
+            return _make_block_blob(
+                layers,
+                self.kwargs["t_start"],
+                self.kwargs["t_end"],
+                self.kwargs["T_total"],
+            )
+
+        def save_model(self, path: str) -> None:
+            Path(path).write_text("fake checkpoint\n", encoding="utf-8")
+
+    spec = ModelSpec(
+        name="recursive_fixed_rollout_stub",
+        state_dim=D,
+        state_labels=base.state_labels,
+        z_labels=base.z_labels,
+        build_default_params=base.build_default_params,
+        build_layers=base.build_layers,
+        xi_generator=base.xi_generator,
+        deterministic_xi=base.deterministic_xi,
+        standard_model_factory=lambda **kwargs: None,
+        recursive_model_factory=lambda **kwargs: _RecursiveModel(**kwargs),
+        build_exact_solution=lambda *args, **kwargs: None,
+        build_exact_initial_boundary_samples=None,
+    )
+
+    def fake_train_with_standard_schedule(**kwargs):
+        return {
+            "stage_logs": [],
+            "eval_stats": {
+                "mean_loss": 0.10,
+                "std_loss": 0.0,
+                "mean_loss_per_sample": 0.025,
+                "std_loss_per_sample": 0.0,
+                "mean_y0": 0.0,
+                "std_y0": 0.0,
+            },
+            "refine_rounds": 0,
+            "precision_target": kwargs.get("precision_target"),
+        }
+
+    def fake_rollout_boundaries(**kwargs):
+        rollout_calls.append(kwargs)
+        np.testing.assert_allclose(kwargs["Xi_initial"], fixed_Xi, rtol=0.0, atol=0.0)
+        assert len(kwargs["rollout_inputs"]) == len(fixed_rollout)
+        for actual, expected in zip(kwargs["rollout_inputs"], fixed_rollout):
+            np.testing.assert_allclose(actual[0], expected[0], rtol=0.0, atol=0.0)
+            np.testing.assert_allclose(actual[1], expected[1], rtol=0.0, atol=0.0)
+        return [
+            np.full((int(kwargs["M_rollout"]), int(kwargs["D"])), np.float32(idx), dtype=np.float32)
+            for idx in range(len(kwargs["blocks"]) + 1)
+        ]
+
+    original_train = orchestration.train_with_standard_schedule
+    original_rollout = orchestration.rollout_boundaries
+    orchestration.train_with_standard_schedule = fake_train_with_standard_schedule
+    orchestration.rollout_boundaries = fake_rollout_boundaries
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            orchestration.run_recursive_training(
+                Xi_generator=base.xi_generator,
+                params=base.build_default_params(),
+                M=M,
+                N_per_block=N,
+                D=D,
+                T_total=T_total,
+                block_size=block_size,
+                layers=layers,
+                stage_plan=[(1, 1.0e-3)],
+                final_plan=[],
+                output_dir=tmp,
+                max_refine_rounds=0,
+                rollout_M=rollout_M,
+                save_tf_checkpoints=False,
+                n_passes=2,
+                empirical_jitter_scale=0.0,
+                fixed_boundary_Xi_initial=fixed_Xi,
+                fixed_boundary_rollout_inputs=fixed_rollout,
+                model_spec=spec,
+            )
+    finally:
+        orchestration.train_with_standard_schedule = original_train
+        orchestration.rollout_boundaries = original_rollout
+
+    assert len(rollout_calls) == 2
+
+
+def test_run_recursive_training_negative_fixed_eval_seed_keeps_legacy_batches() -> None:
+    from . import orchestration
+    from .model_specs import ModelSpec, get_model_spec
+
+    base = get_model_spec("quadratic_coupled")
+    D = 4
+    M = 3
+    N = 2
+    layers = [5, 8, 1]
+    train_eval_batches = []
+
+    class _Session:
+        def close(self):
+            pass
+
+    class _RecursiveModel:
+        def __init__(self, **kwargs):
+            self.kwargs = dict(kwargs)
+            self.M = int(kwargs["M"])
+            self.N = int(kwargs["N"])
+            self.D = int(kwargs["D"])
+            self.sess = _Session()
+
+        def import_parameter_blob(self, blob, strict=True):
+            pass
+
+        def export_parameter_blob(self):
+            return _make_block_blob(
+                layers,
+                self.kwargs["t_start"],
+                self.kwargs["t_end"],
+                self.kwargs["T_total"],
+            )
+
+    spec = ModelSpec(
+        name="recursive_negative_seed_stub",
+        state_dim=D,
+        state_labels=base.state_labels,
+        z_labels=base.z_labels,
+        build_default_params=base.build_default_params,
+        build_layers=base.build_layers,
+        xi_generator=base.xi_generator,
+        deterministic_xi=base.deterministic_xi,
+        standard_model_factory=lambda **kwargs: None,
+        recursive_model_factory=lambda **kwargs: _RecursiveModel(**kwargs),
+        build_exact_solution=lambda *args, **kwargs: None,
+        build_exact_initial_boundary_samples=None,
+    )
+
+    def fake_train_with_standard_schedule(**kwargs):
+        train_eval_batches.append(kwargs["eval_batches"])
+        return {
+            "stage_logs": [],
+            "eval_stats": {
+                "mean_loss": 0.10,
+                "std_loss": 0.0,
+                "mean_loss_per_sample": 0.025,
+                "std_loss_per_sample": 0.0,
+                "mean_y0": 0.0,
+                "std_y0": 0.0,
+            },
+            "refine_rounds": 0,
+            "precision_target": kwargs.get("precision_target"),
+        }
+
+    def fake_rollout_boundaries(**kwargs):
+        return [
+            np.zeros((int(kwargs["M_rollout"]), int(kwargs["D"])), dtype=np.float32)
+            for _ in range(len(kwargs["blocks"]) + 1)
+        ]
+
+    original_train = orchestration.train_with_standard_schedule
+    original_rollout = orchestration.rollout_boundaries
+    orchestration.train_with_standard_schedule = fake_train_with_standard_schedule
+    orchestration.rollout_boundaries = fake_rollout_boundaries
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            orchestration.run_recursive_training(
+                Xi_generator=base.xi_generator,
+                params=base.build_default_params(),
+                M=M,
+                N_per_block=N,
+                D=D,
+                T_total=0.25,
+                block_size=0.25,
+                layers=layers,
+                stage_plan=[(1, 1.0e-3)],
+                final_plan=[],
+                output_dir=tmp,
+                max_refine_rounds=0,
+                rollout_M=5,
+                save_tf_checkpoints=False,
+                n_passes=1,
+                fixed_eval_seed=-1,
+                model_spec=spec,
+            )
+    finally:
+        orchestration.train_with_standard_schedule = original_train
+        orchestration.rollout_boundaries = original_rollout
+
+    assert train_eval_batches == [5]
+
+
+def test_run_recursive_training_copies_external_fixed_eval_batches_by_block() -> None:
+    from . import orchestration
+    from .model_specs import ModelSpec, get_model_spec
+
+    base = get_model_spec("quadratic_coupled")
+    D = 4
+    M = 2
+    N = 1
+    layers = [5, 8, 1]
+    external_batches = _schedule_fixed_eval_batches(M=M, N=N, D=D, t_start=0.0, t_end=0.25)
+    fixed_eval_batches_by_block = [external_batches]
+    train_calls = []
+
+    class _Session:
+        def close(self):
+            pass
+
+    class _RecursiveModel:
+        def __init__(self, **kwargs):
+            self.kwargs = dict(kwargs)
+            self.M = int(kwargs["M"])
+            self.N = int(kwargs["N"])
+            self.D = int(kwargs["D"])
+            self.sess = _Session()
+
+        def import_parameter_blob(self, blob, strict=True):
+            pass
+
+        def export_parameter_blob(self):
+            return _make_block_blob(
+                layers,
+                self.kwargs["t_start"],
+                self.kwargs["t_end"],
+                self.kwargs["T_total"],
+            )
+
+    spec = ModelSpec(
+        name="recursive_external_fixed_eval_copy_stub",
+        state_dim=D,
+        state_labels=base.state_labels,
+        z_labels=base.z_labels,
+        build_default_params=base.build_default_params,
+        build_layers=base.build_layers,
+        xi_generator=base.xi_generator,
+        deterministic_xi=base.deterministic_xi,
+        standard_model_factory=lambda **kwargs: None,
+        recursive_model_factory=lambda **kwargs: _RecursiveModel(**kwargs),
+        build_exact_solution=lambda *args, **kwargs: None,
+        build_exact_initial_boundary_samples=None,
+    )
+
+    def fake_train_with_standard_schedule(**kwargs):
+        eval_batches = kwargs["eval_batches"]
+        assert not isinstance(eval_batches, (int, np.integer))
+        _, _, Xi_batch = eval_batches[0]
+        np.testing.assert_allclose(Xi_batch, 0.0, rtol=0.0, atol=0.0)
+        Xi_batch[:, :] = np.float32(123.0)
+        train_calls.append(eval_batches)
+        return {
+            "stage_logs": [],
+            "eval_stats": {
+                "mean_loss": 0.10,
+                "std_loss": 0.0,
+                "mean_loss_per_sample": 0.05,
+                "std_loss_per_sample": 0.0,
+                "mean_y0": 0.0,
+                "std_y0": 0.0,
+            },
+            "refine_rounds": 0,
+            "precision_target": kwargs.get("precision_target"),
+        }
+
+    def fake_rollout_boundaries(**kwargs):
+        return [
+            np.zeros((int(kwargs["M_rollout"]), int(kwargs["D"])), dtype=np.float32)
+            for _ in range(len(kwargs["blocks"]) + 1)
+        ]
+
+    original_train = orchestration.train_with_standard_schedule
+    original_rollout = orchestration.rollout_boundaries
+    orchestration.train_with_standard_schedule = fake_train_with_standard_schedule
+    orchestration.rollout_boundaries = fake_rollout_boundaries
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            orchestration.run_recursive_training(
+                Xi_generator=base.xi_generator,
+                params=base.build_default_params(),
+                M=M,
+                N_per_block=N,
+                D=D,
+                T_total=0.25,
+                block_size=0.25,
+                layers=layers,
+                stage_plan=[(1, 1.0e-3)],
+                final_plan=[],
+                output_dir=tmp,
+                max_refine_rounds=0,
+                rollout_M=4,
+                save_tf_checkpoints=False,
+                n_passes=2,
+                fixed_eval_batches_by_block=fixed_eval_batches_by_block,
+                model_spec=spec,
+            )
+    finally:
+        orchestration.train_with_standard_schedule = original_train
+        orchestration.rollout_boundaries = original_rollout
+
+    assert len(train_calls) == 2
+    np.testing.assert_allclose(external_batches[0][2], 0.0, rtol=0.0, atol=0.0)
+
+
 def test_score_pass_logs_rejects_nonfinite_rows() -> None:
     from .plotting import score_pass_logs
 
@@ -6753,7 +8174,7 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
     import json
 
     from . import cli, orchestration
-    from .sampling import build_blocks
+    from .sampling import build_blocks, file_sha256
     from .tf_backend import require_tensorflow
 
     require_tensorflow()
@@ -6914,6 +8335,8 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
             "exact_summary_by_pass": {},
             "exact_summary_by_pass_index": {},
             "eval_bundle_path": str(eval_bundle_path),
+            "eval_bundle_status": "created",
+            "eval_bundle_sha256": file_sha256(str(eval_bundle_path)),
             "evaluation_bundle_M": 4,
             "excluded_pass_ids_from_selection": [],
             "excluded_pass_indices_from_selection": [],
@@ -7017,6 +8440,11 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
 
         assert len(standard_calls) == 5
         assert len(recursive_calls) == 3
+        for call in recursive_calls:
+            assert call["fixed_eval_seed"] is None
+            assert call["fixed_boundary_Xi_initial"] is None
+            assert call["fixed_boundary_rollout_inputs"] is None
+            assert call["return_gradient_diagnostics"] is False
         assert len(print_calls) == 3
     finally:
         orchestration.run_standard_reference = original_run_standard_reference
@@ -7026,12 +8454,174 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
         cli.plot_stage_logs = original_plot_stage_logs
 
 
+def test_cli_wires_recursive_diagnostic_flags_and_separate_rollout_bundle() -> None:
+    import json
+
+    from . import cli, orchestration
+    from .sampling import build_blocks, file_sha256
+    from .tf_backend import require_tensorflow
+
+    require_tensorflow()
+
+    recursive_calls = []
+    print_calls = []
+
+    def fake_run_recursive_training(**kwargs):
+        recursive_calls.append(kwargs)
+        assert kwargs["fixed_eval_seed"] == 777
+        assert kwargs["return_gradient_diagnostics"] is True
+        assert kwargs["fixed_boundary_Xi_initial"] is not None
+        assert kwargs["fixed_boundary_Xi_initial"].shape == (2000, kwargs["D"])
+        assert kwargs["fixed_boundary_rollout_inputs"] is not None
+        blocks = build_blocks(T_total=kwargs["T_total"], block_size=kwargs["block_size"])
+        assert len(kwargs["fixed_boundary_rollout_inputs"]) == len(blocks)
+        logs = [
+            {
+                "pass": 1,
+                "block": int(block["idx"]),
+                "t_start": block["t_start"],
+                "t_end": block["t_end"],
+                "T_block": block["T_block"],
+                "eval_mean_loss": 1.0,
+                "eval_std_loss": 0.0,
+                "eval_mean_loss_per_sample": 0.25,
+                "eval_std_loss_per_sample": 0.0,
+                "eval_mean_y0": 0.0,
+                "precision_target": None,
+                "refine_rounds": 0,
+            }
+            for block in blocks
+        ]
+        pass_entry = {
+            "pass_id": 1,
+            "reference_loss": 1.0,
+            "logs": logs,
+            "blobs": [_make_blob([5, 8, 1]) for _ in blocks],
+            "models_dir": kwargs["output_dir"],
+            "pass_init_mode": kwargs["pass1_init_mode"],
+            "boundary_source": "base_xi",
+            "is_bootstrap_pass": True,
+            "active_set_summary": {},
+        }
+        return {
+            "blocks": blocks,
+            "passes": [pass_entry],
+            "pass1": {
+                "logs": logs,
+                "reference_loss": 1.0,
+                "blobs": pass_entry["blobs"],
+            },
+            "boundary_samples": [
+                np.zeros((kwargs["M"], kwargs["D"]), dtype=np.float32)
+                for _ in range(len(blocks) + 1)
+            ],
+        }
+
+    def fake_print_recursive_pass(**kwargs):
+        print_calls.append(kwargs)
+        eval_bundle_path = Path(kwargs["eval_bundle_path"])
+        eval_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(eval_bundle_path, Xi_initial=np.zeros((4, kwargs["D"]), dtype=np.float32))
+        return {
+            "processed_pass_ids": [1],
+            "exact_summary_by_pass": {},
+            "exact_summary_by_pass_index": {},
+            "eval_bundle_path": str(eval_bundle_path),
+            "eval_bundle_status": "created",
+            "eval_bundle_sha256": file_sha256(str(eval_bundle_path)),
+            "evaluation_bundle_M": 4,
+            "excluded_pass_ids_from_selection": [],
+            "excluded_pass_indices_from_selection": [],
+            "selected_pass_id": 1,
+            "selected_pass_index": 0,
+            "selected_score_metric": "loss.eval_mean_loss_per_sample",
+            "selected_score": 0.25,
+            "selected_scores_by_pass": {"1": 0.25},
+            "selected_scores_by_pass_index": {"0": 0.25},
+            "score_key": "eval_mean_loss_per_sample",
+            "pass_scores_loss": {1: 0.25},
+            "pass_scores_loss_by_index": {0: 0.25},
+        }
+
+    original_run_recursive_training = orchestration.run_recursive_training
+    original_print_recursive_pass = orchestration.print_recursive_pass
+    orchestration.run_recursive_training = fake_run_recursive_training
+    orchestration.print_recursive_pass = fake_print_recursive_pass
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            exit_code = cli.main(
+                [
+                    "run",
+                    "--mode",
+                    "recursive",
+                    "--M",
+                    "4",
+                    "--N",
+                    "2",
+                    "--T_standard",
+                    "0.25",
+                    "--T_total",
+                    "0.25",
+                    "--block_size",
+                    "0.25",
+                    "--passes",
+                    "1",
+                    "--recursive_fixed_eval_seed",
+                    "777",
+                    "--recursive_gradient_diagnostics",
+                    "--use_recursive_rollout_bundle",
+                    "--visual_sample_paths",
+                    "1",
+                    "--output_dir",
+                    str(out_dir),
+                ]
+            )
+            assert exit_code == 0
+            assert len(recursive_calls) == 1
+            assert len(print_calls) == 1
+            runs = sorted(out_dir.glob("run_*"))
+            assert len(runs) == 1
+            config = json.loads((runs[0] / "run_config.json").read_text(encoding="utf-8"))
+            eval_path = Path(config["eval_bundle_path_effective"])
+            rollout_path = Path(config["recursive_rollout_bundle_path_effective"])
+            assert config["recursive_fixed_eval_seed"] == 777
+            assert config["seed_manifest"]["recursive_fixed_eval_seed"] == 777
+            assert config["recursive_gradient_diagnostics"] is True
+            assert config["use_recursive_rollout_bundle"] is True
+            assert "use_eval_bundle_for_recursive_rollout" not in config
+            assert eval_path.name == "evaluation_bundle.npz"
+            assert rollout_path.name == "boundary_rollout_bundle.npz"
+            assert eval_path != rollout_path
+            assert eval_path.exists()
+            assert rollout_path.exists()
+            assert config["eval_bundle_status"] == "created"
+            assert isinstance(config["eval_bundle_sha256"], str)
+            assert len(config["eval_bundle_sha256"]) == 64
+            assert isinstance(config["recursive_rollout_bundle_sha256"], str)
+            assert len(config["recursive_rollout_bundle_sha256"]) == 64
+            assert config["recursive_rollout_bundle_status"] == "created"
+            rec_results = json.loads(
+                (runs[0] / "recursive" / "results.json").read_text(encoding="utf-8")
+            )
+            assert rec_results["evaluation_bundle_status"] == "created"
+            assert rec_results["evaluation_bundle_sha256"] == config["eval_bundle_sha256"]
+            assert rec_results["recursive_rollout_bundle_status"] == "created"
+            assert (
+                rec_results["recursive_rollout_bundle_sha256"]
+                == config["recursive_rollout_bundle_sha256"]
+            )
+    finally:
+        orchestration.run_recursive_training = original_run_recursive_training
+        orchestration.print_recursive_pass = original_print_recursive_pass
+
+
 def test_cli_recursive_two_pass_callbacks_finalize_selection_only_at_last_pass() -> None:
     import json
 
     from . import cli, orchestration
     from .naming import _pass_index
-    from .sampling import build_blocks
+    from .sampling import build_blocks, file_sha256
     from .tf_backend import require_tensorflow
 
     require_tensorflow()
@@ -7137,6 +8727,8 @@ def test_cli_recursive_two_pass_callbacks_finalize_selection_only_at_last_pass()
             "application_stability_by_pass_index": {},
             "selected_application_summary": None,
             "eval_bundle_path": str(eval_bundle_path),
+            "eval_bundle_status": "created",
+            "eval_bundle_sha256": file_sha256(str(eval_bundle_path)),
             "evaluation_bundle_M": 4,
             "visual_sample_paths": int(kwargs.get("visual_sample_paths", 0)),
             "visual_seed": int(kwargs.get("visual_seed") or 0),
@@ -7449,14 +9041,13 @@ def test_cli_records_application_metric_manifest_in_run_config() -> None:
                 "cost_J_running_cumulative",
             ]
             assert config["application_metric_aggregation"] == "left_riemann_f_plus_terminal_g"
-            assert config["seed_manifest"] == {
-                "global_seed": 1234,
-                "eval_seed": 222,
-                "visual_seed": 333,
-                "visual_seed_effective": 333,
-                "coarse_prepass_seed": 444,
-                "exact_init_seed": 555,
-            }
+            assert config["seed_manifest"]["global_seed"] == 1234
+            assert config["seed_manifest"]["eval_seed"] == 222
+            assert config["seed_manifest"]["recursive_fixed_eval_seed"] is None
+            assert config["seed_manifest"]["visual_seed"] == 333
+            assert config["seed_manifest"]["visual_seed_effective"] == 333
+            assert config["seed_manifest"]["coarse_prepass_seed"] == 444
+            assert config["seed_manifest"]["exact_init_seed"] == 555
             assert config["visual_seed_effective"] == 333
             assert isinstance(config["run_config_sha256"], str)
             assert len(config["run_config_sha256"]) == 64
@@ -7490,9 +9081,21 @@ def test_run_config_sha256_excludes_timestamp_metadata() -> None:
         "M": 4,
         "N": 2,
         "application_metric_schema": "pascucci_application_metrics_v2",
+        "eval_bundle_path_effective": "/tmp/run_a/recursive/evaluation_bundle.npz",
+        "eval_bundle_sha256": "0" * 64,
+        "eval_bundle_status": "created",
+        "recursive_rollout_bundle_path_effective": "/tmp/run_a/recursive/boundary_rollout_bundle.npz",
+        "recursive_rollout_bundle_sha256": "1" * 64,
+        "recursive_rollout_bundle_status": "created",
     }
     config_b = dict(config_a)
     config_b["timestamp"] = "run_20260609_120001"
+    config_b["eval_bundle_path_effective"] = "/tmp/run_b/recursive/evaluation_bundle.npz"
+    config_b["eval_bundle_sha256"] = "2" * 64
+    config_b["eval_bundle_status"] = "loaded"
+    config_b["recursive_rollout_bundle_path_effective"] = "/tmp/run_b/recursive/boundary_rollout_bundle.npz"
+    config_b["recursive_rollout_bundle_sha256"] = "3" * 64
+    config_b["recursive_rollout_bundle_status"] = "loaded"
     config_c = dict(config_a)
     config_c["M"] = 8
 
@@ -7551,7 +9154,7 @@ def test_cli_rejects_pascucci_cost_profile_for_quadratic_model() -> None:
 def test_cli_records_pascucci_cost_profile_params_in_recursive_run_config() -> None:
     _assert_pascucci_model_tdd_contract("pascucci_cli_records_cost_profile_params_in_recursive_run_config")
     from . import cli, orchestration
-    from .sampling import build_blocks
+    from .sampling import build_blocks, file_sha256
     from .tf_backend import require_tensorflow
 
     require_tensorflow()
@@ -7617,6 +9220,8 @@ def test_cli_records_pascucci_cost_profile_params_in_recursive_run_config() -> N
             "exact_summary_by_pass": {},
             "exact_summary_by_pass_index": {},
             "eval_bundle_path": str(eval_bundle_path),
+            "eval_bundle_status": "created",
+            "eval_bundle_sha256": file_sha256(str(eval_bundle_path)),
             "evaluation_bundle_M": 4,
             "excluded_pass_ids_from_selection": [],
             "excluded_pass_indices_from_selection": [],
@@ -8084,6 +9689,583 @@ def test_terminal_blob_constants_survive_train_graph() -> None:
     model.close()
 
 
+def test_train_with_standard_schedule_uses_fixed_evaluation_batches() -> None:
+    from .orchestration import train_with_standard_schedule
+
+    fixed_batches = _schedule_fixed_eval_batches()
+    train_calls = []
+    evaluate_calls = []
+
+    class FixedEvalModel:
+        const = np.float32(1.0)
+
+        def train(self, **kwargs):
+            train_calls.append(dict(kwargs))
+            return {
+                "last_loss": 0.25,
+                "best_score": 0.20,
+                "best_iter": 0,
+                "stopped_early": False,
+            }
+
+        def evaluate(
+            self,
+            const_value=None,
+            n_batches=5,
+            evaluation_batches=None,
+            moment_policy="batch_current",
+        ):
+            evaluate_calls.append(
+                {
+                    "const_value": const_value,
+                    "n_batches": n_batches,
+                    "evaluation_batches": evaluation_batches,
+                    "moment_policy": moment_policy,
+                }
+            )
+            return {
+                "mean_loss": 0.25,
+                "std_loss": 0.0,
+                "mean_loss_per_sample": 0.125,
+                "std_loss_per_sample": 0.0,
+                "mean_y0": 0.0,
+                "std_y0": 0.0,
+            }
+
+    train_with_standard_schedule(
+        model=FixedEvalModel(),
+        stage_plan=[(1, 1.0e-3)],
+        final_plan=[],
+        eval_batches=fixed_batches,
+        precision_target=None,
+        label="pass1:block5",
+        coupling_const=1.0,
+    )
+
+    assert len(evaluate_calls) >= 2
+    for call in evaluate_calls:
+        assert len(call["evaluation_batches"]) == len(fixed_batches)
+        for actual_batch, expected_batch in zip(call["evaluation_batches"], fixed_batches):
+            for actual, expected in zip(actual_batch, expected_batch):
+                np.testing.assert_allclose(actual, expected, rtol=0.0, atol=0.0)
+        assert call["n_batches"] == len(fixed_batches)
+        assert call["moment_policy"] == "fixed_evaluation_bundle"
+    assert len(train_calls) == 1
+    train_call = train_calls[0]
+    assert len(train_call["evaluation_batches"]) == len(fixed_batches)
+    for actual_batch, expected_batch in zip(train_call["evaluation_batches"], fixed_batches):
+        for actual, expected in zip(actual_batch, expected_batch):
+            np.testing.assert_allclose(actual, expected, rtol=0.0, atol=0.0)
+    assert train_call["moment_policy"] == "fixed_evaluation_bundle"
+
+
+def test_train_with_standard_schedule_accepts_kwargs_evaluate_adapter() -> None:
+    from .orchestration import train_with_standard_schedule
+
+    fixed_batches = _schedule_fixed_eval_batches()
+    evaluate_calls = []
+
+    class KwargsEvalModel:
+        const = np.float32(1.0)
+
+        def train(self, **kwargs):
+            return {
+                "last_loss": 0.25,
+                "best_score": 0.20,
+                "best_iter": 0,
+                "stopped_early": False,
+            }
+
+        def evaluate(self, **kwargs):
+            evaluate_calls.append(dict(kwargs))
+            return {
+                "mean_loss": 0.25,
+                "std_loss": 0.0,
+                "mean_loss_per_sample": 0.125,
+                "std_loss_per_sample": 0.0,
+                "mean_y0": 0.0,
+                "std_y0": 0.0,
+            }
+
+    train_with_standard_schedule(
+        model=KwargsEvalModel(),
+        stage_plan=[(1, 1.0e-3)],
+        final_plan=[],
+        eval_batches=fixed_batches,
+        precision_target=None,
+        label="pass1:block5",
+        coupling_const=1.0,
+    )
+
+    assert len(evaluate_calls) >= 2
+    for call in evaluate_calls:
+        assert call["n_batches"] == len(fixed_batches)
+        assert call["evaluation_batches"] == fixed_batches
+        assert call["moment_policy"] == "fixed_evaluation_bundle"
+
+
+def test_train_with_standard_schedule_fixed_eval_passes_integer_batch_count() -> None:
+    from .orchestration import train_with_standard_schedule
+
+    fixed_batches = _schedule_fixed_eval_batches()
+
+    class CastsBatchCountModel:
+        const = np.float32(1.0)
+
+        def train(self, **kwargs):
+            return {
+                "last_loss": 0.25,
+                "best_score": 0.20,
+                "best_iter": 0,
+                "stopped_early": False,
+            }
+
+        def evaluate(
+            self,
+            const_value=None,
+            n_batches=5,
+            evaluation_batches=None,
+            moment_policy="batch_current",
+        ):
+            assert int(n_batches) == len(fixed_batches)
+            for actual_batch, expected_batch in zip(list(evaluation_batches), fixed_batches):
+                for actual, expected in zip(actual_batch, expected_batch):
+                    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=0.0)
+            assert moment_policy == "fixed_evaluation_bundle"
+            return {
+                "mean_loss": 0.25,
+                "std_loss": 0.0,
+                "mean_loss_per_sample": 0.125,
+                "std_loss_per_sample": 0.0,
+                "mean_y0": 0.0,
+                "std_y0": 0.0,
+            }
+
+    train_with_standard_schedule(
+        model=CastsBatchCountModel(),
+        stage_plan=[(1, 1.0e-3)],
+        final_plan=[],
+        eval_batches=fixed_batches,
+        precision_target=None,
+        label="pass1:block5",
+        coupling_const=1.0,
+    )
+
+
+def test_train_with_standard_schedule_rejects_fixed_eval_without_bundle_api() -> None:
+    from .orchestration import train_with_standard_schedule
+
+    fixed_batches = _schedule_fixed_eval_batches()
+
+    class RestrictedEvalModel:
+        const = np.float32(1.0)
+
+        def train(self, **kwargs):
+            return {
+                "last_loss": 0.25,
+                "best_score": 0.20,
+                "best_iter": 0,
+                "stopped_early": False,
+            }
+
+        def evaluate(self, const_value=None, n_batches=5):
+            return {
+                "mean_loss": 0.25,
+                "std_loss": 0.0,
+                "mean_loss_per_sample": 0.125,
+                "std_loss_per_sample": 0.0,
+                "mean_y0": 0.0,
+                "std_y0": 0.0,
+            }
+
+    try:
+        train_with_standard_schedule(
+            model=RestrictedEvalModel(),
+            stage_plan=[(1, 1.0e-3)],
+            final_plan=[],
+            eval_batches=fixed_batches,
+            precision_target=None,
+            label="pass1:block5",
+            coupling_const=1.0,
+        )
+    except TypeError as exc:
+        assert "fixed evaluation batches require model.evaluate" in str(exc)
+        assert "evaluation_batches" in str(exc)
+        assert "moment_policy" in str(exc)
+    else:
+        raise AssertionError("fixed eval bundles must fail fast when evaluate lacks bundle kwargs")
+
+
+def test_train_with_standard_schedule_rejects_noninspectable_fixed_eval_api() -> None:
+    from .orchestration import train_with_standard_schedule
+
+    fixed_batches = _schedule_fixed_eval_batches()
+
+    class NoninspectableEvaluate:
+        __signature__ = "invalid"
+
+        def __call__(self, const_value=None, n_batches=5):
+            raise AssertionError("fixed eval should fail before calling a noninspectable evaluate")
+
+    class NoninspectableEvalModel:
+        const = np.float32(1.0)
+        evaluate = NoninspectableEvaluate()
+
+        def train(self, **kwargs):
+            return {
+                "last_loss": 0.25,
+                "best_score": 0.20,
+                "best_iter": 0,
+                "stopped_early": False,
+            }
+
+    try:
+        train_with_standard_schedule(
+            model=NoninspectableEvalModel(),
+            stage_plan=[(1, 1.0e-3)],
+            final_plan=[],
+            eval_batches=fixed_batches,
+            precision_target=None,
+            label="pass1:block5",
+            coupling_const=1.0,
+        )
+    except TypeError as exc:
+        assert "fixed evaluation batches require model.evaluate" in str(exc)
+    else:
+        raise AssertionError("fixed eval bundles must reject noninspectable evaluate callables")
+
+
+def test_train_with_standard_schedule_rejects_positional_only_fixed_eval_api() -> None:
+    from .orchestration import train_with_standard_schedule
+
+    fixed_batches = _schedule_fixed_eval_batches()
+
+    class PositionalOnlyEvalModel:
+        const = np.float32(1.0)
+
+        def train(self, **kwargs):
+            return {
+                "last_loss": 0.25,
+                "best_score": 0.20,
+                "best_iter": 0,
+                "stopped_early": False,
+            }
+
+        def evaluate(self, const_value, n_batches, evaluation_batches, moment_policy, /):
+            raise AssertionError("fixed eval should fail before calling a positional-only evaluate")
+
+    try:
+        train_with_standard_schedule(
+            model=PositionalOnlyEvalModel(),
+            stage_plan=[(1, 1.0e-3)],
+            final_plan=[],
+            eval_batches=fixed_batches,
+            precision_target=None,
+            label="pass1:block5",
+            coupling_const=1.0,
+        )
+    except TypeError as exc:
+        assert "fixed evaluation batches require model.evaluate" in str(exc)
+    else:
+        raise AssertionError("fixed eval bundles must reject positional-only evaluate parameters")
+
+
+def test_train_with_standard_schedule_rejects_malformed_fixed_eval_batches() -> None:
+    from .orchestration import train_with_standard_schedule
+
+    t_batch = np.zeros((2, 2, 1), dtype=np.float32)
+    W_batch = np.zeros((2, 2, 4), dtype=np.float32)
+    Xi_batch = np.zeros((2, 4), dtype=np.float32)
+
+    class ShouldNotEvaluateModel:
+        const = np.float32(1.0)
+
+        def train(self, **kwargs):
+            return {
+                "last_loss": 0.25,
+                "best_score": 0.20,
+                "best_iter": 0,
+                "stopped_early": False,
+            }
+
+        def evaluate(
+            self,
+            const_value=None,
+            n_batches=5,
+            evaluation_batches=None,
+            moment_policy="batch_current",
+        ):
+            raise AssertionError("malformed fixed eval batches should fail before evaluate")
+
+    def assert_rejected(eval_batches, expected):
+        try:
+            train_with_standard_schedule(
+                model=ShouldNotEvaluateModel(),
+                stage_plan=[(1, 1.0e-3)],
+                final_plan=[],
+                eval_batches=eval_batches,
+                precision_target=None,
+                label="pass1:block5",
+                coupling_const=1.0,
+            )
+        except ValueError as exc:
+            assert expected in str(exc)
+        else:
+            raise AssertionError(f"fixed eval batches should reject malformed input: {expected}")
+
+    assert_rejected([(t_batch, W_batch)], "triple")
+    assert_rejected([(t_batch, W_batch[:, :1, :], Xi_batch)], "time dimension")
+    assert_rejected([(t_batch, W_batch, Xi_batch[:, :3])], "state dimension")
+
+
+def test_train_with_standard_schedule_rejects_model_incompatible_fixed_eval_horizon() -> None:
+    from .orchestration import train_with_standard_schedule
+
+    fixed_batches = [
+        (
+            np.linspace(0.0, 0.25, 4, dtype=np.float32).reshape(1, 4, 1).repeat(2, axis=0),
+            np.zeros((2, 4, 4), dtype=np.float32),
+            np.zeros((2, 4), dtype=np.float32),
+        )
+    ]
+    calls = {"train": 0, "evaluate": 0}
+
+    class DimensionedModel:
+        const = np.float32(1.0)
+        M = 2
+        N = 2
+        D = 4
+
+        def train(self, **kwargs):
+            calls["train"] += 1
+            raise AssertionError("fixed eval horizon mismatch should fail before training")
+
+        def evaluate(
+            self,
+            const_value=None,
+            n_batches=5,
+            evaluation_batches=None,
+            moment_policy="batch_current",
+        ):
+            calls["evaluate"] += 1
+            raise AssertionError("fixed eval horizon mismatch should fail before evaluation")
+
+    try:
+        train_with_standard_schedule(
+            model=DimensionedModel(),
+            stage_plan=[(1, 1.0e-3)],
+            final_plan=[],
+            eval_batches=fixed_batches,
+            precision_target=None,
+            label="pass1:block5",
+            coupling_const=1.0,
+        )
+    except ValueError as exc:
+        assert "N+1=3" in str(exc)
+    else:
+        raise AssertionError("fixed eval batches should reject model-incompatible time horizons")
+    assert calls == {"train": 0, "evaluate": 0}
+
+
+def test_train_with_standard_schedule_rejects_zero_path_fixed_eval_batches() -> None:
+    from .orchestration import train_with_standard_schedule
+
+    class ShouldNotEvaluateModel:
+        const = np.float32(1.0)
+
+        def train(self, **kwargs):
+            return {
+                "last_loss": 0.25,
+                "best_score": 0.20,
+                "best_iter": 0,
+                "stopped_early": False,
+            }
+
+        def evaluate(
+            self,
+            const_value=None,
+            n_batches=5,
+            evaluation_batches=None,
+            moment_policy="batch_current",
+        ):
+            raise AssertionError("zero-path fixed eval batches should fail before evaluate")
+
+    try:
+        train_with_standard_schedule(
+            model=ShouldNotEvaluateModel(),
+            stage_plan=[(1, 1.0e-3)],
+            final_plan=[],
+            eval_batches=[
+                (
+                    np.zeros((0, 2, 1), dtype=np.float32),
+                    np.zeros((0, 2, 4), dtype=np.float32),
+                    np.zeros((0, 4), dtype=np.float32),
+                )
+            ],
+            precision_target=None,
+            label="pass1:block5",
+            coupling_const=1.0,
+        )
+    except ValueError as exc:
+        assert "at least one path" in str(exc)
+    else:
+        raise AssertionError("fixed eval batches should reject zero-path batches")
+
+
+def test_train_with_standard_schedule_fixed_eval_bundle_with_real_fbsnn() -> None:
+    from .models import NN_Quadratic_Coupled_Recursive
+    from .orchestration import train_with_standard_schedule
+    from .tf_backend import set_seed
+
+    set_seed(33)
+    params = _default_params()
+    model = NN_Quadratic_Coupled_Recursive(
+        Xi_generator=Xi_generator_default,
+        T=0.25,
+        M=4,
+        N=2,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        normalize_time_input=True,
+    )
+    fixed_batches = [
+        (
+            np.linspace(0.0, 0.25, 3, dtype=np.float32).reshape(1, 3, 1).repeat(4, axis=0),
+            np.zeros((4, 3, 4), dtype=np.float32),
+            np.zeros((4, 4), dtype=np.float32),
+        )
+    ]
+
+    try:
+        result = train_with_standard_schedule(
+            model=model,
+            stage_plan=[(1, 1.0e-3)],
+            final_plan=[],
+            eval_batches=fixed_batches,
+            precision_target=None,
+            label="pass1:block5",
+            coupling_const=1.0,
+        )
+        eval_stats = result["eval_stats"]
+        assert eval_stats["moment_policy"] == "fixed_evaluation_bundle"
+        assert eval_stats["n_batches"] == 1
+        assert eval_stats["evaluation_batches"] == 1
+        assert np.isfinite(float(eval_stats["mean_loss"]))
+    finally:
+        model.close()
+
+
+def test_train_with_standard_schedule_aggregates_gradient_diagnostic_maxima() -> None:
+    from .orchestration import train_with_standard_schedule
+
+    class GradientDiagnosticModel:
+        const = np.float32(1.0)
+
+        def __init__(self) -> None:
+            self.train_calls = 0
+
+        def train(self, **kwargs):
+            self.train_calls += 1
+            assert kwargs["return_gradient_diagnostics"] is True
+            if self.train_calls == 1:
+                grad = {
+                    "train_grad_global_norm": 10.0,
+                    "train_grad_global_norm_clipped": 4.0,
+                    "train_grad_clip_ratio": 0.4,
+                    "train_grad_global_norm_max": 10.0,
+                    "train_grad_global_norm_clipped_max": 4.0,
+                    "train_grad_clip_ratio_max": 0.4,
+                }
+            else:
+                grad = {
+                    "train_grad_global_norm": 2.0,
+                    "train_grad_global_norm_clipped": 2.0,
+                    "train_grad_clip_ratio": 1.0,
+                    "train_grad_global_norm_max": 2.0,
+                    "train_grad_global_norm_clipped_max": 2.0,
+                    "train_grad_clip_ratio_max": 1.0,
+                }
+            return {
+                "last_loss": 0.25,
+                "best_score": 0.20,
+                "best_iter": 0,
+                "stopped_early": False,
+                **grad,
+            }
+
+        def evaluate(self, **kwargs):
+            return {
+                "mean_loss": 0.25,
+                "std_loss": 0.0,
+                "mean_loss_per_sample": 0.125,
+                "std_loss_per_sample": 0.0,
+                "mean_y0": 0.0,
+                "std_y0": 0.0,
+            }
+
+    model = GradientDiagnosticModel()
+    result = train_with_standard_schedule(
+        model=model,
+        stage_plan=[(1, 1.0e-3)],
+        final_plan=[(1, 1.0e-4)],
+        eval_batches=1,
+        precision_target=None,
+        label="pass1:block5",
+        coupling_const=1.0,
+        return_gradient_diagnostics=True,
+    )
+
+    assert model.train_calls == 2
+    diagnostics = result["gradient_diagnostics"]
+    assert diagnostics["train_grad_global_norm"] == 2.0
+    assert diagnostics["train_grad_clip_ratio"] == 1.0
+    assert diagnostics["train_grad_global_norm_max"] == 10.0
+    assert diagnostics["train_grad_global_norm_clipped_max"] == 4.0
+    assert diagnostics["train_grad_clip_ratio_max"] == 1.0
+    assert result["stage_logs"][0]["train_grad_global_norm_max"] == 10.0
+    assert result["stage_logs"][1]["train_grad_global_norm_max"] == 2.0
+
+
+def test_train_with_standard_schedule_rejects_gradient_diagnostics_without_train_api() -> None:
+    from .orchestration import train_with_standard_schedule
+
+    class IncompatibleTrainModel:
+        const = np.float32(1.0)
+
+        def train(self, N_Iter, learning_rate, const_value):
+            raise AssertionError("diagnostic API guard should fail before train")
+
+        def evaluate(self, **kwargs):
+            return {
+                "mean_loss": 0.25,
+                "std_loss": 0.0,
+                "mean_loss_per_sample": 0.125,
+                "std_loss_per_sample": 0.0,
+                "mean_y0": 0.0,
+                "std_y0": 0.0,
+            }
+
+    try:
+        train_with_standard_schedule(
+            model=IncompatibleTrainModel(),
+            stage_plan=[(1, 1.0e-3)],
+            final_plan=[],
+            eval_batches=1,
+            precision_target=None,
+            label="pass1:block5",
+            coupling_const=1.0,
+            return_gradient_diagnostics=True,
+        )
+    except TypeError as exc:
+        assert "return_gradient_diagnostics" in str(exc)
+    else:
+        raise AssertionError("gradient diagnostics should require explicit model.train API support")
+
+
 def test_train_with_standard_schedule_rejects_nonfinite_stage() -> None:
     from .orchestration import train_with_standard_schedule
 
@@ -8468,6 +10650,8 @@ def run_tests(argv: List[str] | None = None) -> int:
         ("numpy_math_and_schedules", test_numpy_math_and_schedules),
         ("rollout_inputs_are_antithetic", test_rollout_inputs_are_antithetic),
         ("evaluation_bundle_rejects_block_metadata_mismatch", test_evaluation_bundle_rejects_block_metadata_mismatch),
+        ("evaluation_bundle_rejects_wrong_bundle_kind", test_evaluation_bundle_rejects_wrong_bundle_kind),
+        ("evaluation_bundle_loads_legacy_no_kind_as_evaluation_only", test_evaluation_bundle_loads_legacy_no_kind_as_evaluation_only),
         ("model_spec_contract", test_model_spec_contract),
         ("pascucci_tdd_contract_metadata", test_pascucci_tdd_contract_metadata),
         ("pascucci_model_layer_tdd_contract_metadata", test_pascucci_model_layer_tdd_contract_metadata),
@@ -8799,6 +10983,50 @@ def run_tests(argv: List[str] | None = None) -> int:
         "test_print_recursive_pass_application_metrics_emit_comparison_and_stability",
     ) and ok
     ok = _run_subprocess_case(
+        "rollout_boundaries_accepts_fixed_initial_and_rollout_inputs",
+        "test_rollout_boundaries_accepts_fixed_initial_and_rollout_inputs",
+    ) and ok
+    ok = _run_subprocess_case(
+        "rollout_boundaries_rejects_fixed_input_shape_mismatch",
+        "test_rollout_boundaries_rejects_fixed_input_shape_mismatch",
+    ) and ok
+    ok = _run_subprocess_case(
+        "rollout_boundaries_rejects_malformed_fixed_rollout_inputs",
+        "test_rollout_boundaries_rejects_malformed_fixed_rollout_inputs",
+    ) and ok
+    ok = _run_subprocess_case(
+        "rollout_boundaries_rejects_nonmonotonic_rollout_times",
+        "test_rollout_boundaries_rejects_nonmonotonic_rollout_times",
+    ) and ok
+    ok = _run_subprocess_case(
+        "rollout_boundaries_legacy_path_still_uses_generator_and_minibatch",
+        "test_rollout_boundaries_legacy_path_still_uses_generator_and_minibatch",
+    ) and ok
+    ok = _run_subprocess_case(
+        "load_evaluation_bundle_rejects_nonfinite_payload",
+        "test_load_evaluation_bundle_rejects_nonfinite_payload",
+    ) and ok
+    ok = _run_subprocess_case(
+        "print_recursive_pass_fails_fast_on_nonfinite_eval_bundle_before_predict",
+        "test_print_recursive_pass_fails_fast_on_nonfinite_eval_bundle_before_predict",
+    ) and ok
+    ok = _run_subprocess_case(
+        "run_recursive_training_wires_fixed_eval_and_gradient_diagnostics_to_logs",
+        "test_run_recursive_training_wires_fixed_eval_and_gradient_diagnostics_to_logs",
+    ) and ok
+    ok = _run_subprocess_case(
+        "run_recursive_training_pass_boundary_rollouts_use_fixed_rollout_inputs",
+        "test_run_recursive_training_pass_boundary_rollouts_use_fixed_rollout_inputs",
+    ) and ok
+    ok = _run_subprocess_case(
+        "run_recursive_training_negative_fixed_eval_seed_keeps_legacy_batches",
+        "test_run_recursive_training_negative_fixed_eval_seed_keeps_legacy_batches",
+    ) and ok
+    ok = _run_subprocess_case(
+        "run_recursive_training_copies_external_fixed_eval_batches_by_block",
+        "test_run_recursive_training_copies_external_fixed_eval_batches_by_block",
+    ) and ok
+    ok = _run_subprocess_case(
         "score_pass_logs_rejects_nonfinite_rows",
         "test_score_pass_logs_rejects_nonfinite_rows",
     ) and ok
@@ -8843,6 +11071,10 @@ def run_tests(argv: List[str] | None = None) -> int:
         "test_cli_tiny_standard_and_both_model_spec_outputs",
     ) and ok
     ok = _run_subprocess_case(
+        "cli_wires_recursive_diagnostic_flags_and_separate_rollout_bundle",
+        "test_cli_wires_recursive_diagnostic_flags_and_separate_rollout_bundle",
+    ) and ok
+    ok = _run_subprocess_case(
         "cli_recursive_two_pass_callbacks_finalize_selection_only_at_last_pass",
         "test_cli_recursive_two_pass_callbacks_finalize_selection_only_at_last_pass",
     ) and ok
@@ -8885,6 +11117,78 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "terminal_blob_constants_survive_train_graph",
         "test_terminal_blob_constants_survive_train_graph",
+    ) and ok
+    ok = _run_subprocess_case(
+        "train_with_standard_schedule_uses_fixed_evaluation_batches",
+        "test_train_with_standard_schedule_uses_fixed_evaluation_batches",
+    ) and ok
+    ok = _run_subprocess_case(
+        "train_with_standard_schedule_accepts_kwargs_evaluate_adapter",
+        "test_train_with_standard_schedule_accepts_kwargs_evaluate_adapter",
+    ) and ok
+    ok = _run_subprocess_case(
+        "train_with_standard_schedule_fixed_eval_passes_integer_batch_count",
+        "test_train_with_standard_schedule_fixed_eval_passes_integer_batch_count",
+    ) and ok
+    ok = _run_subprocess_case(
+        "train_with_standard_schedule_rejects_fixed_eval_without_bundle_api",
+        "test_train_with_standard_schedule_rejects_fixed_eval_without_bundle_api",
+    ) and ok
+    ok = _run_subprocess_case(
+        "train_with_standard_schedule_rejects_noninspectable_fixed_eval_api",
+        "test_train_with_standard_schedule_rejects_noninspectable_fixed_eval_api",
+    ) and ok
+    ok = _run_subprocess_case(
+        "train_with_standard_schedule_rejects_positional_only_fixed_eval_api",
+        "test_train_with_standard_schedule_rejects_positional_only_fixed_eval_api",
+    ) and ok
+    ok = _run_subprocess_case(
+        "train_with_standard_schedule_rejects_malformed_fixed_eval_batches",
+        "test_train_with_standard_schedule_rejects_malformed_fixed_eval_batches",
+    ) and ok
+    ok = _run_subprocess_case(
+        "train_with_standard_schedule_rejects_model_incompatible_fixed_eval_horizon",
+        "test_train_with_standard_schedule_rejects_model_incompatible_fixed_eval_horizon",
+    ) and ok
+    ok = _run_subprocess_case(
+        "train_with_standard_schedule_rejects_zero_path_fixed_eval_batches",
+        "test_train_with_standard_schedule_rejects_zero_path_fixed_eval_batches",
+    ) and ok
+    ok = _run_subprocess_case(
+        "train_with_standard_schedule_fixed_eval_bundle_with_real_fbsnn",
+        "test_train_with_standard_schedule_fixed_eval_bundle_with_real_fbsnn",
+    ) and ok
+    ok = _run_subprocess_case(
+        "train_with_standard_schedule_aggregates_gradient_diagnostic_maxima",
+        "test_train_with_standard_schedule_aggregates_gradient_diagnostic_maxima",
+    ) and ok
+    ok = _run_subprocess_case(
+        "train_with_standard_schedule_rejects_gradient_diagnostics_without_train_api",
+        "test_train_with_standard_schedule_rejects_gradient_diagnostics_without_train_api",
+    ) and ok
+    ok = _run_subprocess_case(
+        "model_train_reports_gradient_norm_diagnostics",
+        "test_model_train_reports_gradient_norm_diagnostics",
+    ) and ok
+    ok = _run_subprocess_case(
+        "model_train_gradient_diagnostics_marks_disabled_clipping",
+        "test_model_train_gradient_diagnostics_marks_disabled_clipping",
+    ) and ok
+    ok = _run_subprocess_case(
+        "model_train_uses_fixed_evaluation_batches_for_best_snapshot",
+        "test_model_train_uses_fixed_evaluation_batches_for_best_snapshot",
+    ) and ok
+    ok = _run_subprocess_case(
+        "model_train_rejects_malformed_fixed_evaluation_batches",
+        "test_model_train_rejects_malformed_fixed_evaluation_batches",
+    ) and ok
+    ok = _run_subprocess_case(
+        "model_train_rejects_wrong_time_horizon_fixed_evaluation_batches",
+        "test_model_train_rejects_wrong_time_horizon_fixed_evaluation_batches",
+    ) and ok
+    ok = _run_subprocess_case(
+        "model_train_rejects_wrong_time_horizon_before_update",
+        "test_model_train_rejects_wrong_time_horizon_before_update",
     ) and ok
     ok = _run_subprocess_case(
         "model_train_rejects_nonfinite_loss",

@@ -539,14 +539,38 @@ class FBSNN(tf.Module, ABC):
         grads_and_vars = [(g, v) for g, v in zip(gradients, variables) if g is not None]
         for grad, _ in grads_and_vars:
             tf.debugging.assert_all_finite(grad, "non-finite training gradient")
+        grad_global_norm = tf.constant(0.0, dtype=tf.float32)
+        grad_clipped_global_norm = tf.constant(0.0, dtype=tf.float32)
+        grad_clip_ratio = tf.constant(1.0, dtype=tf.float32)
+        grad_clip_norm = tf.constant(
+            0.0 if self.clip_grad_norm is None else float(self.clip_grad_norm),
+            dtype=tf.float32,
+        )
         if self.clip_grad_norm is not None and grads_and_vars:
             grads, vars_ = zip(*grads_and_vars)
+            grad_global_norm = tf.linalg.global_norm(grads)
             clipped, _ = tf.clip_by_global_norm(grads, self.clip_grad_norm)
             for grad in clipped:
                 tf.debugging.assert_all_finite(grad, "non-finite clipped training gradient")
+            grad_clipped_global_norm = tf.linalg.global_norm(clipped)
+            grad_clip_ratio = grad_clipped_global_norm / tf.maximum(
+                grad_global_norm,
+                tf.constant(1.0e-12, dtype=tf.float32),
+            )
             grads_and_vars = list(zip(clipped, vars_))
+        elif grads_and_vars:
+            grads, _ = zip(*grads_and_vars)
+            grad_global_norm = tf.linalg.global_norm(grads)
+            grad_clipped_global_norm = grad_global_norm
         self.optimizer.apply_gradients(grads_and_vars)
-        return loss_value
+        return (
+            loss_value,
+            grad_global_norm,
+            grad_clipped_global_norm,
+            grad_clip_ratio,
+            grad_clip_norm,
+            tf.constant(float(len(grads_and_vars)), dtype=tf.float32),
+        )
 
     def train(
         self,
@@ -559,10 +583,20 @@ class FBSNN(tf.Module, ABC):
         patience=None,
         min_delta=1e-3,
         restore_best=False,
+        return_gradient_diagnostics=False,
+        evaluation_batches=None,
+        moment_policy="batch_current",
     ):
         self._set_optimizer_learning_rate(float(learning_rate))
         start_time = time.time()
         last_loss = None
+        last_gradient_diagnostics = {}
+        max_gradient_diagnostics = {}
+        fixed_evaluation_batches = (
+            self._prepare_evaluation_batches(evaluation_batches)
+            if evaluation_batches is not None
+            else None
+        )
         current_const = np.float32(self.const if const_value is None else const_value)
         self._set_const(current_const)
 
@@ -575,16 +609,59 @@ class FBSNN(tf.Module, ABC):
         for it in range(int(N_Iter)):
             t_batch, W_batch, Xi_batch = self.fetch_minibatch()
             try:
-                train_loss = self._train_step_tensor(
+                train_step = self._train_step_tensor(
                     tf.convert_to_tensor(t_batch, dtype=tf.float32),
                     tf.convert_to_tensor(W_batch, dtype=tf.float32),
                     tf.convert_to_tensor(Xi_batch, dtype=tf.float32),
                     tf.constant(current_const, dtype=tf.float32),
                 )
+                (
+                    train_loss,
+                    grad_global_norm,
+                    grad_clipped_global_norm,
+                    grad_clip_ratio,
+                    grad_clip_norm,
+                    gradient_variable_count,
+                ) = train_step
                 self._require_finite_training_scalar(
                     train_loss.numpy(),
                     f"loss before update at it={it}",
                 )
+                if return_gradient_diagnostics:
+                    current_gradient_diagnostics = {
+                        "train_grad_global_norm": self._require_finite_training_scalar(
+                            grad_global_norm.numpy(),
+                            f"grad_global_norm at it={it}",
+                        ),
+                        "train_grad_global_norm_clipped": self._require_finite_training_scalar(
+                            grad_clipped_global_norm.numpy(),
+                            f"grad_clipped_global_norm at it={it}",
+                        ),
+                        "train_grad_clip_ratio": self._require_finite_training_scalar(
+                            grad_clip_ratio.numpy(),
+                            f"grad_clip_ratio at it={it}",
+                        ),
+                        "train_grad_clip_norm": self._require_finite_training_scalar(
+                            grad_clip_norm.numpy(),
+                            f"grad_clip_norm at it={it}",
+                        ),
+                        "train_grad_clip_enabled": float(self.clip_grad_norm is not None),
+                        "train_gradient_variable_count": self._require_finite_training_scalar(
+                            gradient_variable_count.numpy(),
+                            f"gradient_variable_count at it={it}",
+                        ),
+                    }
+                    last_gradient_diagnostics = current_gradient_diagnostics
+                    for key in (
+                        "train_grad_global_norm",
+                        "train_grad_global_norm_clipped",
+                        "train_grad_clip_ratio",
+                    ):
+                        max_key = f"{key}_max"
+                        max_gradient_diagnostics[max_key] = max(
+                            float(max_gradient_diagnostics.get(max_key, 0.0)),
+                            float(current_gradient_diagnostics[key]),
+                        )
             except tf.errors.InvalidArgumentError as exc:
                 raise RuntimeError(f"non-finite training step at it={it}: {exc.message}") from exc
 
@@ -611,7 +688,15 @@ class FBSNN(tf.Module, ABC):
                 start_time = time.time()
 
             if (it % int(eval_every) == 0) or (it == int(N_Iter) - 1):
-                eval_stats = self.evaluate(const_value=current_const, n_batches=val_batches)
+                if fixed_evaluation_batches is None:
+                    eval_stats = self.evaluate(const_value=current_const, n_batches=val_batches)
+                else:
+                    eval_stats = self.evaluate(
+                        const_value=current_const,
+                        n_batches=len(fixed_evaluation_batches),
+                        evaluation_batches=fixed_evaluation_batches,
+                        moment_policy=moment_policy,
+                    )
                 if early_stopping_metric == "loss":
                     score = self._require_finite_training_scalar(
                         eval_stats["mean_loss"],
@@ -637,7 +722,7 @@ class FBSNN(tf.Module, ABC):
             self._restore_snapshot(best_snapshot)
             print(f"[RestoreBest] best_it={best_iter}, best_score={best_score:.6e}")
 
-        return {
+        train_summary = {
             "const": float(current_const),
             "learning_rate": float(learning_rate),
             "n_iter": int(N_Iter),
@@ -646,6 +731,55 @@ class FBSNN(tf.Module, ABC):
             "best_score": float(best_score),
             "stopped_early": bool(stopped_early),
         }
+        if return_gradient_diagnostics:
+            train_summary.update(last_gradient_diagnostics)
+            train_summary.update(max_gradient_diagnostics)
+        return train_summary
+
+    def _prepare_evaluation_batches(self, evaluation_batches):
+        batches = list(evaluation_batches)
+        if len(batches) == 0:
+            raise ValueError("evaluation_batches must contain at least one batch")
+        validated = []
+        for idx, batch in enumerate(batches):
+            if not isinstance(batch, (tuple, list)) or len(batch) != 3:
+                raise ValueError(f"evaluation_batches[{idx}] must be a (t, W, Xi) triple")
+            t_batch, W_batch, Xi_batch = batch
+            t_arr = np.asarray(t_batch, dtype=np.float32)
+            W_arr = np.asarray(W_batch, dtype=np.float32)
+            Xi_arr = np.asarray(Xi_batch, dtype=np.float32)
+            if t_arr.ndim != 3 or t_arr.shape[2] != 1:
+                raise ValueError(f"evaluation_batches[{idx}][0] must have shape (M, N+1, 1)")
+            if W_arr.ndim != 3:
+                raise ValueError(f"evaluation_batches[{idx}][1] must have shape (M, N+1, D)")
+            if Xi_arr.ndim != 2:
+                raise ValueError(f"evaluation_batches[{idx}][2] must have shape (M, D)")
+            if t_arr.shape[0] == 0:
+                raise ValueError(f"evaluation_batches[{idx}] must contain at least one path")
+            if t_arr.shape[1] <= 1:
+                raise ValueError(f"evaluation_batches[{idx}] must contain at least one time step")
+            expected_time_points = int(self.N) + 1
+            if t_arr.shape[1] != expected_time_points:
+                raise ValueError(
+                    f"evaluation_batches[{idx}] time dimension must match model N+1={expected_time_points}, "
+                    f"got {t_arr.shape[1]}"
+                )
+            if t_arr.shape[0] != int(self.M):
+                raise ValueError(
+                    f"evaluation_batches[{idx}] batch size must match model M={int(self.M)}, got {t_arr.shape[0]}"
+                )
+            if t_arr.shape[0] != W_arr.shape[0] or t_arr.shape[0] != Xi_arr.shape[0]:
+                raise ValueError(f"evaluation_batches[{idx}] batch dimension mismatch")
+            if t_arr.shape[1] != W_arr.shape[1]:
+                raise ValueError(f"evaluation_batches[{idx}] time dimension mismatch")
+            if W_arr.shape[2] != self.D or Xi_arr.shape[1] != self.D:
+                raise ValueError(f"evaluation_batches[{idx}] state dimension mismatch")
+            if not np.isfinite(t_arr).all() or not np.isfinite(W_arr).all() or not np.isfinite(Xi_arr).all():
+                raise ValueError(f"evaluation_batches[{idx}] contains non-finite values")
+            if not np.all(np.diff(t_arr[:, :, 0], axis=1) > 0.0):
+                raise ValueError(f"evaluation_batches[{idx}] time grid must be strictly increasing")
+            validated.append((t_arr, W_arr, Xi_arr))
+        return validated
 
     def evaluate(
         self,
@@ -661,9 +795,7 @@ class FBSNN(tf.Module, ABC):
             batches = [self.fetch_minibatch() for _ in range(int(n_batches))]
             evaluation_batch_count = 0
         else:
-            batches = list(evaluation_batches)
-            if len(batches) == 0:
-                raise ValueError("evaluation_batches must contain at least one batch")
+            batches = self._prepare_evaluation_batches(evaluation_batches)
             evaluation_batch_count = len(batches)
 
         losses = []

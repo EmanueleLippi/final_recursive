@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import os
+import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+
+_EVALUATION_BUNDLE_SCHEMA = "evaluation_bundle_v2"
+_VALID_BUNDLE_KINDS = {"evaluation", "boundary_rollout"}
 
 def build_stitched_rollout_inputs(
     blocks: List[Dict[str, float]],
@@ -53,7 +57,14 @@ def save_evaluation_bundle(
     Xi_initial: np.ndarray,
     rollout_inputs: List[Tuple[np.ndarray, np.ndarray]],
     blocks: List[Dict[str, float]],
+    bundle_kind: str = "evaluation",
 ) -> None:
+    bundle_kind = str(bundle_kind)
+    if bundle_kind not in _VALID_BUNDLE_KINDS:
+        raise ValueError(
+            f"Unsupported evaluation bundle kind: {bundle_kind!r}; "
+            f"expected one of {sorted(_VALID_BUNDLE_KINDS)}"
+        )
     dir_name = os.path.dirname(path)
     if dir_name != "":
         os.makedirs(dir_name, exist_ok=True)
@@ -68,7 +79,16 @@ def save_evaluation_bundle(
         W_bundle=w_stack,
         block_t_start=t_start,
         block_t_end=t_end,
+        bundle_schema=np.asarray(_EVALUATION_BUNDLE_SCHEMA),
+        bundle_kind=np.asarray(bundle_kind),
     )
+
+def file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 def load_evaluation_bundle(
     path: str,
@@ -77,6 +97,7 @@ def load_evaluation_bundle(
     D_expected: int,
     blocks_expected: Optional[List[Dict[str, float]]] = None,
     T_total_expected: Optional[float] = None,
+    bundle_kind_expected: Optional[str] = None,
 ) -> Tuple[np.ndarray, List[Tuple[np.ndarray, np.ndarray]]]:
     with np.load(path, allow_pickle=False) as data:
         files = set(data.files)
@@ -93,6 +114,35 @@ def load_evaluation_bundle(
             if "block_t_end" in files
             else None
         )
+        saved_kind = str(np.asarray(data["bundle_kind"]).item()) if "bundle_kind" in files else None
+        saved_schema = (
+            str(np.asarray(data["bundle_schema"]).item())
+            if "bundle_schema" in files
+            else None
+        )
+
+    if bundle_kind_expected is not None:
+        expected_kind = str(bundle_kind_expected)
+        if expected_kind not in _VALID_BUNDLE_KINDS:
+            raise ValueError(
+                f"Unsupported expected evaluation bundle kind: {expected_kind!r}; "
+                f"expected one of {sorted(_VALID_BUNDLE_KINDS)}"
+            )
+        if saved_kind is None:
+            if expected_kind == "evaluation":
+                saved_kind = "evaluation"
+            else:
+                raise ValueError("Evaluation bundle metadata mismatch: missing bundle_kind")
+        if saved_kind != expected_kind:
+            raise ValueError(
+                "Evaluation bundle metadata mismatch: "
+                f"bundle_kind={saved_kind!r}, expected {expected_kind!r}"
+            )
+    if saved_schema is not None and saved_schema != _EVALUATION_BUNDLE_SCHEMA:
+        raise ValueError(
+            "Evaluation bundle metadata mismatch: "
+            f"bundle_schema={saved_schema!r}, expected {_EVALUATION_BUNDLE_SCHEMA!r}"
+        )
 
     if Xi.ndim != 2 or Xi.shape[1] != int(D_expected):
         raise ValueError(
@@ -101,6 +151,10 @@ def load_evaluation_bundle(
     if t_bundle.ndim != 4 or W_bundle.ndim != 4:
         raise ValueError(
             f"Invalid rollout bundle rank: t={t_bundle.shape}, W={W_bundle.shape}; expected rank-4"
+        )
+    if t_bundle.shape[3] != 1:
+        raise ValueError(
+            f"Evaluation bundle time tensor must have final dimension 1, got {t_bundle.shape}"
         )
     if t_bundle.shape[0] != int(n_blocks_expected) or W_bundle.shape[0] != int(n_blocks_expected):
         raise ValueError(
@@ -111,6 +165,11 @@ def load_evaluation_bundle(
             "Evaluation bundle N_per_block mismatch: "
             f"got {t_bundle.shape[2]-1}, expected {int(N_per_block_expected)}"
         )
+    if W_bundle.shape[2] != int(N_per_block_expected) + 1:
+        raise ValueError(
+            "Evaluation bundle N_per_block mismatch in W: "
+            f"got {W_bundle.shape[2]-1}, expected {int(N_per_block_expected)}"
+        )
     if W_bundle.shape[3] != int(D_expected):
         raise ValueError(
             f"Evaluation bundle D mismatch in W: got {W_bundle.shape[3]}, expected {int(D_expected)}"
@@ -120,6 +179,8 @@ def load_evaluation_bundle(
             "Evaluation bundle M mismatch between Xi and rollout tensors: "
             f"Xi={Xi.shape[0]}, t_bundle={t_bundle.shape[1]}, W_bundle={W_bundle.shape[1]}"
         )
+    if not np.isfinite(Xi).all() or not np.isfinite(t_bundle).all() or not np.isfinite(W_bundle).all():
+        raise ValueError("Evaluation bundle contains non-finite values")
 
     if blocks_expected is not None:
         expected_start = np.asarray(
@@ -150,7 +211,26 @@ def load_evaluation_bundle(
 
     rollout_inputs = []
     for i in range(int(n_blocks_expected)):
-        rollout_inputs.append((t_bundle[i], W_bundle[i]))
+        t_i = t_bundle[i]
+        W_i = W_bundle[i]
+        if not np.all(np.diff(t_i[:, :, 0], axis=1) > 0.0):
+            raise ValueError(f"Evaluation bundle block {i} time grid must be strictly increasing")
+        if not np.allclose(W_i[:, 0, :], 0.0, rtol=1.0e-6, atol=1.0e-6):
+            raise ValueError(f"Evaluation bundle block {i} W_start must be zero")
+        expected_start_value = None
+        expected_end_value = None
+        if blocks_expected is not None:
+            expected_start_value = float(blocks_expected[i]["t_start"])
+            expected_end_value = float(blocks_expected[i]["t_end"])
+        elif saved_t_start is not None and saved_t_end is not None:
+            expected_start_value = float(saved_t_start[i])
+            expected_end_value = float(saved_t_end[i])
+        if expected_start_value is not None:
+            if not np.allclose(t_i[:, 0, 0], expected_start_value, rtol=1.0e-6, atol=1.0e-6):
+                raise ValueError(f"Evaluation bundle block {i} t_start does not match metadata")
+            if not np.allclose(t_i[:, -1, 0], expected_end_value, rtol=1.0e-6, atol=1.0e-6):
+                raise ValueError(f"Evaluation bundle block {i} t_end does not match metadata")
+        rollout_inputs.append((t_i, W_i))
     return Xi, rollout_inputs
 
 
