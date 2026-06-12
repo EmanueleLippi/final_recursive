@@ -4896,6 +4896,332 @@ def test_model_train_rejects_nonfinite_loss() -> None:
         model.close()
 
 
+def test_model_train_reports_gradient_norm_diagnostics() -> None:
+    from .models import NN_Quadratic_Coupled_Recursive
+    from .tf_backend import set_seed
+
+    set_seed(31)
+    params = _default_params()
+    model = NN_Quadratic_Coupled_Recursive(
+        Xi_generator=Xi_generator_default,
+        T=0.25,
+        M=4,
+        N=2,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        normalize_time_input=True,
+    )
+
+    try:
+        stats = model.train(
+            N_Iter=2,
+            learning_rate=1.0e-3,
+            const_value=1.0,
+            eval_every=1,
+            val_batches=1,
+            return_gradient_diagnostics=True,
+        )
+        for key in (
+            "train_grad_global_norm",
+            "train_grad_global_norm_clipped",
+            "train_grad_clip_ratio",
+            "train_grad_clip_norm",
+            "train_grad_clip_enabled",
+            "train_grad_global_norm_max",
+            "train_grad_global_norm_clipped_max",
+            "train_grad_clip_ratio_max",
+        ):
+            assert key in stats, f"{key} missing from train diagnostics"
+            assert np.isfinite(float(stats[key])), f"{key} must be finite"
+        assert stats["train_grad_global_norm"] >= 0.0
+        assert stats["train_grad_global_norm_clipped"] >= 0.0
+        assert stats["train_grad_global_norm_clipped"] <= stats["train_grad_global_norm"] + 1.0e-6
+        assert stats["train_grad_clip_ratio"] >= 0.0
+        assert stats["train_grad_clip_enabled"] == 1.0
+        assert stats["train_grad_global_norm_max"] >= stats["train_grad_global_norm"]
+        assert stats["train_grad_global_norm_clipped_max"] >= stats["train_grad_global_norm_clipped"]
+        assert stats["train_grad_clip_ratio_max"] >= stats["train_grad_clip_ratio"]
+    finally:
+        model.close()
+
+
+def test_model_train_gradient_diagnostics_marks_disabled_clipping() -> None:
+    from .models import NN_Quadratic_Coupled_Recursive
+    from .tf_backend import set_seed
+
+    set_seed(32)
+    params = _default_params()
+    model = NN_Quadratic_Coupled_Recursive(
+        Xi_generator=Xi_generator_default,
+        T=0.25,
+        M=4,
+        N=2,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        normalize_time_input=True,
+    )
+    model.clip_grad_norm = None
+
+    try:
+        stats = model.train(
+            N_Iter=1,
+            learning_rate=1.0e-3,
+            const_value=1.0,
+            eval_every=1,
+            val_batches=1,
+            return_gradient_diagnostics=True,
+        )
+        assert stats["train_grad_clip_enabled"] == 0.0
+        assert stats["train_grad_clip_norm"] == 0.0
+        assert stats["train_grad_clip_ratio"] == 1.0
+        np.testing.assert_allclose(
+            stats["train_grad_global_norm_clipped"],
+            stats["train_grad_global_norm"],
+            rtol=1.0e-6,
+            atol=1.0e-6,
+        )
+    finally:
+        model.close()
+
+
+def test_model_train_uses_fixed_evaluation_batches_for_best_snapshot() -> None:
+    from .models import NN_Quadratic_Coupled_Recursive
+    from .tf_backend import set_seed
+
+    set_seed(34)
+    params = _default_params()
+    model = NN_Quadratic_Coupled_Recursive(
+        Xi_generator=Xi_generator_default,
+        T=0.25,
+        M=4,
+        N=2,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        normalize_time_input=True,
+    )
+    fixed_batches = [
+        (
+            np.linspace(0.0, 0.25, 3, dtype=np.float32).reshape(1, 3, 1).repeat(4, axis=0),
+            np.zeros((4, 3, 4), dtype=np.float32),
+            np.zeros((4, 4), dtype=np.float32),
+        )
+    ]
+    eval_calls = []
+    eval_scores = [0.75, 0.25]
+
+    def fixed_evaluate(
+        const_value=None,
+        n_batches=5,
+        evaluation_batches=None,
+        moment_policy="batch_current",
+    ):
+        eval_calls.append(
+            {
+                "n_batches": n_batches,
+                "evaluation_batches": evaluation_batches,
+                "moment_policy": moment_policy,
+            }
+        )
+        score = eval_scores[len(eval_calls) - 1]
+        return {
+            "mean_loss": score,
+            "std_loss": 0.0,
+            "mean_loss_per_sample": score / 4.0,
+            "std_loss_per_sample": 0.0,
+            "mean_y0": 0.0,
+            "std_y0": 0.0,
+        }
+
+    model.evaluate = fixed_evaluate
+
+    try:
+        stats = model.train(
+            N_Iter=2,
+            learning_rate=1.0e-3,
+            const_value=1.0,
+            eval_every=1,
+            val_batches=7,
+            early_stopping_metric="loss",
+            restore_best=True,
+            evaluation_batches=fixed_batches,
+            moment_policy="fixed_evaluation_bundle",
+        )
+        assert stats["best_iter"] == 1
+        assert stats["best_score"] == 0.25
+        assert len(eval_calls) == 2
+        for call in eval_calls:
+            assert call["n_batches"] == len(fixed_batches)
+            assert call["moment_policy"] == "fixed_evaluation_bundle"
+            assert len(call["evaluation_batches"]) == len(fixed_batches)
+            for actual_batch, expected_batch in zip(call["evaluation_batches"], fixed_batches):
+                for actual, expected in zip(actual_batch, expected_batch):
+                    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=0.0)
+    finally:
+        model.close()
+
+
+def test_model_train_rejects_malformed_fixed_evaluation_batches() -> None:
+    from .models import NN_Quadratic_Coupled_Recursive
+    from .tf_backend import set_seed
+
+    set_seed(35)
+    params = _default_params()
+    model = NN_Quadratic_Coupled_Recursive(
+        Xi_generator=Xi_generator_default,
+        T=0.25,
+        M=4,
+        N=2,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        normalize_time_input=True,
+    )
+    t_batch = np.linspace(0.0, 0.25, 3, dtype=np.float32).reshape(1, 3, 1).repeat(4, axis=0)
+    W_batch = np.zeros((4, 3, 4), dtype=np.float32)
+    Xi_batch = np.zeros((4, 4), dtype=np.float32)
+
+    def assert_rejected(evaluation_batches, expected):
+        try:
+            model.train(
+                N_Iter=1,
+                learning_rate=1.0e-3,
+                const_value=1.0,
+                eval_every=1,
+                evaluation_batches=evaluation_batches,
+                moment_policy="fixed_evaluation_bundle",
+            )
+        except ValueError as exc:
+            assert expected in str(exc)
+        else:
+            raise AssertionError(f"train should reject malformed evaluation_batches: {expected}")
+
+    try:
+        assert_rejected([(t_batch, W_batch)], "triple")
+        assert_rejected([(t_batch, W_batch[:, :1, :], Xi_batch)], "time dimension")
+        assert_rejected([(t_batch, W_batch, Xi_batch[:, :3])], "state dimension")
+        assert_rejected([(t_batch[:2], W_batch[:2], Xi_batch[:2])], "batch size")
+        bad_t = t_batch.copy()
+        bad_t[:, 1, 0] = bad_t[:, 0, 0]
+        assert_rejected([(bad_t, W_batch, Xi_batch)], "strictly increasing")
+    finally:
+        model.close()
+
+
+def test_model_train_rejects_wrong_time_horizon_fixed_evaluation_batches() -> None:
+    from .models import NN_Quadratic_Coupled_Recursive
+    from .tf_backend import set_seed
+
+    set_seed(37)
+    params = _default_params()
+    model = NN_Quadratic_Coupled_Recursive(
+        Xi_generator=Xi_generator_default,
+        T=0.25,
+        M=4,
+        N=2,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        normalize_time_input=True,
+    )
+    Xi_batch = np.zeros((4, 4), dtype=np.float32)
+
+    def assert_rejected(time_points: int) -> None:
+        t_batch = (
+            np.linspace(0.0, 0.25, time_points, dtype=np.float32)
+            .reshape(1, time_points, 1)
+            .repeat(4, axis=0)
+        )
+        W_batch = np.zeros((4, time_points, 4), dtype=np.float32)
+        try:
+            model.train(
+                N_Iter=1,
+                learning_rate=1.0e-3,
+                const_value=1.0,
+                eval_every=1,
+                evaluation_batches=[(t_batch, W_batch, Xi_batch)],
+                moment_policy="fixed_evaluation_bundle",
+            )
+        except ValueError as exc:
+            assert "N+1=3" in str(exc)
+        else:
+            raise AssertionError("train should reject a fixed evaluation bundle with the wrong time horizon")
+
+    try:
+        assert_rejected(2)
+        assert_rejected(4)
+    finally:
+        model.close()
+
+
+def test_model_train_rejects_wrong_time_horizon_before_update() -> None:
+    from .models import NN_Quadratic_Coupled_Recursive
+    from .tf_backend import set_seed
+
+    set_seed(38)
+    params = _default_params()
+    model = NN_Quadratic_Coupled_Recursive(
+        Xi_generator=Xi_generator_default,
+        T=0.25,
+        M=4,
+        N=2,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        normalize_time_input=True,
+    )
+    t_batch = np.linspace(0.0, 0.25, 4, dtype=np.float32).reshape(1, 4, 1).repeat(4, axis=0)
+    W_batch = np.zeros((4, 4, 4), dtype=np.float32)
+    Xi_batch = np.zeros((4, 4), dtype=np.float32)
+    loss_calls = {"count": 0}
+    original_loss_function = model.loss_function
+
+    def fail_if_training_starts(*args, **kwargs):
+        loss_calls["count"] += 1
+        raise AssertionError("fixed evaluation validation should fail before the training loss is evaluated")
+
+    model.loss_function = fail_if_training_starts
+    try:
+        try:
+            model.train(
+                N_Iter=1,
+                learning_rate=1.0e-3,
+                const_value=1.0,
+                eval_every=1,
+                evaluation_batches=[(t_batch, W_batch, Xi_batch)],
+                moment_policy="fixed_evaluation_bundle",
+                return_gradient_diagnostics=True,
+            )
+        except ValueError as exc:
+            assert "N+1=3" in str(exc)
+        else:
+            raise AssertionError("train should fail fast on fixed evaluation time-horizon mismatch")
+        assert loss_calls["count"] == 0
+    finally:
+        model.loss_function = original_loss_function
+        model.close()
+
+
 def test_model_spec_recursive_factory_matches_direct_constructor() -> None:
     from .model_specs import get_model_spec
     from .models import NN_Quadratic_Coupled_Recursive
@@ -5847,6 +6173,314 @@ def test_print_recursive_pass_application_metrics_emit_comparison_and_stability(
         orchestration.plot_recursive_pass_logs_multi = original_plot_logs
         orchestration.plot_recursive_stitched_predictions = original_plot_stitched
         orchestration.plot_recursive_stitched_y_convergence = original_plot_convergence
+
+
+def test_rollout_boundaries_accepts_fixed_initial_and_rollout_inputs() -> None:
+    from . import orchestration
+    from .model_specs import ModelSpec, get_model_spec
+
+    base = get_model_spec("quadratic_coupled")
+    M = 3
+    D = 4
+    N = 2
+    layers = [5, 8, 1]
+    blocks = [
+        {"idx": 0, "t_start": 0.0, "t_end": 0.25, "T_block": 0.25},
+        {"idx": 1, "t_start": 0.25, "t_end": 0.50, "T_block": 0.25},
+    ]
+    Xi_initial = np.arange(M * D, dtype=np.float32).reshape(M, D) / np.float32(10.0)
+    rollout_inputs = []
+    for idx, block in enumerate(blocks):
+        t_block = (
+            np.linspace(block["t_start"], block["t_end"], N + 1, dtype=np.float32)
+            .reshape(1, N + 1, 1)
+            .repeat(M, axis=0)
+        )
+        W_block = np.full((M, N + 1, D), np.float32(idx + 1), dtype=np.float32)
+        W_block[:, 0, :] = 0.0
+        rollout_inputs.append((t_block, W_block))
+    predict_calls = []
+
+    class _Session:
+        def close(self):
+            pass
+
+    class _BoundaryModel:
+        def __init__(self, *, model_index: int, **kwargs):
+            self.model_index = int(model_index)
+            self.sess = _Session()
+
+        def import_parameter_blob(self, blob, strict=True):
+            self.blob = dict(blob)
+            self.strict = bool(strict)
+
+        def fetch_minibatch(self):
+            raise AssertionError("fixed rollout_inputs should be used instead of fetch_minibatch")
+
+        def predict(self, Xi_star, t_star, W_star, const_value=None):
+            predict_calls.append(
+                {
+                    "idx": self.model_index,
+                    "Xi": np.asarray(Xi_star, dtype=np.float32).copy(),
+                    "t": np.asarray(t_star, dtype=np.float32).copy(),
+                    "W": np.asarray(W_star, dtype=np.float32).copy(),
+                    "const": float(const_value),
+                }
+            )
+            X = np.repeat(np.asarray(Xi_star, dtype=np.float32)[:, None, :], np.asarray(t_star).shape[1], axis=1)
+            X[:, -1, :] += np.float32(10.0 * (self.model_index + 1))
+            Y = np.zeros((X.shape[0], X.shape[1], 1), dtype=np.float32)
+            Z = np.zeros((X.shape[0], X.shape[1], D), dtype=np.float32)
+            return X.astype(np.float32), Y, Z
+
+    model_counter = {"count": 0}
+
+    def build_model(**kwargs):
+        idx = model_counter["count"]
+        model_counter["count"] += 1
+        return _BoundaryModel(model_index=idx, **kwargs)
+
+    spec = ModelSpec(
+        name="boundary_replay_stub",
+        state_dim=D,
+        state_labels=base.state_labels,
+        z_labels=base.z_labels,
+        build_default_params=base.build_default_params,
+        build_layers=base.build_layers,
+        xi_generator=base.xi_generator,
+        deterministic_xi=base.deterministic_xi,
+        standard_model_factory=lambda **kwargs: None,
+        recursive_model_factory=build_model,
+        build_exact_solution=lambda *args, **kwargs: None,
+        build_exact_initial_boundary_samples=None,
+    )
+
+    def forbidden_generator(M_arg, D_arg):
+        raise AssertionError("fixed Xi_initial should be used instead of Xi_generator")
+
+    boundaries = orchestration.rollout_boundaries(
+        block_blobs=[_make_blob(layers), _make_blob(layers)],
+        blocks=blocks,
+        Xi_generator=forbidden_generator,
+        params=base.build_default_params(),
+        M_rollout=M,
+        N_per_block=N,
+        D=D,
+        layers=layers,
+        T_total=0.50,
+        coupling_const=0.75,
+        model_spec=spec,
+        Xi_initial=Xi_initial,
+        rollout_inputs=rollout_inputs,
+    )
+
+    assert len(boundaries) == 3
+    np.testing.assert_allclose(boundaries[0], Xi_initial, rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(boundaries[1], Xi_initial + np.float32(10.0), rtol=0.0, atol=1.0e-6)
+    np.testing.assert_allclose(boundaries[2], Xi_initial + np.float32(30.0), rtol=0.0, atol=1.0e-6)
+    assert [call["idx"] for call in predict_calls] == [0, 1]
+    np.testing.assert_allclose(predict_calls[0]["Xi"], boundaries[0], rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(predict_calls[1]["Xi"], boundaries[1], rtol=0.0, atol=0.0)
+    for idx, call in enumerate(predict_calls):
+        np.testing.assert_allclose(call["t"], rollout_inputs[idx][0], rtol=0.0, atol=0.0)
+        np.testing.assert_allclose(call["W"], rollout_inputs[idx][1], rtol=0.0, atol=0.0)
+        np.testing.assert_allclose(call["const"], 0.75, rtol=0.0, atol=0.0)
+
+
+def test_rollout_boundaries_rejects_fixed_input_shape_mismatch() -> None:
+    from . import orchestration
+    from .model_specs import get_model_spec
+
+    base = get_model_spec("quadratic_coupled")
+    M = 2
+    D = 4
+    N = 1
+    layers = [5, 8, 1]
+    blocks = [{"idx": 0, "t_start": 0.0, "t_end": 0.25, "T_block": 0.25}]
+    rollout_inputs = [
+        (
+            np.asarray([[[0.0], [0.25]], [[0.0], [0.25]]], dtype=np.float32),
+            np.zeros((M, N + 1, D), dtype=np.float32),
+        )
+    ]
+
+    try:
+        orchestration.rollout_boundaries(
+            block_blobs=[_make_blob(layers)],
+            blocks=blocks,
+            Xi_generator=base.xi_generator,
+            params=base.build_default_params(),
+            M_rollout=M,
+            N_per_block=N,
+            D=D,
+            layers=layers,
+            T_total=0.25,
+            model_spec=base,
+            Xi_initial=np.zeros((M, D + 1), dtype=np.float32),
+            rollout_inputs=rollout_inputs,
+        )
+    except ValueError as exc:
+        assert "Xi_initial" in str(exc)
+    else:
+        raise AssertionError("rollout_boundaries should reject invalid fixed Xi_initial shape")
+
+
+def test_rollout_boundaries_rejects_malformed_fixed_rollout_inputs() -> None:
+    from . import orchestration
+    from .model_specs import get_model_spec
+
+    base = get_model_spec("quadratic_coupled")
+    M = 2
+    D = 4
+    N = 1
+    layers = [5, 8, 1]
+    blocks = [{"idx": 0, "t_start": 0.0, "t_end": 0.25, "T_block": 0.25}]
+    Xi_initial = np.zeros((M, D), dtype=np.float32)
+    valid_t = np.asarray([[[0.0], [0.25]], [[0.0], [0.25]]], dtype=np.float32)
+    valid_W = np.zeros((M, N + 1, D), dtype=np.float32)
+
+    def assert_rejected(rollout_inputs, expected):
+        try:
+            orchestration.rollout_boundaries(
+                block_blobs=[_make_blob(layers)],
+                blocks=blocks,
+                Xi_generator=base.xi_generator,
+                params=base.build_default_params(),
+                M_rollout=M,
+                N_per_block=N,
+                D=D,
+                layers=layers,
+                T_total=0.25,
+                model_spec=base,
+                Xi_initial=Xi_initial,
+                rollout_inputs=rollout_inputs,
+            )
+        except ValueError as exc:
+            assert expected in str(exc)
+        else:
+            raise AssertionError(f"rollout_boundaries should reject malformed rollout_inputs: {expected}")
+
+    assert_rejected([], "one (t, W) pair per block")
+    assert_rejected([(valid_t[:, :1, :], valid_W)], "shape")
+    assert_rejected([(valid_t, valid_W[:, :, :3])], "shape")
+    bad_t = valid_t.copy()
+    bad_t[:, -1, 0] = np.float32(0.50)
+    assert_rejected([(bad_t, valid_W)], "t_end")
+    bad_W = valid_W.copy()
+    bad_W[:, 0, :] = np.float32(1.0)
+    assert_rejected([(valid_t, bad_W)], "W_start")
+
+
+def test_rollout_boundaries_rejects_nonmonotonic_rollout_times() -> None:
+    from . import orchestration
+    from .model_specs import get_model_spec
+
+    base = get_model_spec("quadratic_coupled")
+    M = 2
+    D = 4
+    N = 2
+    layers = [5, 8, 1]
+    blocks = [{"idx": 0, "t_start": 0.0, "t_end": 0.25, "T_block": 0.25}]
+    Xi_initial = np.zeros((M, D), dtype=np.float32)
+    bad_t = np.asarray([[[0.0], [0.25], [0.25]], [[0.0], [0.25], [0.25]]], dtype=np.float32)
+    W = np.zeros((M, N + 1, D), dtype=np.float32)
+
+    try:
+        orchestration.rollout_boundaries(
+            block_blobs=[_make_blob(layers)],
+            blocks=blocks,
+            Xi_generator=base.xi_generator,
+            params=base.build_default_params(),
+            M_rollout=M,
+            N_per_block=N,
+            D=D,
+            layers=layers,
+            T_total=0.25,
+            model_spec=base,
+            Xi_initial=Xi_initial,
+            rollout_inputs=[(bad_t, W)],
+        )
+    except ValueError as exc:
+        assert "strictly increasing" in str(exc)
+    else:
+        raise AssertionError("rollout_boundaries should reject nonmonotonic fixed rollout times")
+
+
+def test_rollout_boundaries_legacy_path_still_uses_generator_and_minibatch() -> None:
+    from . import orchestration
+    from .model_specs import ModelSpec, get_model_spec
+
+    base = get_model_spec("quadratic_coupled")
+    M = 2
+    D = 4
+    N = 1
+    layers = [5, 8, 1]
+    blocks = [{"idx": 0, "t_start": 0.0, "t_end": 0.25, "T_block": 0.25}]
+    Xi_from_generator = np.full((M, D), np.float32(3.0), dtype=np.float32)
+    calls = {"generator": 0, "fetch": 0}
+
+    class _Session:
+        def close(self):
+            pass
+
+    class _LegacyBoundaryModel:
+        def __init__(self, **kwargs):
+            self.sess = _Session()
+
+        def import_parameter_blob(self, blob, strict=True):
+            pass
+
+        def fetch_minibatch(self):
+            calls["fetch"] += 1
+            t = np.asarray([[[0.0], [0.25]], [[0.0], [0.25]]], dtype=np.float32)
+            W = np.zeros((M, N + 1, D), dtype=np.float32)
+            Xi = np.zeros((M, D), dtype=np.float32)
+            return t, W, Xi
+
+        def predict(self, Xi_star, t_star, W_star, const_value=None):
+            X = np.repeat(np.asarray(Xi_star, dtype=np.float32)[:, None, :], np.asarray(t_star).shape[1], axis=1)
+            X[:, -1, :] += np.float32(1.0)
+            Y = np.zeros((M, N + 1, 1), dtype=np.float32)
+            Z = np.zeros((M, N + 1, D), dtype=np.float32)
+            return X, Y, Z
+
+    spec = ModelSpec(
+        name="boundary_legacy_stub",
+        state_dim=D,
+        state_labels=base.state_labels,
+        z_labels=base.z_labels,
+        build_default_params=base.build_default_params,
+        build_layers=base.build_layers,
+        xi_generator=base.xi_generator,
+        deterministic_xi=base.deterministic_xi,
+        standard_model_factory=lambda **kwargs: None,
+        recursive_model_factory=lambda **kwargs: _LegacyBoundaryModel(**kwargs),
+        build_exact_solution=lambda *args, **kwargs: None,
+        build_exact_initial_boundary_samples=None,
+    )
+
+    def generator(M_arg, D_arg):
+        calls["generator"] += 1
+        assert int(M_arg) == M
+        assert int(D_arg) == D
+        return Xi_from_generator.copy()
+
+    boundaries = orchestration.rollout_boundaries(
+        block_blobs=[_make_blob(layers)],
+        blocks=blocks,
+        Xi_generator=generator,
+        params=base.build_default_params(),
+        M_rollout=M,
+        N_per_block=N,
+        D=D,
+        layers=layers,
+        T_total=0.25,
+        model_spec=spec,
+    )
+
+    assert calls == {"generator": 1, "fetch": 1}
+    np.testing.assert_allclose(boundaries[0], Xi_from_generator, rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(boundaries[1], Xi_from_generator + np.float32(1.0), rtol=0.0, atol=1.0e-6)
 
 
 def test_score_pass_logs_rejects_nonfinite_rows() -> None:
@@ -8084,6 +8718,512 @@ def test_terminal_blob_constants_survive_train_graph() -> None:
     model.close()
 
 
+def test_train_with_standard_schedule_uses_fixed_evaluation_batches() -> None:
+    from .orchestration import train_with_standard_schedule
+
+    fixed_batches = [
+        (
+            np.zeros((2, 2, 1), dtype=np.float32),
+            np.zeros((2, 2, 4), dtype=np.float32),
+            np.zeros((2, 4), dtype=np.float32),
+        )
+    ]
+    train_calls = []
+    evaluate_calls = []
+
+    class FixedEvalModel:
+        const = np.float32(1.0)
+
+        def train(self, **kwargs):
+            train_calls.append(dict(kwargs))
+            return {
+                "last_loss": 0.25,
+                "best_score": 0.20,
+                "best_iter": 0,
+                "stopped_early": False,
+            }
+
+        def evaluate(
+            self,
+            const_value=None,
+            n_batches=5,
+            evaluation_batches=None,
+            moment_policy="batch_current",
+        ):
+            evaluate_calls.append(
+                {
+                    "const_value": const_value,
+                    "n_batches": n_batches,
+                    "evaluation_batches": evaluation_batches,
+                    "moment_policy": moment_policy,
+                }
+            )
+            return {
+                "mean_loss": 0.25,
+                "std_loss": 0.0,
+                "mean_loss_per_sample": 0.125,
+                "std_loss_per_sample": 0.0,
+                "mean_y0": 0.0,
+                "std_y0": 0.0,
+            }
+
+    train_with_standard_schedule(
+        model=FixedEvalModel(),
+        stage_plan=[(1, 1.0e-3)],
+        final_plan=[],
+        eval_batches=fixed_batches,
+        precision_target=None,
+        label="pass1:block5",
+        coupling_const=1.0,
+    )
+
+    assert len(evaluate_calls) >= 2
+    for call in evaluate_calls:
+        assert len(call["evaluation_batches"]) == len(fixed_batches)
+        for actual_batch, expected_batch in zip(call["evaluation_batches"], fixed_batches):
+            for actual, expected in zip(actual_batch, expected_batch):
+                np.testing.assert_allclose(actual, expected, rtol=0.0, atol=0.0)
+        assert call["n_batches"] == len(fixed_batches)
+        assert call["moment_policy"] == "fixed_evaluation_bundle"
+    assert len(train_calls) == 1
+    train_call = train_calls[0]
+    assert len(train_call["evaluation_batches"]) == len(fixed_batches)
+    for actual_batch, expected_batch in zip(train_call["evaluation_batches"], fixed_batches):
+        for actual, expected in zip(actual_batch, expected_batch):
+            np.testing.assert_allclose(actual, expected, rtol=0.0, atol=0.0)
+    assert train_call["moment_policy"] == "fixed_evaluation_bundle"
+
+
+def test_train_with_standard_schedule_accepts_kwargs_evaluate_adapter() -> None:
+    from .orchestration import train_with_standard_schedule
+
+    fixed_batches = [
+        (
+            np.zeros((2, 2, 1), dtype=np.float32),
+            np.zeros((2, 2, 4), dtype=np.float32),
+            np.zeros((2, 4), dtype=np.float32),
+        )
+    ]
+    evaluate_calls = []
+
+    class KwargsEvalModel:
+        const = np.float32(1.0)
+
+        def train(self, **kwargs):
+            return {
+                "last_loss": 0.25,
+                "best_score": 0.20,
+                "best_iter": 0,
+                "stopped_early": False,
+            }
+
+        def evaluate(self, **kwargs):
+            evaluate_calls.append(dict(kwargs))
+            return {
+                "mean_loss": 0.25,
+                "std_loss": 0.0,
+                "mean_loss_per_sample": 0.125,
+                "std_loss_per_sample": 0.0,
+                "mean_y0": 0.0,
+                "std_y0": 0.0,
+            }
+
+    train_with_standard_schedule(
+        model=KwargsEvalModel(),
+        stage_plan=[(1, 1.0e-3)],
+        final_plan=[],
+        eval_batches=fixed_batches,
+        precision_target=None,
+        label="pass1:block5",
+        coupling_const=1.0,
+    )
+
+    assert len(evaluate_calls) >= 2
+    for call in evaluate_calls:
+        assert call["n_batches"] == len(fixed_batches)
+        assert call["evaluation_batches"] == fixed_batches
+        assert call["moment_policy"] == "fixed_evaluation_bundle"
+
+
+def test_train_with_standard_schedule_fixed_eval_passes_integer_batch_count() -> None:
+    from .orchestration import train_with_standard_schedule
+
+    fixed_batches = [
+        (
+            np.zeros((2, 2, 1), dtype=np.float32),
+            np.zeros((2, 2, 4), dtype=np.float32),
+            np.zeros((2, 4), dtype=np.float32),
+        )
+    ]
+
+    class CastsBatchCountModel:
+        const = np.float32(1.0)
+
+        def train(self, **kwargs):
+            return {
+                "last_loss": 0.25,
+                "best_score": 0.20,
+                "best_iter": 0,
+                "stopped_early": False,
+            }
+
+        def evaluate(
+            self,
+            const_value=None,
+            n_batches=5,
+            evaluation_batches=None,
+            moment_policy="batch_current",
+        ):
+            assert int(n_batches) == len(fixed_batches)
+            for actual_batch, expected_batch in zip(list(evaluation_batches), fixed_batches):
+                for actual, expected in zip(actual_batch, expected_batch):
+                    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=0.0)
+            assert moment_policy == "fixed_evaluation_bundle"
+            return {
+                "mean_loss": 0.25,
+                "std_loss": 0.0,
+                "mean_loss_per_sample": 0.125,
+                "std_loss_per_sample": 0.0,
+                "mean_y0": 0.0,
+                "std_y0": 0.0,
+            }
+
+    train_with_standard_schedule(
+        model=CastsBatchCountModel(),
+        stage_plan=[(1, 1.0e-3)],
+        final_plan=[],
+        eval_batches=fixed_batches,
+        precision_target=None,
+        label="pass1:block5",
+        coupling_const=1.0,
+    )
+
+
+def test_train_with_standard_schedule_rejects_fixed_eval_without_bundle_api() -> None:
+    from .orchestration import train_with_standard_schedule
+
+    fixed_batches = [
+        (
+            np.zeros((2, 2, 1), dtype=np.float32),
+            np.zeros((2, 2, 4), dtype=np.float32),
+            np.zeros((2, 4), dtype=np.float32),
+        )
+    ]
+
+    class RestrictedEvalModel:
+        const = np.float32(1.0)
+
+        def train(self, **kwargs):
+            return {
+                "last_loss": 0.25,
+                "best_score": 0.20,
+                "best_iter": 0,
+                "stopped_early": False,
+            }
+
+        def evaluate(self, const_value=None, n_batches=5):
+            return {
+                "mean_loss": 0.25,
+                "std_loss": 0.0,
+                "mean_loss_per_sample": 0.125,
+                "std_loss_per_sample": 0.0,
+                "mean_y0": 0.0,
+                "std_y0": 0.0,
+            }
+
+    try:
+        train_with_standard_schedule(
+            model=RestrictedEvalModel(),
+            stage_plan=[(1, 1.0e-3)],
+            final_plan=[],
+            eval_batches=fixed_batches,
+            precision_target=None,
+            label="pass1:block5",
+            coupling_const=1.0,
+        )
+    except TypeError as exc:
+        assert "fixed evaluation batches require model.evaluate" in str(exc)
+        assert "evaluation_batches" in str(exc)
+        assert "moment_policy" in str(exc)
+    else:
+        raise AssertionError("fixed eval bundles must fail fast when evaluate lacks bundle kwargs")
+
+
+def test_train_with_standard_schedule_rejects_noninspectable_fixed_eval_api() -> None:
+    from .orchestration import train_with_standard_schedule
+
+    fixed_batches = [
+        (
+            np.zeros((2, 2, 1), dtype=np.float32),
+            np.zeros((2, 2, 4), dtype=np.float32),
+            np.zeros((2, 4), dtype=np.float32),
+        )
+    ]
+
+    class NoninspectableEvaluate:
+        __signature__ = "invalid"
+
+        def __call__(self, const_value=None, n_batches=5):
+            raise AssertionError("fixed eval should fail before calling a noninspectable evaluate")
+
+    class NoninspectableEvalModel:
+        const = np.float32(1.0)
+        evaluate = NoninspectableEvaluate()
+
+        def train(self, **kwargs):
+            return {
+                "last_loss": 0.25,
+                "best_score": 0.20,
+                "best_iter": 0,
+                "stopped_early": False,
+            }
+
+    try:
+        train_with_standard_schedule(
+            model=NoninspectableEvalModel(),
+            stage_plan=[(1, 1.0e-3)],
+            final_plan=[],
+            eval_batches=fixed_batches,
+            precision_target=None,
+            label="pass1:block5",
+            coupling_const=1.0,
+        )
+    except TypeError as exc:
+        assert "fixed evaluation batches require model.evaluate" in str(exc)
+    else:
+        raise AssertionError("fixed eval bundles must reject noninspectable evaluate callables")
+
+
+def test_train_with_standard_schedule_rejects_positional_only_fixed_eval_api() -> None:
+    from .orchestration import train_with_standard_schedule
+
+    fixed_batches = [
+        (
+            np.zeros((2, 2, 1), dtype=np.float32),
+            np.zeros((2, 2, 4), dtype=np.float32),
+            np.zeros((2, 4), dtype=np.float32),
+        )
+    ]
+
+    class PositionalOnlyEvalModel:
+        const = np.float32(1.0)
+
+        def train(self, **kwargs):
+            return {
+                "last_loss": 0.25,
+                "best_score": 0.20,
+                "best_iter": 0,
+                "stopped_early": False,
+            }
+
+        def evaluate(self, const_value, n_batches, evaluation_batches, moment_policy, /):
+            raise AssertionError("fixed eval should fail before calling a positional-only evaluate")
+
+    try:
+        train_with_standard_schedule(
+            model=PositionalOnlyEvalModel(),
+            stage_plan=[(1, 1.0e-3)],
+            final_plan=[],
+            eval_batches=fixed_batches,
+            precision_target=None,
+            label="pass1:block5",
+            coupling_const=1.0,
+        )
+    except TypeError as exc:
+        assert "fixed evaluation batches require model.evaluate" in str(exc)
+    else:
+        raise AssertionError("fixed eval bundles must reject positional-only evaluate parameters")
+
+
+def test_train_with_standard_schedule_rejects_malformed_fixed_eval_batches() -> None:
+    from .orchestration import train_with_standard_schedule
+
+    t_batch = np.zeros((2, 2, 1), dtype=np.float32)
+    W_batch = np.zeros((2, 2, 4), dtype=np.float32)
+    Xi_batch = np.zeros((2, 4), dtype=np.float32)
+
+    class ShouldNotEvaluateModel:
+        const = np.float32(1.0)
+
+        def train(self, **kwargs):
+            return {
+                "last_loss": 0.25,
+                "best_score": 0.20,
+                "best_iter": 0,
+                "stopped_early": False,
+            }
+
+        def evaluate(
+            self,
+            const_value=None,
+            n_batches=5,
+            evaluation_batches=None,
+            moment_policy="batch_current",
+        ):
+            raise AssertionError("malformed fixed eval batches should fail before evaluate")
+
+    def assert_rejected(eval_batches, expected):
+        try:
+            train_with_standard_schedule(
+                model=ShouldNotEvaluateModel(),
+                stage_plan=[(1, 1.0e-3)],
+                final_plan=[],
+                eval_batches=eval_batches,
+                precision_target=None,
+                label="pass1:block5",
+                coupling_const=1.0,
+            )
+        except ValueError as exc:
+            assert expected in str(exc)
+        else:
+            raise AssertionError(f"fixed eval batches should reject malformed input: {expected}")
+
+    assert_rejected([(t_batch, W_batch)], "triple")
+    assert_rejected([(t_batch, W_batch[:, :1, :], Xi_batch)], "time dimension")
+    assert_rejected([(t_batch, W_batch, Xi_batch[:, :3])], "state dimension")
+
+
+def test_train_with_standard_schedule_rejects_model_incompatible_fixed_eval_horizon() -> None:
+    from .orchestration import train_with_standard_schedule
+
+    fixed_batches = [
+        (
+            np.linspace(0.0, 0.25, 4, dtype=np.float32).reshape(1, 4, 1).repeat(2, axis=0),
+            np.zeros((2, 4, 4), dtype=np.float32),
+            np.zeros((2, 4), dtype=np.float32),
+        )
+    ]
+    calls = {"train": 0, "evaluate": 0}
+
+    class DimensionedModel:
+        const = np.float32(1.0)
+        M = 2
+        N = 2
+        D = 4
+
+        def train(self, **kwargs):
+            calls["train"] += 1
+            raise AssertionError("fixed eval horizon mismatch should fail before training")
+
+        def evaluate(
+            self,
+            const_value=None,
+            n_batches=5,
+            evaluation_batches=None,
+            moment_policy="batch_current",
+        ):
+            calls["evaluate"] += 1
+            raise AssertionError("fixed eval horizon mismatch should fail before evaluation")
+
+    try:
+        train_with_standard_schedule(
+            model=DimensionedModel(),
+            stage_plan=[(1, 1.0e-3)],
+            final_plan=[],
+            eval_batches=fixed_batches,
+            precision_target=None,
+            label="pass1:block5",
+            coupling_const=1.0,
+        )
+    except ValueError as exc:
+        assert "N+1=3" in str(exc)
+    else:
+        raise AssertionError("fixed eval batches should reject model-incompatible time horizons")
+    assert calls == {"train": 0, "evaluate": 0}
+
+
+def test_train_with_standard_schedule_rejects_zero_path_fixed_eval_batches() -> None:
+    from .orchestration import train_with_standard_schedule
+
+    class ShouldNotEvaluateModel:
+        const = np.float32(1.0)
+
+        def train(self, **kwargs):
+            return {
+                "last_loss": 0.25,
+                "best_score": 0.20,
+                "best_iter": 0,
+                "stopped_early": False,
+            }
+
+        def evaluate(
+            self,
+            const_value=None,
+            n_batches=5,
+            evaluation_batches=None,
+            moment_policy="batch_current",
+        ):
+            raise AssertionError("zero-path fixed eval batches should fail before evaluate")
+
+    try:
+        train_with_standard_schedule(
+            model=ShouldNotEvaluateModel(),
+            stage_plan=[(1, 1.0e-3)],
+            final_plan=[],
+            eval_batches=[
+                (
+                    np.zeros((0, 2, 1), dtype=np.float32),
+                    np.zeros((0, 2, 4), dtype=np.float32),
+                    np.zeros((0, 4), dtype=np.float32),
+                )
+            ],
+            precision_target=None,
+            label="pass1:block5",
+            coupling_const=1.0,
+        )
+    except ValueError as exc:
+        assert "at least one path" in str(exc)
+    else:
+        raise AssertionError("fixed eval batches should reject zero-path batches")
+
+
+def test_train_with_standard_schedule_fixed_eval_bundle_with_real_fbsnn() -> None:
+    from .models import NN_Quadratic_Coupled_Recursive
+    from .orchestration import train_with_standard_schedule
+    from .tf_backend import set_seed
+
+    set_seed(33)
+    params = _default_params()
+    model = NN_Quadratic_Coupled_Recursive(
+        Xi_generator=Xi_generator_default,
+        T=0.25,
+        M=4,
+        N=2,
+        D=4,
+        layers=[5, 8, 1],
+        parameters=params,
+        t_start=0.0,
+        t_end=0.25,
+        T_total=0.25,
+        normalize_time_input=True,
+    )
+    fixed_batches = [
+        (
+            np.linspace(0.0, 0.25, 3, dtype=np.float32).reshape(1, 3, 1).repeat(4, axis=0),
+            np.zeros((4, 3, 4), dtype=np.float32),
+            np.zeros((4, 4), dtype=np.float32),
+        )
+    ]
+
+    try:
+        result = train_with_standard_schedule(
+            model=model,
+            stage_plan=[(1, 1.0e-3)],
+            final_plan=[],
+            eval_batches=fixed_batches,
+            precision_target=None,
+            label="pass1:block5",
+            coupling_const=1.0,
+        )
+        eval_stats = result["eval_stats"]
+        assert eval_stats["moment_policy"] == "fixed_evaluation_bundle"
+        assert eval_stats["n_batches"] == 1
+        assert eval_stats["evaluation_batches"] == 1
+        assert np.isfinite(float(eval_stats["mean_loss"]))
+    finally:
+        model.close()
+
+
 def test_train_with_standard_schedule_rejects_nonfinite_stage() -> None:
     from .orchestration import train_with_standard_schedule
 
@@ -8799,6 +9939,26 @@ def run_tests(argv: List[str] | None = None) -> int:
         "test_print_recursive_pass_application_metrics_emit_comparison_and_stability",
     ) and ok
     ok = _run_subprocess_case(
+        "rollout_boundaries_accepts_fixed_initial_and_rollout_inputs",
+        "test_rollout_boundaries_accepts_fixed_initial_and_rollout_inputs",
+    ) and ok
+    ok = _run_subprocess_case(
+        "rollout_boundaries_rejects_fixed_input_shape_mismatch",
+        "test_rollout_boundaries_rejects_fixed_input_shape_mismatch",
+    ) and ok
+    ok = _run_subprocess_case(
+        "rollout_boundaries_rejects_malformed_fixed_rollout_inputs",
+        "test_rollout_boundaries_rejects_malformed_fixed_rollout_inputs",
+    ) and ok
+    ok = _run_subprocess_case(
+        "rollout_boundaries_rejects_nonmonotonic_rollout_times",
+        "test_rollout_boundaries_rejects_nonmonotonic_rollout_times",
+    ) and ok
+    ok = _run_subprocess_case(
+        "rollout_boundaries_legacy_path_still_uses_generator_and_minibatch",
+        "test_rollout_boundaries_legacy_path_still_uses_generator_and_minibatch",
+    ) and ok
+    ok = _run_subprocess_case(
         "score_pass_logs_rejects_nonfinite_rows",
         "test_score_pass_logs_rejects_nonfinite_rows",
     ) and ok
@@ -8885,6 +10045,70 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "terminal_blob_constants_survive_train_graph",
         "test_terminal_blob_constants_survive_train_graph",
+    ) and ok
+    ok = _run_subprocess_case(
+        "train_with_standard_schedule_uses_fixed_evaluation_batches",
+        "test_train_with_standard_schedule_uses_fixed_evaluation_batches",
+    ) and ok
+    ok = _run_subprocess_case(
+        "train_with_standard_schedule_accepts_kwargs_evaluate_adapter",
+        "test_train_with_standard_schedule_accepts_kwargs_evaluate_adapter",
+    ) and ok
+    ok = _run_subprocess_case(
+        "train_with_standard_schedule_fixed_eval_passes_integer_batch_count",
+        "test_train_with_standard_schedule_fixed_eval_passes_integer_batch_count",
+    ) and ok
+    ok = _run_subprocess_case(
+        "train_with_standard_schedule_rejects_fixed_eval_without_bundle_api",
+        "test_train_with_standard_schedule_rejects_fixed_eval_without_bundle_api",
+    ) and ok
+    ok = _run_subprocess_case(
+        "train_with_standard_schedule_rejects_noninspectable_fixed_eval_api",
+        "test_train_with_standard_schedule_rejects_noninspectable_fixed_eval_api",
+    ) and ok
+    ok = _run_subprocess_case(
+        "train_with_standard_schedule_rejects_positional_only_fixed_eval_api",
+        "test_train_with_standard_schedule_rejects_positional_only_fixed_eval_api",
+    ) and ok
+    ok = _run_subprocess_case(
+        "train_with_standard_schedule_rejects_malformed_fixed_eval_batches",
+        "test_train_with_standard_schedule_rejects_malformed_fixed_eval_batches",
+    ) and ok
+    ok = _run_subprocess_case(
+        "train_with_standard_schedule_rejects_model_incompatible_fixed_eval_horizon",
+        "test_train_with_standard_schedule_rejects_model_incompatible_fixed_eval_horizon",
+    ) and ok
+    ok = _run_subprocess_case(
+        "train_with_standard_schedule_rejects_zero_path_fixed_eval_batches",
+        "test_train_with_standard_schedule_rejects_zero_path_fixed_eval_batches",
+    ) and ok
+    ok = _run_subprocess_case(
+        "train_with_standard_schedule_fixed_eval_bundle_with_real_fbsnn",
+        "test_train_with_standard_schedule_fixed_eval_bundle_with_real_fbsnn",
+    ) and ok
+    ok = _run_subprocess_case(
+        "model_train_reports_gradient_norm_diagnostics",
+        "test_model_train_reports_gradient_norm_diagnostics",
+    ) and ok
+    ok = _run_subprocess_case(
+        "model_train_gradient_diagnostics_marks_disabled_clipping",
+        "test_model_train_gradient_diagnostics_marks_disabled_clipping",
+    ) and ok
+    ok = _run_subprocess_case(
+        "model_train_uses_fixed_evaluation_batches_for_best_snapshot",
+        "test_model_train_uses_fixed_evaluation_batches_for_best_snapshot",
+    ) and ok
+    ok = _run_subprocess_case(
+        "model_train_rejects_malformed_fixed_evaluation_batches",
+        "test_model_train_rejects_malformed_fixed_evaluation_batches",
+    ) and ok
+    ok = _run_subprocess_case(
+        "model_train_rejects_wrong_time_horizon_fixed_evaluation_batches",
+        "test_model_train_rejects_wrong_time_horizon_fixed_evaluation_batches",
+    ) and ok
+    ok = _run_subprocess_case(
+        "model_train_rejects_wrong_time_horizon_before_update",
+        "test_model_train_rejects_wrong_time_horizon_before_update",
     ) and ok
     ok = _run_subprocess_case(
         "model_train_rejects_nonfinite_loss",

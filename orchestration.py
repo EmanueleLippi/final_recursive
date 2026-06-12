@@ -100,6 +100,112 @@ def _require_finite_schedule_stats(
         if key in stats and stats[key] is not None:
             _require_finite_schedule_scalar(stats[key], label=label, phase=phase, key=key)
 
+def _callable_accepts_keywords(callable_obj: Any, keyword_names: Tuple[str, ...]) -> bool:
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return False
+    parameters = signature.parameters
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+        return True
+    keyword_kinds = {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
+    return all(name in parameters and parameters[name].kind in keyword_kinds for name in keyword_names)
+
+def _optional_int_attr(obj: Any, name: str) -> Optional[int]:
+    if obj is None or not hasattr(obj, name):
+        return None
+    try:
+        return int(getattr(obj, name))
+    except (TypeError, ValueError):
+        return None
+
+def _validate_fixed_evaluation_batches(
+    eval_batches: Any,
+    model: Optional[Any] = None,
+) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    fixed_batches = list(eval_batches)
+    if not fixed_batches:
+        raise ValueError("fixed evaluation batches must contain at least one (t, W, Xi) batch")
+    expected_M = _optional_int_attr(model, "M")
+    expected_N = _optional_int_attr(model, "N")
+    expected_D = _optional_int_attr(model, "D")
+    validated = []
+    for idx, batch in enumerate(fixed_batches):
+        if not isinstance(batch, (tuple, list)) or len(batch) != 3:
+            raise ValueError(f"fixed evaluation batches[{idx}] must be a (t, W, Xi) triple")
+        t_batch, W_batch, Xi_batch = batch
+        t_arr = np.asarray(t_batch, dtype=np.float32)
+        W_arr = np.asarray(W_batch, dtype=np.float32)
+        Xi_arr = np.asarray(Xi_batch, dtype=np.float32)
+        if t_arr.ndim != 3 or t_arr.shape[2] != 1:
+            raise ValueError(f"fixed evaluation batches[{idx}][0] must have shape (M, N+1, 1)")
+        if W_arr.ndim != 3:
+            raise ValueError(f"fixed evaluation batches[{idx}][1] must have shape (M, N+1, D)")
+        if Xi_arr.ndim != 2:
+            raise ValueError(f"fixed evaluation batches[{idx}][2] must have shape (M, D)")
+        if t_arr.shape[0] == 0:
+            raise ValueError(f"fixed evaluation batches[{idx}] must contain at least one path")
+        if t_arr.shape[1] <= 1:
+            raise ValueError(f"fixed evaluation batches[{idx}] must contain at least one time step")
+        if expected_M is not None and t_arr.shape[0] != expected_M:
+            raise ValueError(
+                f"fixed evaluation batches[{idx}] batch size must match model M={expected_M}, got {t_arr.shape[0]}"
+            )
+        if expected_N is not None and t_arr.shape[1] != expected_N + 1:
+            raise ValueError(
+                f"fixed evaluation batches[{idx}] time dimension must match model N+1={expected_N + 1}, "
+                f"got {t_arr.shape[1]}"
+            )
+        if t_arr.shape[0] != W_arr.shape[0] or t_arr.shape[0] != Xi_arr.shape[0]:
+            raise ValueError(f"fixed evaluation batches[{idx}] batch dimension mismatch")
+        if t_arr.shape[1] != W_arr.shape[1]:
+            raise ValueError(f"fixed evaluation batches[{idx}] time dimension mismatch")
+        if W_arr.shape[2] != Xi_arr.shape[1]:
+            raise ValueError(f"fixed evaluation batches[{idx}] state dimension mismatch")
+        if expected_D is not None and (W_arr.shape[2] != expected_D or Xi_arr.shape[1] != expected_D):
+            raise ValueError(
+                f"fixed evaluation batches[{idx}] state dimension must match model D={expected_D}, "
+                f"got W D={W_arr.shape[2]} and Xi D={Xi_arr.shape[1]}"
+            )
+        if not np.isfinite(t_arr).all() or not np.isfinite(W_arr).all() or not np.isfinite(Xi_arr).all():
+            raise ValueError(f"fixed evaluation batches[{idx}] contains non-finite values")
+        validated.append((t_arr, W_arr, Xi_arr))
+    return validated
+
+def _evaluate_with_schedule_batches(model: FBSNN, *, const_value: float, eval_batches: Any) -> Dict[str, Any]:
+    eval_batches = _normalize_schedule_eval_batches(eval_batches, model=model)
+    if isinstance(eval_batches, (int, np.integer)):
+        return model.evaluate(const_value=const_value, n_batches=int(eval_batches))
+    fixed_batches = eval_batches
+    required_kwargs = ("const_value", "n_batches", "evaluation_batches", "moment_policy")
+    if not _callable_accepts_keywords(model.evaluate, required_kwargs):
+        raise TypeError(
+            "fixed evaluation batches require model.evaluate to accept "
+            "const_value, n_batches, evaluation_batches, and moment_policy"
+        )
+    return model.evaluate(
+        const_value=const_value,
+        n_batches=len(fixed_batches),
+        evaluation_batches=fixed_batches,
+        moment_policy="fixed_evaluation_bundle",
+    )
+
+def _normalize_schedule_eval_batches(eval_batches: Any, model: Optional[Any] = None) -> Any:
+    if isinstance(eval_batches, (int, np.integer)):
+        return int(eval_batches)
+    return _validate_fixed_evaluation_batches(eval_batches, model=model)
+
+def _train_evaluation_kwargs(eval_batches: Any) -> Dict[str, Any]:
+    if isinstance(eval_batches, (int, np.integer)):
+        return {}
+    return {
+        "evaluation_batches": eval_batches,
+        "moment_policy": "fixed_evaluation_bundle",
+    }
+
 def _nonfinite_stitched_reason(stitched: Dict[str, np.ndarray], *, pass_label: str) -> Optional[str]:
     required = ("t", "X", "Y", "Z")
     for key in required:
@@ -1079,6 +1185,8 @@ def train_with_standard_schedule(
     coupling_const: float = 1.0,
 ):
     stage_logs = []
+    schedule_eval_batches = _normalize_schedule_eval_batches(eval_batches, model=model)
+    train_eval_kwargs = _train_evaluation_kwargs(schedule_eval_batches)
 
     coupling_levels = np.asarray([np.float32(coupling_const)], dtype=np.float32)
 
@@ -1087,8 +1195,17 @@ def train_with_standard_schedule(
         print(f"=== [{label}] Coupling stage: const={float(level):.1f} ===")
         for n_iter, lr in stage_plan:
             t0 = time.time()
-            train_stats = model.train(N_Iter=n_iter, learning_rate=lr, const_value=level)
-            eval_stats = model.evaluate(const_value=level, n_batches=eval_batches)
+            train_stats = model.train(
+                N_Iter=n_iter,
+                learning_rate=lr,
+                const_value=level,
+                **train_eval_kwargs,
+            )
+            eval_stats = _evaluate_with_schedule_batches(
+                model,
+                const_value=float(level),
+                eval_batches=schedule_eval_batches,
+            )
             _require_finite_schedule_stats(
                 train_stats,
                 label=label,
@@ -1146,8 +1263,13 @@ def train_with_standard_schedule(
             patience=150,
             min_delta=1e-3,
             restore_best=True,
+            **train_eval_kwargs,
         )
-        eval_stats = model.evaluate(const_value=float(coupling_const), n_batches=eval_batches)
+        eval_stats = _evaluate_with_schedule_batches(
+            model,
+            const_value=float(coupling_const),
+            eval_batches=schedule_eval_batches,
+        )
         _require_finite_schedule_stats(
             train_stats,
             label=label,
@@ -1195,7 +1317,11 @@ def train_with_standard_schedule(
             f"eval_Y0={eval_stats['mean_y0']:.3f}+/-{eval_stats['std_y0']:.3f}, time={elapsed:.1f}s"
         )
 
-    eval_stats = model.evaluate(const_value=float(coupling_const), n_batches=eval_batches)
+    eval_stats = _evaluate_with_schedule_batches(
+        model,
+        const_value=float(coupling_const),
+        eval_batches=schedule_eval_batches,
+    )
     refine_rounds = 0
     local_refine_plan = refine_plan if refine_plan is not None else [(50, 1e-5), (50, 5e-6)]
 
@@ -1220,6 +1346,7 @@ def train_with_standard_schedule(
                 patience=100,
                 min_delta=1e-3,
                 restore_best=True,
+                **train_eval_kwargs,
             )
             _require_finite_schedule_stats(
                 train_stats,
@@ -1227,7 +1354,11 @@ def train_with_standard_schedule(
                 phase=f"refine train lr={lr:.1e}",
                 keys=("last_loss", "best_score"),
             )
-        eval_stats = model.evaluate(const_value=float(coupling_const), n_batches=eval_batches)
+        eval_stats = _evaluate_with_schedule_batches(
+            model,
+            const_value=float(coupling_const),
+            eval_batches=schedule_eval_batches,
+        )
         _require_finite_schedule_stats(
             eval_stats,
             label=label,
@@ -1284,6 +1415,51 @@ def run_standard_reference(
     )
     return model, logs
 
+def _validate_fixed_rollout_initial(Xi_initial: np.ndarray, M_rollout: int, D: int) -> np.ndarray:
+    Xi = np.asarray(Xi_initial, dtype=np.float32)
+    expected = (int(M_rollout), int(D))
+    if Xi.shape != expected:
+        raise ValueError(f"Xi_initial shape must be {expected}, got {Xi.shape}")
+    if not np.isfinite(Xi).all():
+        raise ValueError("Xi_initial contains non-finite values")
+    return Xi
+
+def _validate_fixed_rollout_inputs(
+    rollout_inputs: List[Tuple[np.ndarray, np.ndarray]],
+    *,
+    blocks: List[Dict[str, float]],
+    M_rollout: int,
+    N_per_block: int,
+    D: int,
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    pairs = list(rollout_inputs)
+    if len(pairs) != len(blocks):
+        raise ValueError(
+            f"rollout_inputs must contain one (t, W) pair per block, got {len(pairs)} for {len(blocks)} blocks"
+        )
+    validated = []
+    t_shape = (int(M_rollout), int(N_per_block) + 1, 1)
+    w_shape = (int(M_rollout), int(N_per_block) + 1, int(D))
+    for idx, ((t_b, W_b), block) in enumerate(zip(pairs, blocks)):
+        t_arr = np.asarray(t_b, dtype=np.float32)
+        W_arr = np.asarray(W_b, dtype=np.float32)
+        if t_arr.shape != t_shape:
+            raise ValueError(f"rollout_inputs[{idx}][0] shape must be {t_shape}, got {t_arr.shape}")
+        if W_arr.shape != w_shape:
+            raise ValueError(f"rollout_inputs[{idx}][1] shape must be {w_shape}, got {W_arr.shape}")
+        if not np.isfinite(t_arr).all() or not np.isfinite(W_arr).all():
+            raise ValueError(f"rollout_inputs[{idx}] contains non-finite values")
+        if not np.allclose(t_arr[:, 0, 0], float(block["t_start"]), rtol=1.0e-6, atol=1.0e-6):
+            raise ValueError(f"rollout_inputs[{idx}] t_start does not match block metadata")
+        if not np.allclose(t_arr[:, -1, 0], float(block["t_end"]), rtol=1.0e-6, atol=1.0e-6):
+            raise ValueError(f"rollout_inputs[{idx}] t_end does not match block metadata")
+        if not np.all(np.diff(t_arr[:, :, 0], axis=1) > 0.0):
+            raise ValueError(f"rollout_inputs[{idx}] time grid must be strictly increasing")
+        if not np.allclose(W_arr[:, 0, :], 0.0, rtol=1.0e-6, atol=1.0e-6):
+            raise ValueError(f"rollout_inputs[{idx}] W_start must be zero for a block-local Brownian path")
+        validated.append((t_arr, W_arr))
+    return validated
+
 def rollout_boundaries(
     block_blobs: List[Dict[str, np.ndarray]],
     blocks: List[Dict[str, float]],
@@ -1296,11 +1472,28 @@ def rollout_boundaries(
     T_total,
     coupling_const: float = 1.0,
     model_spec: Optional[ModelSpec] = None,
+    Xi_initial: Optional[np.ndarray] = None,
+    rollout_inputs: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
 ):
     spec = _resolve_model_spec(model_spec)
     spec.validate_state_dim(D)
     boundary_samples = []
-    Xi_curr = Xi_generator(M_rollout, D).astype(np.float32)
+    Xi_curr = (
+        _validate_fixed_rollout_initial(Xi_initial, M_rollout, D)
+        if Xi_initial is not None
+        else Xi_generator(M_rollout, D).astype(np.float32)
+    )
+    fixed_rollout_inputs = (
+        _validate_fixed_rollout_inputs(
+            rollout_inputs,
+            blocks=blocks,
+            M_rollout=M_rollout,
+            N_per_block=N_per_block,
+            D=D,
+        )
+        if rollout_inputs is not None
+        else None
+    )
     boundary_samples.append(Xi_curr.copy())
 
     for b, block in enumerate(blocks):
@@ -1322,7 +1515,10 @@ def rollout_boundaries(
             x_norm_std=block_blobs[b].get("x_norm_std", np.ones((1, D), dtype=np.float32)),
         )
         model.import_parameter_blob(block_blobs[b], strict=True)
-        t_b, W_b, _ = model.fetch_minibatch()
+        if fixed_rollout_inputs is None:
+            t_b, W_b, _ = model.fetch_minibatch()
+        else:
+            t_b, W_b = fixed_rollout_inputs[b]
         X_pred, _, _ = model.predict(
             Xi_curr, t_b, W_b, const_value=float(coupling_const)
         )
