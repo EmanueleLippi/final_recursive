@@ -18,7 +18,14 @@ from .io_utils import export_standard_parameter_blob, save_blob_npz, save_json, 
 from .naming import _pass_index, _pass_label
 from .pascucci_plotting import plot_pascucci_paper_bundle_from_artifacts
 from .plotting import plot_recursive_exact_comparison, plot_stage_logs, _PLOTTING_AVAILABLE
-from .sampling import build_blocks, build_stitched_rollout_inputs, summarize_boundary_samples
+from .sampling import (
+    build_blocks,
+    build_stitched_rollout_inputs,
+    file_sha256,
+    load_evaluation_bundle,
+    save_evaluation_bundle,
+    summarize_boundary_samples,
+)
 from .schedules import load_training_plan_csv, parse_float_sequence_arg, resolve_coarse_curriculum_schedule
 from .tf_backend import set_tf_seed
 from .tests import run_tests
@@ -37,7 +44,17 @@ def _parse_optional_component_weights(value: str, arg_name: str, D: int):
     return [float(weight) for weight in weights]
 
 def _run_config_sha256(config: dict) -> str:
-    payload = {k: v for k, v in config.items() if k not in {"run_config_sha256", "timestamp"}}
+    runtime_keys = {
+        "run_config_sha256",
+        "timestamp",
+        "eval_bundle_path_effective",
+        "eval_bundle_sha256",
+        "eval_bundle_status",
+        "recursive_rollout_bundle_path_effective",
+        "recursive_rollout_bundle_sha256",
+        "recursive_rollout_bundle_status",
+    }
+    payload = {k: v for k, v in config.items() if k not in runtime_keys}
     encoded = json.dumps(_to_serializable(payload), sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -267,6 +284,44 @@ def run_program(argv: Optional[List[str]] = None):
         type=int,
         default=1234,
         help="Seed usato per costruire un evaluation bundle nuovo quando non viene caricato.",
+    )
+    parser.add_argument(
+        "--recursive_fixed_eval_seed",
+        type=int,
+        default=-1,
+        help=(
+            "Seed opzionale per batch di valutazione fissi per blocco/pass durante il training "
+            "ricorsivo. -1 mantiene la valutazione stocastica legacy."
+        ),
+    )
+    parser.add_argument(
+        "--recursive_gradient_diagnostics",
+        action="store_true",
+        help="Se attivo, salva diagnostiche gradient/clip nei log dei blocchi ricorsivi.",
+    )
+    parser.add_argument(
+        "--use_recursive_rollout_bundle",
+        action="store_true",
+        dest="use_recursive_rollout_bundle",
+        help=(
+            "Se attivo, carica o crea un boundary_rollout_bundle.npz separato prima del training "
+            "e lo usa per i rollout di frontiera pass-to-pass."
+        ),
+    )
+    parser.add_argument(
+        "--use_eval_bundle_for_recursive_rollout",
+        action="store_true",
+        dest="use_recursive_rollout_bundle",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--recursive_rollout_bundle_path",
+        type=str,
+        default="",
+        help=(
+            "Percorso opzionale per il boundary_rollout_bundle.npz usato da "
+            "--use_recursive_rollout_bundle. Default: recursive/boundary_rollout_bundle.npz."
+        ),
     )
     parser.add_argument(
         "--visual_sample_paths",
@@ -564,7 +619,19 @@ def run_program(argv: Optional[List[str]] = None):
         "exact_regression_action_requested": requested_exact_regression_action,
         "exact_regression_action": effective_exact_regression_action,
         "eval_bundle_path": str(args.eval_bundle_path),
+        "eval_bundle_path_effective": None,
+        "eval_bundle_sha256": None,
+        "eval_bundle_status": None,
+        "recursive_rollout_bundle_path": str(args.recursive_rollout_bundle_path),
+        "recursive_rollout_bundle_path_effective": None,
+        "recursive_rollout_bundle_sha256": None,
+        "recursive_rollout_bundle_status": None,
         "eval_seed": int(args.eval_seed),
+        "recursive_fixed_eval_seed": None
+        if int(args.recursive_fixed_eval_seed) < 0
+        else int(args.recursive_fixed_eval_seed),
+        "recursive_gradient_diagnostics": bool(args.recursive_gradient_diagnostics),
+        "use_recursive_rollout_bundle": bool(args.use_recursive_rollout_bundle),
         "visual_sample_paths": int(args.visual_sample_paths),
         "visual_seed": visual_seed_requested,
         "visual_seed_effective": int(visual_seed_effective),
@@ -603,6 +670,9 @@ def run_program(argv: Optional[List[str]] = None):
         "seed_manifest": {
             "global_seed": 1234,
             "eval_seed": int(args.eval_seed),
+            "recursive_fixed_eval_seed": None
+            if int(args.recursive_fixed_eval_seed) < 0
+            else int(args.recursive_fixed_eval_seed),
             "visual_seed": visual_seed_requested,
             "visual_seed_effective": int(visual_seed_effective),
             "coarse_prepass_seed": int(args.coarse_prepass_seed),
@@ -774,8 +844,65 @@ def run_program(argv: Optional[List[str]] = None):
             eval_bundle_path = os.path.abspath(os.path.expanduser(explicit_eval_bundle))
         else:
             eval_bundle_path = os.path.abspath(os.path.join(rec_dir, "evaluation_bundle.npz"))
+        explicit_rollout_bundle = str(args.recursive_rollout_bundle_path or "").strip()
+        if explicit_rollout_bundle != "":
+            recursive_rollout_bundle_path = os.path.abspath(os.path.expanduser(explicit_rollout_bundle))
+        else:
+            recursive_rollout_bundle_path = os.path.abspath(os.path.join(rec_dir, "boundary_rollout_bundle.npz"))
+        run_config["eval_bundle_path_effective"] = eval_bundle_path
+        run_config["recursive_rollout_bundle_path_effective"] = recursive_rollout_bundle_path
+        run_config["run_config_sha256"] = _run_config_sha256(run_config)
+        save_json(run_config, os.path.join(run_root, "run_config.json"))
 
         rollout_M_recursive = max(2000, M)
+        recursive_blocks = build_blocks(T_total=args.T_total, block_size=args.block_size)
+        fixed_boundary_Xi_initial = None
+        fixed_boundary_rollout_inputs = None
+        if bool(args.use_recursive_rollout_bundle):
+            if os.path.isfile(recursive_rollout_bundle_path):
+                fixed_boundary_Xi_initial, fixed_boundary_rollout_inputs = load_evaluation_bundle(
+                    path=recursive_rollout_bundle_path,
+                    n_blocks_expected=len(recursive_blocks),
+                    N_per_block_expected=N,
+                    D_expected=D,
+                    blocks_expected=recursive_blocks,
+                    T_total_expected=args.T_total,
+                    bundle_kind_expected="boundary_rollout",
+                )
+                run_config["recursive_rollout_bundle_status"] = "loaded"
+                print(
+                    f"[RecursiveDiagnostics] loaded boundary bundle path={recursive_rollout_bundle_path}, "
+                    f"M={fixed_boundary_Xi_initial.shape[0]}"
+                )
+            else:
+                fixed_boundary_Xi_initial = model_spec.deterministic_xi(
+                    rollout_M_recursive,
+                    D,
+                    seed=int(args.eval_seed),
+                )
+                fixed_boundary_rollout_inputs = build_stitched_rollout_inputs(
+                    blocks=recursive_blocks,
+                    M=fixed_boundary_Xi_initial.shape[0],
+                    N_per_block=N,
+                    D=D,
+                    seed=int(args.eval_seed),
+                )
+                save_evaluation_bundle(
+                    path=recursive_rollout_bundle_path,
+                    Xi_initial=fixed_boundary_Xi_initial,
+                    rollout_inputs=fixed_boundary_rollout_inputs,
+                    blocks=recursive_blocks,
+                    bundle_kind="boundary_rollout",
+                )
+                run_config["recursive_rollout_bundle_status"] = "created"
+                print(
+                    f"[RecursiveDiagnostics] created boundary bundle path={recursive_rollout_bundle_path}, "
+                    f"M={fixed_boundary_Xi_initial.shape[0]}, seed={int(args.eval_seed)}"
+                )
+            run_config["recursive_rollout_bundle_sha256"] = file_sha256(recursive_rollout_bundle_path)
+        run_config["run_config_sha256"] = _run_config_sha256(run_config)
+        save_json(run_config, os.path.join(run_root, "run_config.json"))
+
         if pass1_init_mode == "coarse":
             np_state_before_prepass = np.random.get_state()
             np.random.seed(int(args.coarse_prepass_seed))
@@ -944,6 +1071,14 @@ def run_program(argv: Optional[List[str]] = None):
             coupling_const=float(recursive_const),
             on_pass_end=_on_recursive_pass_end,
             model_spec=model_spec,
+            fixed_eval_seed=(
+                None
+                if int(args.recursive_fixed_eval_seed) < 0
+                else int(args.recursive_fixed_eval_seed)
+            ),
+            fixed_boundary_Xi_initial=fixed_boundary_Xi_initial,
+            fixed_boundary_rollout_inputs=fixed_boundary_rollout_inputs,
+            return_gradient_diagnostics=bool(args.recursive_gradient_diagnostics),
         )
 
         pass_entries = sorted(rec.get("passes", []), key=lambda x: int(x["pass_id"]))
@@ -981,6 +1116,11 @@ def run_program(argv: Optional[List[str]] = None):
 
         exact_summary_by_pass = plot_summary["exact_summary_by_pass"]
         exact_summary_by_pass_index = plot_summary.get("exact_summary_by_pass_index", {})
+        run_config["eval_bundle_path_effective"] = str(plot_summary["eval_bundle_path"])
+        run_config["eval_bundle_sha256"] = str(plot_summary.get("eval_bundle_sha256", ""))
+        run_config["eval_bundle_status"] = plot_summary.get("eval_bundle_status", None)
+        run_config["run_config_sha256"] = _run_config_sha256(run_config)
+        save_json(run_config, os.path.join(run_root, "run_config.json"))
 
         boundary_stats = summarize_boundary_samples(rec.get("boundary_samples", []))
 
@@ -1010,7 +1150,12 @@ def run_program(argv: Optional[List[str]] = None):
             "boundary_stats": boundary_stats,
             "models_dir": os.path.join(rec_dir, "models"),
             "evaluation_bundle_path": plot_summary["eval_bundle_path"],
+            "evaluation_bundle_status": plot_summary.get("eval_bundle_status", None),
+            "evaluation_bundle_sha256": plot_summary.get("eval_bundle_sha256", None),
             "evaluation_bundle_M": int(plot_summary["evaluation_bundle_M"]),
+            "recursive_rollout_bundle_path": run_config.get("recursive_rollout_bundle_path_effective"),
+            "recursive_rollout_bundle_sha256": run_config.get("recursive_rollout_bundle_sha256"),
+            "recursive_rollout_bundle_status": run_config.get("recursive_rollout_bundle_status"),
             "visual_seed_effective": int(plot_summary.get("visual_seed", visual_seed_effective)),
             "initialization_summary": initialization_summary,
             "active_set_freezing": {

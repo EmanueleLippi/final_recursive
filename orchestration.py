@@ -30,6 +30,7 @@ from .sampling import (
     build_blocks,
     build_stitched_rollout_inputs,
     estimate_generator_stats,
+    file_sha256,
     load_evaluation_bundle,
     make_empirical_generator,
     save_evaluation_bundle,
@@ -125,6 +126,7 @@ def _optional_int_attr(obj: Any, name: str) -> Optional[int]:
 def _validate_fixed_evaluation_batches(
     eval_batches: Any,
     model: Optional[Any] = None,
+    block_metadata: Optional[Dict[str, float]] = None,
 ) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     fixed_batches = list(eval_batches)
     if not fixed_batches:
@@ -172,8 +174,27 @@ def _validate_fixed_evaluation_batches(
             )
         if not np.isfinite(t_arr).all() or not np.isfinite(W_arr).all() or not np.isfinite(Xi_arr).all():
             raise ValueError(f"fixed evaluation batches[{idx}] contains non-finite values")
+        if not np.all(np.diff(t_arr[:, :, 0], axis=1) > 0.0):
+            raise ValueError(f"fixed evaluation batches[{idx}] time grid must be strictly increasing")
+        if block_metadata is not None:
+            if not np.allclose(t_arr[:, 0, 0], float(block_metadata["t_start"]), rtol=1.0e-6, atol=1.0e-6):
+                raise ValueError(f"fixed evaluation batches[{idx}] t_start does not match block metadata")
+            if not np.allclose(t_arr[:, -1, 0], float(block_metadata["t_end"]), rtol=1.0e-6, atol=1.0e-6):
+                raise ValueError(f"fixed evaluation batches[{idx}] t_end does not match block metadata")
         validated.append((t_arr, W_arr, Xi_arr))
     return validated
+
+def _copy_fixed_evaluation_batches(
+    eval_batches: List[Tuple[np.ndarray, np.ndarray, np.ndarray]],
+) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    return [
+        (
+            np.asarray(t_batch, dtype=np.float32).copy(),
+            np.asarray(W_batch, dtype=np.float32).copy(),
+            np.asarray(Xi_batch, dtype=np.float32).copy(),
+        )
+        for t_batch, W_batch, Xi_batch in eval_batches
+    ]
 
 def _evaluate_with_schedule_batches(model: FBSNN, *, const_value: float, eval_batches: Any) -> Dict[str, Any]:
     eval_batches = _normalize_schedule_eval_batches(eval_batches, model=model)
@@ -193,10 +214,18 @@ def _evaluate_with_schedule_batches(model: FBSNN, *, const_value: float, eval_ba
         moment_policy="fixed_evaluation_bundle",
     )
 
-def _normalize_schedule_eval_batches(eval_batches: Any, model: Optional[Any] = None) -> Any:
+def _normalize_schedule_eval_batches(
+    eval_batches: Any,
+    model: Optional[Any] = None,
+    block_metadata: Optional[Dict[str, float]] = None,
+) -> Any:
     if isinstance(eval_batches, (int, np.integer)):
         return int(eval_batches)
-    return _validate_fixed_evaluation_batches(eval_batches, model=model)
+    return _validate_fixed_evaluation_batches(
+        eval_batches,
+        model=model,
+        block_metadata=block_metadata,
+    )
 
 def _train_evaluation_kwargs(eval_batches: Any) -> Dict[str, Any]:
     if isinstance(eval_batches, (int, np.integer)):
@@ -205,6 +234,66 @@ def _train_evaluation_kwargs(eval_batches: Any) -> Dict[str, Any]:
         "evaluation_batches": eval_batches,
         "moment_policy": "fixed_evaluation_bundle",
     }
+
+def _train_gradient_diagnostic_kwargs(model: Any, enabled: bool) -> Dict[str, Any]:
+    if not bool(enabled):
+        return {}
+    if not _callable_accepts_keywords(model.train, ("return_gradient_diagnostics",)):
+        raise TypeError(
+            "gradient diagnostics require model.train to accept "
+            "return_gradient_diagnostics"
+        )
+    return {"return_gradient_diagnostics": True}
+
+_GRADIENT_DIAGNOSTIC_KEYS = {
+    "train_grad_global_norm",
+    "train_grad_global_norm_clipped",
+    "train_grad_clip_ratio",
+    "train_grad_clip_norm",
+    "train_grad_clip_enabled",
+    "train_gradient_variable_count",
+    "train_grad_global_norm_max",
+    "train_grad_global_norm_clipped_max",
+    "train_grad_clip_ratio_max",
+}
+
+def _gradient_diagnostics_from_train_stats(
+    train_stats: Dict[str, Any],
+    *,
+    label: str,
+    phase: str,
+) -> Dict[str, float]:
+    diagnostics: Dict[str, float] = {}
+    nested = train_stats.get("gradient_diagnostics", {})
+    if isinstance(nested, dict):
+        sources = [nested, train_stats]
+    else:
+        sources = [train_stats]
+    for source in sources:
+        for key, value in source.items():
+            key_str = str(key)
+            if key_str not in _GRADIENT_DIAGNOSTIC_KEYS:
+                continue
+            diagnostics[key_str] = _require_finite_schedule_scalar(
+                value,
+                label=label,
+                phase=phase,
+                key=key_str,
+            )
+    return diagnostics
+
+def _merge_gradient_diagnostics(
+    aggregate: Dict[str, float],
+    current: Dict[str, float],
+) -> Dict[str, float]:
+    merged = dict(aggregate)
+    for key, value in current.items():
+        value_float = float(value)
+        if key.endswith("_max"):
+            merged[key] = max(float(merged.get(key, 0.0)), value_float)
+        else:
+            merged[key] = value_float
+    return merged
 
 def _nonfinite_stitched_reason(stitched: Dict[str, np.ndarray], *, pass_label: str) -> Optional[str]:
     required = ("t", "X", "Y", "Z")
@@ -460,6 +549,7 @@ def print_recursive_pass(
     eval_bundle_path = os.path.abspath(os.path.expanduser(eval_bundle_path))
 
     if os.path.isfile(eval_bundle_path):
+        eval_bundle_status = "loaded"
         Xi_stitched, rollout_inputs = load_evaluation_bundle(
             path=eval_bundle_path,
             n_blocks_expected=len(blocks),
@@ -467,12 +557,14 @@ def print_recursive_pass(
             D_expected=D,
             blocks_expected=blocks,
             T_total_expected=T_total,
+            bundle_kind_expected="evaluation",
         )
         print(
             f"[EvalBundle] loaded path={eval_bundle_path}, M={Xi_stitched.shape[0]}, "
             f"blocks={len(rollout_inputs)}"
         )
     else:
+        eval_bundle_status = "created"
         Xi_stitched = spec.deterministic_xi(
             max(1, int(eval_min_paths)),
             D,
@@ -490,6 +582,7 @@ def print_recursive_pass(
             Xi_initial=Xi_stitched,
             rollout_inputs=rollout_inputs,
             blocks=blocks,
+            bundle_kind="evaluation",
         )
         print(
             f"[EvalBundle] created path={eval_bundle_path}, M={Xi_stitched.shape[0]}, "
@@ -745,6 +838,8 @@ def print_recursive_pass(
             },
             "selected_application_summary": None,
             "eval_bundle_path": eval_bundle_path,
+            "eval_bundle_status": eval_bundle_status,
+            "eval_bundle_sha256": file_sha256(eval_bundle_path),
             "evaluation_bundle_M": int(Xi_stitched.shape[0]),
             "visual_sample_paths": int(max(0, visual_path_count)),
             "visual_seed": int(visual_seed_effective),
@@ -914,6 +1009,8 @@ def print_recursive_pass(
         },
         "selected_application_summary": selected_application_summary,
         "eval_bundle_path": eval_bundle_path,
+        "eval_bundle_status": eval_bundle_status,
+        "eval_bundle_sha256": file_sha256(eval_bundle_path),
         "evaluation_bundle_M": int(Xi_stitched.shape[0]),
         "visual_sample_paths": int(max(0, visual_path_count)),
         "visual_seed": int(visual_seed_effective),
@@ -1183,10 +1280,21 @@ def train_with_standard_schedule(
     refine_plan: Optional[List[Tuple[int, float]]] = None,
     label: str = "",
     coupling_const: float = 1.0,
+    return_gradient_diagnostics: bool = False,
+    block_metadata: Optional[Dict[str, float]] = None,
 ):
     stage_logs = []
-    schedule_eval_batches = _normalize_schedule_eval_batches(eval_batches, model=model)
+    schedule_eval_batches = _normalize_schedule_eval_batches(
+        eval_batches,
+        model=model,
+        block_metadata=block_metadata,
+    )
     train_eval_kwargs = _train_evaluation_kwargs(schedule_eval_batches)
+    train_diagnostic_kwargs = _train_gradient_diagnostic_kwargs(
+        model,
+        bool(return_gradient_diagnostics),
+    )
+    last_gradient_diagnostics: Dict[str, float] = {}
 
     coupling_levels = np.asarray([np.float32(coupling_const)], dtype=np.float32)
 
@@ -1200,6 +1308,7 @@ def train_with_standard_schedule(
                 learning_rate=lr,
                 const_value=level,
                 **train_eval_kwargs,
+                **train_diagnostic_kwargs,
             )
             eval_stats = _evaluate_with_schedule_batches(
                 model,
@@ -1225,6 +1334,15 @@ def train_with_standard_schedule(
                     "std_y0",
                 ),
             )
+            gradient_diagnostics = _gradient_diagnostics_from_train_stats(
+                train_stats,
+                label=label,
+                phase=f"train lr={lr:.1e}",
+            )
+            last_gradient_diagnostics = _merge_gradient_diagnostics(
+                last_gradient_diagnostics,
+                gradient_diagnostics,
+            )
             elapsed = time.time() - t0
             stage_logs.append(
                 {
@@ -1242,6 +1360,7 @@ def train_with_standard_schedule(
                     "elapsed_sec": float(elapsed),
                 }
                 | _prefixed_eval_diagnostics(eval_stats)
+                | gradient_diagnostics
             )
             print(
                 f"[StageSummary] {label} const={level:.1f}, lr={lr:.1e}, iters={n_iter}, "
@@ -1264,6 +1383,7 @@ def train_with_standard_schedule(
             min_delta=1e-3,
             restore_best=True,
             **train_eval_kwargs,
+            **train_diagnostic_kwargs,
         )
         eval_stats = _evaluate_with_schedule_batches(
             model,
@@ -1289,6 +1409,15 @@ def train_with_standard_schedule(
                 "std_y0",
             ),
         )
+        gradient_diagnostics = _gradient_diagnostics_from_train_stats(
+            train_stats,
+            label=label,
+            phase=f"train lr={lr:.1e}",
+        )
+        last_gradient_diagnostics = _merge_gradient_diagnostics(
+            last_gradient_diagnostics,
+            gradient_diagnostics,
+        )
         elapsed = time.time() - t0
         stage_logs.append(
             {
@@ -1309,6 +1438,7 @@ def train_with_standard_schedule(
                 "elapsed_sec": float(elapsed),
             }
             | _prefixed_eval_diagnostics(eval_stats)
+            | gradient_diagnostics
         )
         print(
             f"[FinalSummary] {label} const={float(coupling_const):.1f}, lr={lr:.1e}, iters={n_iter}, "
@@ -1347,12 +1477,22 @@ def train_with_standard_schedule(
                 min_delta=1e-3,
                 restore_best=True,
                 **train_eval_kwargs,
+                **train_diagnostic_kwargs,
             )
             _require_finite_schedule_stats(
                 train_stats,
                 label=label,
                 phase=f"refine train lr={lr:.1e}",
                 keys=("last_loss", "best_score"),
+            )
+            gradient_diagnostics = _gradient_diagnostics_from_train_stats(
+                train_stats,
+                label=label,
+                phase=f"refine train lr={lr:.1e}",
+            )
+            last_gradient_diagnostics = _merge_gradient_diagnostics(
+                last_gradient_diagnostics,
+                gradient_diagnostics,
             )
         eval_stats = _evaluate_with_schedule_batches(
             model,
@@ -1378,6 +1518,7 @@ def train_with_standard_schedule(
         "eval_stats": eval_stats,
         "refine_rounds": int(refine_rounds),
         "precision_target": None if precision_target is None else float(precision_target),
+        "gradient_diagnostics": last_gradient_diagnostics,
     }
 
 def run_standard_reference(
@@ -1637,6 +1778,11 @@ def run_recursive_training(
     coupling_const: float = 1.0,
     on_pass_end: Optional[Callable[[Dict[str, Any]], None]] = None,
     model_spec: Optional[ModelSpec] = None,
+    fixed_eval_seed: Optional[int] = None,
+    fixed_eval_batches_by_block: Optional[List[Any]] = None,
+    fixed_boundary_Xi_initial: Optional[np.ndarray] = None,
+    fixed_boundary_rollout_inputs: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
+    return_gradient_diagnostics: bool = False,
 ):
     if int(n_passes) < 1:
         raise ValueError("n_passes must be >= 1")
@@ -1654,10 +1800,66 @@ def run_recursive_training(
         raise ValueError(
             "initial_warm_start_blobs must contain one blob per block when provided"
         )
+    if fixed_eval_batches_by_block is not None and len(fixed_eval_batches_by_block) != len(blocks):
+        raise ValueError(
+            "fixed_eval_batches_by_block must contain one entry per recursive block"
+        )
+    fixed_boundary_Xi = (
+        _validate_fixed_rollout_initial(fixed_boundary_Xi_initial, rollout_M, D)
+        if fixed_boundary_Xi_initial is not None
+        else None
+    )
+    fixed_boundary_rollout = (
+        _validate_fixed_rollout_inputs(
+            fixed_boundary_rollout_inputs,
+            blocks=blocks,
+            M_rollout=rollout_M,
+            N_per_block=N_per_block,
+            D=D,
+        )
+        if fixed_boundary_rollout_inputs is not None
+        else None
+    )
+    fixed_eval_seed_effective = (
+        None
+        if fixed_eval_seed is None or int(fixed_eval_seed) < 0
+        else int(fixed_eval_seed)
+    )
+    fixed_eval_batches_cache: Dict[int, List[Tuple[np.ndarray, np.ndarray, np.ndarray]]] = {}
     print(
         f"[Recursive] blocks={len(blocks)} -> {[ (b['t_start'], b['t_end']) for b in blocks ]}, "
         f"n_passes={int(n_passes)}"
     )
+
+    def _materialize_fixed_eval_batches(pass_id: int, block_idx: int, generator_fn) -> Any:
+        if fixed_eval_batches_by_block is not None:
+            entry = fixed_eval_batches_by_block[int(block_idx)]
+            if isinstance(entry, (int, np.integer)):
+                return int(entry)
+            return _copy_fixed_evaluation_batches(_validate_fixed_evaluation_batches(entry))
+        if fixed_eval_seed_effective is None:
+            return 5
+        block_key = int(block_idx)
+        if block_key in fixed_eval_batches_cache:
+            return _copy_fixed_evaluation_batches(fixed_eval_batches_cache[block_key])
+        block = blocks[block_key]
+        seed = int(fixed_eval_seed_effective) + block_key * 9176
+        np_state = np.random.get_state()
+        try:
+            np.random.seed(seed)
+            Xi_eval = generator_fn(int(M), int(D)).astype(np.float32)
+        finally:
+            np.random.set_state(np_state)
+        rollout_inputs = build_stitched_rollout_inputs(
+            blocks=[block],
+            M=int(M),
+            N_per_block=int(N_per_block),
+            D=int(D),
+            seed=seed + 17,
+        )
+        t_eval, W_eval = rollout_inputs[0]
+        fixed_eval_batches_cache[block_key] = [(t_eval, W_eval, Xi_eval)]
+        return _copy_fixed_evaluation_batches(fixed_eval_batches_cache[block_key])
 
     def _run_pass(
         pass_id,
@@ -1720,8 +1922,19 @@ def run_recursive_training(
                     x_norm_std=blob.get("x_norm_std", np.ones((1, D), dtype=np.float32)),
                 )
                 model.import_parameter_blob(blob, strict=True)
-                eval_stats = model.evaluate(
-                    const_value=float(coupling_const), n_batches=5
+                fixed_eval_batches = _materialize_fixed_eval_batches(
+                    pass_id=pass_id,
+                    block_idx=b,
+                    generator_fn=generators_per_block[b],
+                )
+                eval_stats = _evaluate_with_schedule_batches(
+                    model,
+                    const_value=float(coupling_const),
+                    eval_batches=_normalize_schedule_eval_batches(
+                        fixed_eval_batches,
+                        model=model,
+                        block_metadata=block,
+                    ),
                 )
                 blob_path = os.path.join(pass_dir, f"block_{b:02d}.npz")
                 save_blob_npz(blob, blob_path)
@@ -1807,12 +2020,18 @@ def run_recursive_training(
                 model=model,
                 stage_plan=resolved_plan["stage_plan"],
                 final_plan=resolved_plan["final_plan"],
-                eval_batches=5,
+                eval_batches=_materialize_fixed_eval_batches(
+                    pass_id=pass_id,
+                    block_idx=b,
+                    generator_fn=generators_per_block[b],
+                ),
                 precision_target=precision_target,
                 max_refine_rounds=max_refine_rounds,
                 refine_plan=resolved_plan["refine_plan"],
                 label=label,
                 coupling_const=float(coupling_const),
+                return_gradient_diagnostics=bool(return_gradient_diagnostics),
+                block_metadata=block,
             )
 
             eval_loss = block_stats["eval_stats"]["mean_loss"]
@@ -1855,6 +2074,7 @@ def run_recursive_training(
                 "freeze_neighbor_radius": int(freeze_neighbor_radius),
                 "active_set_enabled": bool(active_set_summary.get("enabled", False)),
             } | _prefixed_eval_diagnostics(block_stats["eval_stats"])
+            log_row.update(block_stats.get("gradient_diagnostics", {}) or {})
             logs.append(log_row)
 
             block_blobs[b] = blob
@@ -1915,6 +2135,8 @@ def run_recursive_training(
                     T_total=T_total,
                     coupling_const=float(coupling_const),
                     model_spec=spec,
+                    Xi_initial=fixed_boundary_Xi,
+                    rollout_inputs=fixed_boundary_rollout,
                 )
             generators = [
                 make_empirical_generator(prev_boundary_samples[b], jitter_scale=empirical_jitter_scale)
@@ -1952,6 +2174,8 @@ def run_recursive_training(
             T_total=T_total,
             coupling_const=float(coupling_const),
             model_spec=spec,
+            Xi_initial=fixed_boundary_Xi,
+            rollout_inputs=fixed_boundary_rollout,
         )
 
         pass_results.append(
