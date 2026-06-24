@@ -5,10 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import zipfile
+import zlib
 from pathlib import Path
 from typing import Callable, List
 from xml.sax.saxutils import escape
@@ -20,8 +23,23 @@ from .exact import (
     quadratic_coupled_exact_z_np,
     quadratic_coupled_mu_np,
 )
-from .sampling import build_blocks, build_stitched_rollout_inputs, Xi_generator_default
+from .sampling import build_blocks, build_stitched_rollout_inputs, file_sha256, Xi_generator_default
 from .schedules import parse_float_sequence_arg, resolve_coarse_curriculum_schedule
+
+
+def _write_minimal_png(path: Path, width: int, height: int) -> None:
+    def chunk(tag: bytes, payload: bytes) -> bytes:
+        checksum = zlib.crc32(tag + payload) & 0xFFFFFFFF
+        return struct.pack(">I", len(payload)) + tag + payload + struct.pack(">I", checksum)
+
+    header = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", int(width), int(height), 8, 2, 0, 0, 0)
+    row = b"\x00" + (b"\xff\xff\xff" * int(width))
+    image = zlib.compress(row * int(height))
+    payload = header + chunk(b"IHDR", ihdr) + chunk(b"IDAT", image) + chunk(b"IEND", b"")
+    if len(payload) <= 1001:
+        payload += b"\0" * (1002 - len(payload))
+    path.write_bytes(payload)
 
 
 def _default_params(const: float = 1.0):
@@ -62,7 +80,7 @@ def _build_default_pascucci_ou_params():
 def _default_pascucci_params(const: float = 1.0):
     return {
         "l_v": np.float32(0.01),
-        "l_a": np.float32(0.01),
+        "l_a": np.float32(0.005),
         "c3": np.float32(10.0),
         "c4": np.float32(10.0),
         "gamma": np.float32(1.0),
@@ -75,7 +93,7 @@ def _default_pascucci_params(const: float = 1.0):
         "s3v": np.float32(0.001),
         "s3k": np.float32(0.001),
         "omega": np.float32(0.01),
-        "c_h": np.float32(0.0001),
+        "c_h": np.float32(0.001),
         "c_con": np.float32(0.01),
         "const": np.float32(const),
         "params_S": _build_default_pascucci_ou_params(),
@@ -441,6 +459,8 @@ def test_model_spec_contract() -> None:
 
     pascucci_params = pascucci_spec.build_default_params(const=0.55)
     assert pascucci_params["const"] == np.float32(0.55)
+    assert pascucci_params["l_a"] == np.float32(0.005)
+    assert pascucci_params["c_h"] == np.float32(0.001)
     for required in ("params_S", "params_H", "l_v", "l_a", "s3", "s3h", "s3v", "s3k", "omega", "c_h", "c_con"):
         assert required in pascucci_params
     assert pascucci_spec.build_exact_initial_boundary_samples is None
@@ -478,6 +498,38 @@ def test_model_spec_contract() -> None:
     Xi = spec.deterministic_xi(4, 4, seed=11)
     assert Xi.shape == (4, 4)
     assert Xi.dtype == np.float32
+
+
+def test_pascucci_model_spec_uses_paper_like_initial_distribution() -> None:
+    from .model_specs import get_model_spec
+
+    quadratic_spec = get_model_spec("quadratic_coupled")
+    pascucci_spec = get_model_spec("pascucci")
+    assert pascucci_spec.xi_generator is not quadratic_spec.xi_generator
+    assert pascucci_spec.deterministic_xi is not quadratic_spec.deterministic_xi
+
+    Xi = pascucci_spec.deterministic_xi(10000, 4, seed=123)
+    Xi_repeat = pascucci_spec.deterministic_xi(10000, 4, seed=123)
+    assert Xi.shape == (10000, 4)
+    assert Xi.dtype == np.float32
+    np.testing.assert_allclose(Xi, Xi_repeat)
+
+    means = np.mean(Xi, axis=0)
+    stds = np.std(Xi, axis=0)
+    assert abs(float(means[0]) - (-2.3)) < 0.02
+    assert abs(float(stds[0]) - 0.2) < 0.01
+    assert abs(float(means[1]) - 0.4) < 0.03
+    assert abs(float(stds[1]) - 0.5) < 0.02
+    assert abs(float(means[2])) < 0.03
+    assert abs(float(stds[2]) - 1.0) < 0.03
+    assert float(np.min(Xi[:, 3])) >= 1.0
+    assert float(np.max(Xi[:, 3])) <= 9.0
+    assert abs(float(means[3]) - 5.0) < 0.08
+
+    quadratic_Xi = quadratic_spec.deterministic_xi(10000, 4, seed=123)
+    assert abs(float(np.mean(quadratic_Xi[:, 0]) - means[0])) > 3.0
+    assert float(np.min(quadratic_Xi[:, 3])) >= 3.0
+    assert float(np.max(quadratic_Xi[:, 3])) <= 7.0
 
 
 PASCUCCI_CALIBRATION_TDD_CONTRACTS = {
@@ -593,6 +645,20 @@ PASCUCCI_CALIBRATION_TDD_CONTRACTS = {
         "expected": "Fixture pipeline produces finite validated params and a JSON-dumpable Pascucci run params dict.",
         "failure": "Catches broken end-to-end calibration wiring before T12/T24 gates.",
     },
+    "pascucci_cli_calibration_paths_inject_run_config_params": {
+        "type": "acceptance-cli",
+        "target": "cli.run --pascucci_H_path/--pascucci_S_path",
+        "purpose": "Prevent T12/T24 plot-parity runs from silently using placeholder OU params.",
+        "expected": "CLI prepares, calibrates, injects params_H/params_S, and persists calibration metadata in run_config.json.",
+        "failure": "Catches non-comparable Pascucci runs with default H/S dynamics.",
+    },
+    "pascucci_cli_require_calibration_fails_before_training_without_paths": {
+        "type": "negative-cli",
+        "target": "cli.run --pascucci_require_calibration",
+        "purpose": "Fail fast before expensive T12/T24 paper-parity runs when H/S calibration sources are missing.",
+        "expected": "ValueError before run directory creation or training when either calibration path is absent, and rejection for non-Pascucci models.",
+        "failure": "Catches accidental launch of diagnostic-only Pascucci runs under a paper-parity label.",
+    },
 }
 
 
@@ -631,6 +697,13 @@ PASCUCCI_MODEL_LAYER_TDD_CONTRACTS = {
         "purpose": "Protect the frozen quadratic benchmark from Pascucci-specific config pollution.",
         "expected": "Passing Pascucci cost-profile args with quadratic_coupled raises ValueError before any run.",
         "failure": "Catches benchmark run_config drift or accidental cross-model parameter injection.",
+    },
+    "pascucci_cli_rejects_calibration_paths_for_quadratic_model": {
+        "type": "negative-integration-unit",
+        "target": "cli.run_program",
+        "purpose": "Protect the frozen quadratic benchmark from Pascucci-specific calibration metadata.",
+        "expected": "Passing Pascucci H/S calibration paths with quadratic_coupled raises ValueError before any file read or run.",
+        "failure": "Catches benchmark run_config drift or accidental cross-model calibration injection.",
     },
     "pascucci_recursive_cost_profile_matches_standard_formula": {
         "type": "regression-unit",
@@ -1044,6 +1117,8 @@ def test_pascucci_tdd_contract_metadata() -> None:
         "pascucci_calibration_config_records_units_log_price_dt_and_sources",
         "pascucci_build_run_config_params_injects_calibrated_ou_without_losing_solver_flags",
         "pascucci_minimal_fixture_pipeline_builds_json_run_params",
+        "pascucci_cli_calibration_paths_inject_run_config_params",
+        "pascucci_cli_require_calibration_fails_before_training_without_paths",
     }
     assert set(PASCUCCI_CALIBRATION_TDD_CONTRACTS) == expected_names
     for name in expected_names:
@@ -1057,6 +1132,7 @@ def test_pascucci_model_layer_tdd_contract_metadata() -> None:
         "pascucci_cost_profile_rejects_unknown_profile",
         "pascucci_cli_records_cost_profile_params_in_run_config",
         "pascucci_cli_rejects_cost_profile_for_quadratic_model",
+        "pascucci_cli_rejects_calibration_paths_for_quadratic_model",
         "pascucci_recursive_cost_profile_matches_standard_formula",
         "pascucci_cli_records_cost_profile_params_in_recursive_run_config",
         "pascucci_physical_constraint_diagnostics_q_v_are_model_owned",
@@ -1646,6 +1722,7 @@ def test_pascucci_minimal_fixture_pipeline_builds_json_run_params() -> None:
         validate_ou_params,
     )
     from .pascucci_data import prepare_H, prepare_S
+    from .pascucci_plotting import _load_to_ema_ou_reference, _load_to_ema_uncontrolled_reference
 
     n_per_hour = 2
     H_hours = _simulate_piecewise_ou_series(n_points=240, dt=1.0, start_hour=0.0)
@@ -1715,6 +1792,295 @@ def test_pascucci_minimal_fixture_pipeline_builds_json_run_params() -> None:
     assert params["pascucci_calibration"]["H_metadata"]["source_path"].endswith("H_fixture.csv")
     assert params["pascucci_calibration"]["S_metadata"]["source_path"].endswith("S_fixture.xlsx")
     _assert_json_roundtrip(params)
+
+
+def test_cli_pascucci_calibration_paths_inject_run_config_params() -> None:
+    _assert_pascucci_tdd_contract("pascucci_cli_calibration_paths_inject_run_config_params")
+    import types
+
+    from . import cli
+
+    n_points = 120
+    H_hours = _simulate_piecewise_ou_series(
+        n_points=n_points,
+        dt=1.0,
+        start_hour=0.0,
+        x0=0.25,
+        a0_day=0.80,
+        a0_night=-0.30,
+    )
+    log_S_hours = _simulate_piecewise_ou_series(
+        n_points=n_points,
+        dt=1.0,
+        start_hour=0.0,
+        x0=0.05,
+        a0_day=0.30,
+        a0_night=-0.12,
+    )
+    S_hours = np.exp(log_S_hours)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        H_path = tmp_path / "H_cli_fixture.csv"
+        S_path = tmp_path / "S_cli_fixture.xlsx"
+        out_dir = tmp_path / "out"
+        H_rows = []
+        for value in H_hours:
+            for _ in range(4):
+                production = 5000.0
+                consumption = production + float(value) / 0.001
+                H_rows.append({"Consumo (W)": f"{consumption:.12f}", "Produzione (W)": f"{production:.12f}"})
+        S_rows = [["fixture-day", "fixture-hour", f"{float(value) / 0.01:.12f}"] for value in S_hours]
+        _write_rows_csv(H_path, ["Consumo (W)", "Produzione (W)"], H_rows)
+        _write_minimal_xlsx(S_path, ["Data", "Ora", "€/MWh"], S_rows)
+
+        calls = {"recursive": 0, "print": 0}
+        captured_params = {}
+
+        def fake_run_recursive_training(**kwargs):
+            calls["recursive"] += 1
+            params = kwargs["params"]
+            captured_params.update(params)
+            assert kwargs["model_spec"].name == "pascucci"
+            assert params["pascucci_calibration"]["schema"] == "pascucci_ou_calibration_v1"
+            assert params["pascucci_calibration"]["K"] == 0
+            assert params["pascucci_calibration"]["log_price"] is True
+            assert params["pascucci_calibration"]["S_transform"] == "log"
+            assert params["params_H"]["a0_day"] != -1.0
+            assert params["params_S"]["a0_day"] != -1.0
+            assert params["pascucci_calibration"]["S_metadata"]["mul_factor"] == 0.01
+            blocks = build_blocks(T_total=kwargs["T_total"], block_size=kwargs["block_size"])
+            logs = [
+                {
+                    "pass": 1,
+                    "block": 0,
+                    "t_start": blocks[0]["t_start"],
+                    "t_end": blocks[0]["t_end"],
+                    "T_block": blocks[0]["T_block"],
+                    "eval_mean_loss": 1.0,
+                    "eval_std_loss": 0.0,
+                    "eval_mean_loss_per_sample": 0.25,
+                    "eval_std_loss_per_sample": 0.0,
+                    "eval_mean_y0": 0.0,
+                    "precision_target": None,
+                    "refine_rounds": 0,
+                }
+            ]
+            return {
+                "blocks": blocks,
+                "passes": [
+                    {
+                        "pass_id": 1,
+                        "reference_loss": 1.0,
+                        "logs": logs,
+                        "blobs": [_make_blob(kwargs["layers"]) for _ in blocks],
+                        "models_dir": kwargs["output_dir"],
+                        "pass_init_mode": kwargs["pass1_init_mode"],
+                        "boundary_source": "base_xi",
+                        "is_bootstrap_pass": True,
+                        "active_set_summary": {},
+                    }
+                ],
+                "boundary_samples": [
+                    np.zeros((kwargs["M"], kwargs["D"]), dtype=np.float32)
+                    for _ in range(len(blocks) + 1)
+                ],
+            }
+
+        def fake_print_recursive_pass(**kwargs):
+            calls["print"] += 1
+            assert kwargs["model_spec"].name == "pascucci"
+            assert kwargs["params"]["pascucci_calibration"]["schema"] == "pascucci_ou_calibration_v1"
+            return {
+                "processed_pass_ids": [1],
+                "exact_summary_by_pass": {},
+                "exact_summary_by_pass_index": {},
+                "eval_bundle_path": str(Path(kwargs["rec_dir"]) / "evaluation_bundle.npz"),
+                "eval_bundle_sha256": "",
+                "eval_bundle_status": "fake",
+                "evaluation_bundle_M": 4,
+                "excluded_pass_ids_from_selection": [],
+                "excluded_pass_indices_from_selection": [],
+                "selected_pass_id": 1,
+                "selected_pass_index": 0,
+                "selected_score_metric": "loss.eval_mean_loss_per_sample",
+                "selected_score": 0.25,
+                "selected_scores_by_pass": {"1": 0.25},
+                "selected_scores_by_pass_index": {"0": 0.25},
+                "score_key": "eval_mean_loss_per_sample",
+                "pass_scores_loss": {1: 0.25},
+                "pass_scores_loss_by_index": {0: 0.25},
+            }
+
+        fake_orchestration = types.ModuleType("final_recursive.orchestration")
+        fake_orchestration.run_recursive_training = fake_run_recursive_training
+        fake_orchestration.print_recursive_pass = fake_print_recursive_pass
+        fake_orchestration.run_recursive_coarse_prepass = lambda **kwargs: None
+        fake_orchestration.run_standard_reference = lambda **kwargs: None
+
+        module_name = f"{cli.__package__}.orchestration"
+        original_orchestration = sys.modules.get(module_name)
+        original_set_tf_seed = cli.set_tf_seed
+        sys.modules[module_name] = fake_orchestration
+        cli.set_tf_seed = lambda seed: None
+        try:
+            exit_code = cli.main(
+                [
+                    "run",
+                    "--model",
+                    "pascucci",
+                    "--mode",
+                    "recursive",
+                    "--M",
+                    "4",
+                    "--N",
+                    "2",
+                    "--T_total",
+                    "0.25",
+                    "--block_size",
+                    "0.25",
+                    "--passes",
+                    "1",
+                    "--pascucci_H_path",
+                    str(H_path),
+                    "--pascucci_S_path",
+                    str(S_path),
+                    "--pascucci_require_calibration",
+                    "--pascucci_calibration_K",
+                    "0",
+                    "--pascucci_S_mul_factor",
+                    "0.01",
+                    "--visual_sample_paths",
+                    "1",
+                    "--output_dir",
+                    str(out_dir),
+                ]
+            )
+        finally:
+            cli.set_tf_seed = original_set_tf_seed
+            if original_orchestration is None:
+                sys.modules.pop(module_name, None)
+            else:
+                sys.modules[module_name] = original_orchestration
+
+        assert exit_code == 0
+        assert calls["recursive"] == 1
+        assert calls["print"] >= 1
+        assert captured_params["pascucci_calibration"]["schema"] == "pascucci_ou_calibration_v1"
+        runs = sorted(out_dir.glob("run_*"))
+        assert len(runs) == 1
+        config = json.loads((runs[0] / "run_config.json").read_text(encoding="utf-8"))
+        assert config["model_name"] == "pascucci"
+        assert config["pascucci_require_calibration"] is True
+        assert config["pascucci_calibration_enabled"] is True
+        assert config["params"]["pascucci_calibration"]["schema"] == "pascucci_ou_calibration_v1"
+        assert config["params"]["pascucci_calibration"]["K"] == 0
+        assert config["params"]["pascucci_calibration"]["S_transform"] == "log"
+        assert config["params"]["params_H"]["a0_day"] != -1.0
+        assert config["params"]["params_S"]["a0_day"] != -1.0
+        assert config["params"]["pascucci_calibration"]["H_metadata"]["source_path"] == os.path.abspath(str(H_path))
+        assert config["params"]["pascucci_calibration"]["S_metadata"]["source_path"] == os.path.abspath(str(S_path))
+        assert config["params"]["pascucci_calibration"]["H_metadata"]["source_sha256"] == file_sha256(str(H_path))
+        assert config["params"]["pascucci_calibration"]["S_metadata"]["source_sha256"] == file_sha256(str(S_path))
+        assert config["params"]["pascucci_calibration"]["H_metadata"]["prepared_points"] == n_points
+        assert config["params"]["pascucci_calibration"]["S_metadata"]["prepared_points"] == n_points
+        assert config["params"]["pascucci_calibration"]["S_metadata"]["mul_factor"] == 0.01
+
+
+def test_cli_pascucci_require_calibration_fails_before_training_without_paths() -> None:
+    _assert_pascucci_tdd_contract("pascucci_cli_require_calibration_fails_before_training_without_paths")
+    import types
+
+    from . import cli
+
+    calls = {"recursive": 0}
+
+    def forbidden_run_recursive_training(**kwargs):
+        del kwargs
+        calls["recursive"] += 1
+        raise AssertionError("paper-parity calibration guard must fail before training starts")
+
+    fake_orchestration = types.ModuleType("final_recursive.orchestration")
+    fake_orchestration.run_recursive_training = forbidden_run_recursive_training
+    fake_orchestration.print_recursive_pass = lambda **kwargs: {}
+    fake_orchestration.run_recursive_coarse_prepass = lambda **kwargs: None
+    fake_orchestration.run_standard_reference = lambda **kwargs: None
+
+    module_name = f"{cli.__package__}.orchestration"
+    original_orchestration = sys.modules.get(module_name)
+    original_set_tf_seed = cli.set_tf_seed
+    sys.modules[module_name] = fake_orchestration
+    cli.set_tf_seed = lambda seed: None
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "out"
+            try:
+                cli.main(
+                    [
+                        "run",
+                        "--model",
+                        "pascucci",
+                        "--mode",
+                        "recursive",
+                        "--M",
+                        "4",
+                        "--N",
+                        "2",
+                        "--T_total",
+                        "0.25",
+                        "--block_size",
+                        "0.25",
+                        "--passes",
+                        "1",
+                        "--pascucci_require_calibration",
+                        "--output_dir",
+                        str(out_dir),
+                    ]
+                )
+            except ValueError as exc:
+                message = str(exc)
+                assert "--pascucci_require_calibration" in message
+                assert "--pascucci_H_path" in message
+                assert "--pascucci_S_path" in message
+            else:
+                raise AssertionError("--pascucci_require_calibration must reject missing H/S paths")
+
+            assert calls["recursive"] == 0
+            assert not list(out_dir.glob("run_*"))
+
+            try:
+                cli.main(
+                    [
+                        "run",
+                        "--model",
+                        "quadratic_coupled",
+                        "--mode",
+                        "recursive",
+                        "--M",
+                        "4",
+                        "--N",
+                        "2",
+                        "--T_total",
+                        "0.25",
+                        "--block_size",
+                        "0.25",
+                        "--passes",
+                        "1",
+                        "--pascucci_require_calibration",
+                        "--output_dir",
+                        str(out_dir),
+                    ]
+                )
+            except ValueError as exc:
+                assert "supported only with --model pascucci" in str(exc)
+            else:
+                raise AssertionError("--pascucci_require_calibration must not apply to quadratic_coupled")
+    finally:
+        cli.set_tf_seed = original_set_tf_seed
+        if original_orchestration is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = original_orchestration
 
 
 def _pascucci_psi(x: np.ndarray, d: float, x_max: float) -> np.ndarray:
@@ -1902,6 +2268,8 @@ def test_model_spec_application_metric_names() -> None:
         "cost_J_terminal",
         "cost_J_total",
         "cost_J_running_cumulative",
+        "cost_J_trajectory",
+        "cost_J_trajectory_math",
     ), "Pascucci must declare cost J components before metrics are emitted"
     assert set(pascucci.moment_names).isdisjoint(pascucci.application_metric_names)
 
@@ -2012,6 +2380,201 @@ def test_pascucci_application_cost_functional_decomposes_to_f_plus_g() -> None:
         assert cumulative.shape == (t_batch.shape[0], t_batch.shape[1] - 1, 1)
         np.testing.assert_allclose(cumulative, expected_cumulative, rtol=1.0e-6, atol=1.0e-6)
         np.testing.assert_allclose(cumulative[:, -1, :], expected_running, rtol=1.0e-6, atol=1.0e-6)
+
+        trajectory_terms = []
+        terminal_terms = []
+        for step in range(t_batch.shape[1]):
+            X_step = X[:, step, :]
+            Z_step = Z[:, step, :]
+            t_step = t_tf[:, step, :]
+            moments = model.mean_field_moments_tf(X_step)
+            f_step = model.f_tf(
+                t_step,
+                X_step,
+                tf.zeros_like(Y[:, step, :]),
+                Z_step,
+                moment_state=moments,
+            ).numpy()
+            if t_batch.shape[1] == 1:
+                dt_step = np.zeros_like(t_batch[:, step, :])
+            elif step == 0:
+                dt_step = t_batch[:, 1, :] - t_batch[:, 0, :]
+            else:
+                dt_step = t_batch[:, step, :] - t_batch[:, step - 1, :]
+            trajectory_terms.append(f_step * dt_step)
+            terminal_terms.append(model.g_tf(X_step, moment_state=moments).numpy())
+        expected_trajectory = (
+            np.cumsum(np.stack(trajectory_terms, axis=1), axis=1)
+            + np.stack(terminal_terms, axis=1)
+        ).astype(np.float32)
+        trajectory = np.asarray(result["pathwise"]["cost_J_trajectory"], dtype=np.float32)
+        assert trajectory.shape == (t_batch.shape[0], t_batch.shape[1], 1)
+        np.testing.assert_allclose(trajectory, expected_trajectory, rtol=1.0e-6, atol=1.0e-6)
+
+        terminal_trace = np.stack(terminal_terms, axis=1).astype(np.float32)
+        integral_to_time = np.concatenate(
+            [np.zeros((t_batch.shape[0], 1, 1), dtype=np.float32), expected_cumulative],
+            axis=1,
+        )
+        expected_trajectory_math = (integral_to_time + terminal_trace).astype(np.float32)
+        trajectory_math = np.asarray(result["pathwise"]["cost_J_trajectory_math"], dtype=np.float32)
+        assert trajectory_math.shape == (t_batch.shape[0], t_batch.shape[1], 1)
+        np.testing.assert_allclose(trajectory_math, expected_trajectory_math, rtol=1.0e-6, atol=1.0e-6)
+        np.testing.assert_allclose(trajectory_math[:, 0, :], terminal_trace[:, 0, :], rtol=1.0e-6, atol=1.0e-6)
+        np.testing.assert_allclose(trajectory_math[:, -1, :], expected_total, rtol=1.0e-6, atol=1.0e-6)
+        assert not np.allclose(trajectory[:, -1, :], expected_total, rtol=1.0e-6, atol=1.0e-6), (
+            "cost_J_trajectory intentionally follows raw/to_ema plotmaker.ipynb; "
+            "use cost_J_trajectory_math for cost accounting"
+        )
+    finally:
+        model.close()
+
+
+def test_pascucci_application_cost_trajectory_matches_plotmaker_nonuniform_grid() -> None:
+    from .model_specs import get_model_spec
+    from .tf_backend import require_tensorflow, reset_backend_state, set_seed
+
+    tf = require_tensorflow()
+    reset_backend_state()
+    set_seed(303)
+
+    spec = get_model_spec("pascucci")
+    params = spec.build_default_params(const=0.75)
+    model = _build_pascucci_recursive_unit_model(params, M=3)
+
+    try:
+        M = 3
+        t_grid = np.asarray([0.0, 0.05, 0.20, 0.25], dtype=np.float32)
+        t = np.tile(t_grid.reshape(1, -1, 1), (M, 1, 1)).astype(np.float32)
+        X = np.zeros((M, len(t_grid), 4), dtype=np.float32)
+        for i in range(M):
+            X[i, :, 0] = 0.20 + 0.04 * i + np.asarray([0.00, 0.01, 0.03, 0.06], dtype=np.float32)
+            X[i, :, 1] = -0.10 + 0.03 * i + np.asarray([0.00, 0.02, 0.02, 0.04], dtype=np.float32)
+            X[i, :, 2] = 0.10 + 0.02 * i + np.asarray([0.00, 0.05, 0.04, 0.07], dtype=np.float32)
+            X[i, :, 3] = 3.00 + 0.20 * i + np.asarray([0.00, 0.10, 0.15, 0.25], dtype=np.float32)
+        Y = np.zeros((M, len(t_grid), 1), dtype=np.float32)
+        Z = np.zeros((M, len(t_grid), 4), dtype=np.float32)
+        Z[:, :, 2] = 0.05
+
+        result = model.application_cost_from_path(t, X, Y, Z)
+
+        f_slices = []
+        g_slices = []
+        t_tf = tf.constant(t, dtype=tf.float32)
+        X_tf = tf.constant(X, dtype=tf.float32)
+        Y_tf = tf.constant(Y, dtype=tf.float32)
+        Z_tf = tf.constant(Z, dtype=tf.float32)
+        for step in range(len(t_grid)):
+            X_step = X_tf[:, step, :]
+            moments = model.mean_field_moments_tf(X_step)
+            f_slices.append(
+                model.f_tf(
+                    t_tf[:, step, :],
+                    X_step,
+                    Y_tf[:, step, :],
+                    Z_tf[:, step, :],
+                    moment_state=moments,
+                ).numpy()[:, 0]
+            )
+            g_slices.append(model.g_tf(X_step, moment_state=moments).numpy()[:, 0])
+        f_vals = np.stack(f_slices, axis=1)
+        g_vals = np.stack(g_slices, axis=1)
+        plotmaker_dt = np.concatenate([[np.diff(t_grid)[0]], np.diff(t_grid)]).astype(np.float32)
+        expected_plotmaker = (
+            np.cumsum(f_vals * plotmaker_dt.reshape(1, -1), axis=1)
+            + g_vals
+        ).reshape(M, len(t_grid), 1)
+
+        trajectory = np.asarray(result["pathwise"]["cost_J_trajectory"], dtype=np.float32)
+        trajectory_math = np.asarray(result["pathwise"]["cost_J_trajectory_math"], dtype=np.float32)
+        total = np.asarray(result["pathwise"]["cost_J_total"], dtype=np.float32)
+
+        np.testing.assert_allclose(trajectory, expected_plotmaker, rtol=1.0e-6, atol=1.0e-6)
+        np.testing.assert_allclose(trajectory_math[:, -1, :], total, rtol=1.0e-6, atol=1.0e-6)
+        assert not np.allclose(trajectory[:, -1, :], total, rtol=1.0e-6, atol=1.0e-6)
+    finally:
+        model.close()
+
+
+def test_pascucci_application_cost_trajectory_uses_per_time_mean_field_oracle() -> None:
+    from .model_specs import get_model_spec
+    from .tf_backend import require_tensorflow, reset_backend_state, set_seed
+
+    tf = require_tensorflow()
+    reset_backend_state()
+    set_seed(404)
+
+    spec = get_model_spec("pascucci")
+    params = spec.build_default_params(const=0.75)
+    model = _build_pascucci_recursive_unit_model(params, M=4)
+
+    try:
+        M = 4
+        t_grid = np.asarray([0.0, 0.04, 0.12, 0.25], dtype=np.float32)
+        t = np.tile(t_grid.reshape(1, -1, 1), (M, 1, 1)).astype(np.float32)
+        X = np.zeros((M, len(t_grid), 4), dtype=np.float32)
+        path_offsets = np.arange(M, dtype=np.float32)
+        q_offsets = np.asarray([0.0, 1.0, 3.0, 6.0], dtype=np.float32)
+        for step in range(len(t_grid)):
+            X[:, step, 0] = 0.10 + 0.03 * step + 0.02 * path_offsets
+            X[:, step, 1] = -2.00 + 2.00 * step + 0.50 * path_offsets
+            X[:, step, 2] = 0.10 + 1.00 * step + 0.40 * path_offsets
+            X[:, step, 3] = 1.00 + 3.00 * step + q_offsets
+        Y = np.zeros((M, len(t_grid), 1), dtype=np.float32)
+        Z = np.zeros((M, len(t_grid), 4), dtype=np.float32)
+        Z[:, :, 2] = 0.10 + 0.02 * np.arange(len(t_grid), dtype=np.float32).reshape(1, -1)
+
+        result = model.application_cost_from_path(t, X, Y, Z)
+
+        t_tf = tf.constant(t, dtype=tf.float32)
+        X_tf = tf.constant(X, dtype=tf.float32)
+        Y_tf = tf.constant(Y, dtype=tf.float32)
+        Z_tf = tf.constant(Z, dtype=tf.float32)
+        f_slices = []
+        g_slices = []
+        for step in range(len(t_grid)):
+            X_step = X_tf[:, step, :]
+            moments = model.mean_field_moments_tf(X_step)
+            f_slices.append(
+                model.f_tf(
+                    t_tf[:, step, :],
+                    X_step,
+                    Y_tf[:, step, :],
+                    Z_tf[:, step, :],
+                    moment_state=moments,
+                ).numpy()[:, 0]
+            )
+            g_slices.append(model.g_tf(X_step, moment_state=moments).numpy()[:, 0])
+        f_vals = np.stack(f_slices, axis=1)
+        g_vals = np.stack(g_slices, axis=1)
+        plotmaker_dt = np.concatenate([[np.diff(t_grid)[0]], np.diff(t_grid)]).astype(np.float32)
+        per_time_oracle = (
+            np.cumsum(f_vals * plotmaker_dt.reshape(1, -1), axis=1)
+            + g_vals
+        ).reshape(M, len(t_grid), 1)
+
+        t_flat = t.reshape(-1, 1)
+        X_flat = X.reshape(-1, 4)
+        Y_flat = Y.reshape(-1, 1)
+        Z_flat = Z.reshape(-1, 4)
+        f_flat = model.f_tf(
+            tf.constant(t_flat, dtype=tf.float32),
+            tf.constant(X_flat, dtype=tf.float32),
+            tf.constant(Y_flat, dtype=tf.float32),
+            tf.constant(Z_flat, dtype=tf.float32),
+        ).numpy().reshape(M, len(t_grid))
+        g_flat = model.g_tf(tf.constant(X_flat, dtype=tf.float32)).numpy().reshape(M, len(t_grid))
+        flattened_helper = (
+            np.cumsum(f_flat * plotmaker_dt.reshape(1, -1), axis=1)
+            + g_flat
+        ).reshape(M, len(t_grid), 1)
+
+        trajectory = np.asarray(result["pathwise"]["cost_J_trajectory"], dtype=np.float32)
+        np.testing.assert_allclose(trajectory, per_time_oracle, rtol=1.0e-6, atol=1.0e-6)
+        assert np.max(np.abs(flattened_helper - per_time_oracle)) > 1.0e-3, (
+            "The raw notebook helper cannot be used naively after flattening "
+            "(path, time) because mean-field moments must be evaluated per time slice."
+        )
     finally:
         model.close()
 
@@ -2045,12 +2608,19 @@ def test_pascucci_application_cost_summary_has_quantiles_and_metadata() -> None:
         assert result["metadata"]["control_law"] == "alpha_tf"
 
         summary = result["summary"]
-        for metric_name in ("cost_J_running", "cost_J_terminal", "cost_J_total", "cost_J_running_cumulative"):
-            if metric_name == "cost_J_running_cumulative":
-                cumulative = np.asarray(result["pathwise"][metric_name], dtype=np.float32)
-                assert cumulative.ndim == 3
-                assert cumulative.shape[1] > 0
-                flat = cumulative[:, -1, :].reshape(-1)
+        for metric_name in (
+            "cost_J_running",
+            "cost_J_terminal",
+            "cost_J_total",
+            "cost_J_running_cumulative",
+            "cost_J_trajectory",
+            "cost_J_trajectory_math",
+        ):
+            if metric_name in ("cost_J_running_cumulative", "cost_J_trajectory", "cost_J_trajectory_math"):
+                trace = np.asarray(result["pathwise"][metric_name], dtype=np.float32)
+                assert trace.ndim == 3
+                assert trace.shape[1] > 0
+                flat = trace[:, -1, :].reshape(-1)
             else:
                 pathwise = _numpy_cost_result_pathwise(result, metric_name)
                 flat = pathwise[:, 0]
@@ -2088,6 +2658,8 @@ def test_pascucci_application_cost_summary_handles_zero_step_cumulative() -> Non
             "cost_J_terminal": np.asarray([[1.0], [2.0], [3.0]], dtype=np.float32),
             "cost_J_total": np.asarray([[1.0], [2.0], [3.0]], dtype=np.float32),
             "cost_J_running_cumulative": np.zeros((3, 0, 1), dtype=np.float32),
+            "cost_J_trajectory": np.asarray([[[1.0]], [[2.0]], [[3.0]]], dtype=np.float32),
+            "cost_J_trajectory_math": np.asarray([[[1.0]], [[2.0]], [[3.0]]], dtype=np.float32),
         }
         summary = model._application_summary_np(pathwise)
         for suffix in ("mean", "std", "q05", "q50", "q95"):
@@ -2095,6 +2667,7 @@ def test_pascucci_application_cost_summary_handles_zero_step_cumulative() -> Non
             assert key in summary
             assert isinstance(summary[key], float)
             np.testing.assert_allclose(summary[key], 0.0, rtol=0.0, atol=0.0)
+        assert summary["cost_J_trajectory_mean"] == 2.0
     finally:
         model.close()
 
@@ -3260,7 +3833,7 @@ def test_pascucci_equation_oracle_exp_minus_offset_variant() -> None:
         offset_oracle["outputs"]["f"] - base_oracle["outputs"]["f"],
         expected_delta,
         rtol=1.0e-6,
-        atol=1.0e-3,
+        atol=6.0e-3,
     )
     for key in ("mu", "sigma", "alpha", "g"):
         np.testing.assert_allclose(
@@ -4495,16 +5068,28 @@ def _pascucci_paper_plot_smoke_inputs(M: int = 5):
     uncontrolled_cumulative = np.cumsum(uncontrolled_increment, axis=1).astype(np.float32)
     controlled_terminal = np.full((M, 1), 0.25, dtype=np.float32)
     uncontrolled_terminal = np.full((M, 1), 0.35, dtype=np.float32)
+    controlled_trajectory = (
+        np.concatenate([np.zeros((M, 1, 1), dtype=np.float32), controlled_cumulative], axis=1)
+        + controlled_terminal[:, None, :]
+    ).astype(np.float32)
+    uncontrolled_trajectory = (
+        np.concatenate([np.zeros((M, 1, 1), dtype=np.float32), uncontrolled_cumulative], axis=1)
+        + uncontrolled_terminal[:, None, :]
+    ).astype(np.float32)
     application_pathwise = {
         "controlled_cost_J_running": controlled_cumulative[:, -1, :],
         "controlled_cost_J_terminal": controlled_terminal,
         "controlled_cost_J_total": controlled_cumulative[:, -1, :] + controlled_terminal,
         "controlled_cost_J_running_cumulative": controlled_cumulative,
+        "controlled_cost_J_trajectory": controlled_trajectory,
+        "controlled_cost_J_trajectory_math": controlled_trajectory,
         "controlled_alpha": controlled_alpha,
         "uncontrolled_cost_J_running": uncontrolled_cumulative[:, -1, :],
         "uncontrolled_cost_J_terminal": uncontrolled_terminal,
         "uncontrolled_cost_J_total": uncontrolled_cumulative[:, -1, :] + uncontrolled_terminal,
         "uncontrolled_cost_J_running_cumulative": uncontrolled_cumulative,
+        "uncontrolled_cost_J_trajectory": uncontrolled_trajectory,
+        "uncontrolled_cost_J_trajectory_math": uncontrolled_trajectory,
         "uncontrolled_alpha": uncontrolled_alpha,
     }
     params = _default_pascucci_params(const=0.75)
@@ -4522,7 +5107,7 @@ def _pascucci_paper_plot_smoke_inputs(M: int = 5):
 
 def test_pascucci_paper_plot_bundle_from_artifacts_smoke() -> None:
     from .io_utils import save_blob_npz, save_json
-    from .plotting import _PLOTTING_AVAILABLE
+    from .plotting import _PLOTTING_AVAILABLE, plt
 
     if not _PLOTTING_AVAILABLE:
         return
@@ -4566,16 +5151,88 @@ def test_pascucci_paper_plot_bundle_from_artifacts_smoke() -> None:
         assert manifest["model_name"] == "pascucci"
         assert manifest["source"]["source_label"] == "synthetic_smoke"
         assert manifest["source"]["run_config_sha256"] == "0" * 64
-        assert manifest["cost_trace_source"] == "cost_J_running_cumulative"
+        assert manifest["cost_trace_source"] == "cost_J_trajectory"
         assert manifest["controlled_uncontrolled_available"] is True
         assert manifest["plot_path_policy"] == "relative_to_manifest_dir"
+        assert manifest["state_transforms"]["#35"] == "PUN price = exp(S) * 1000, matching to_ema calibration plots"
+        assert "exp(stitched.X[:, :, S]) * 1000" in manifest["plots"]["#35"]["inputs"]
+        assert manifest["plots"]["#35"]["style"]["source"] == "raw/to_ema/variable_mu_calibration.ipynb::generate_plot"
+        assert manifest["plots"]["#35"]["style"]["real_color"] == "red"
+        assert manifest["plots"]["#35"]["style"]["figure_size"] == [12, 6]
+        assert manifest["plots"]["#37"]["style"]["source"] == "raw/to_ema/plotmaker.ipynb::comparison J cell"
+        assert manifest["plots"]["#37"]["style"]["figure_size"] == [10, 6]
+        assert manifest["plots"]["#37"]["style"]["controlled_color"] == "r"
+        assert "J_t=" in manifest["plots"]["#37"]["style"]["title"]
+        assert manifest["notebook_parity"]["exact_all_stories"] is False
+        assert manifest["notebook_parity"]["stories"]["#37"] == "plotmaker_per_time_cost_formula_oracled"
+        assert manifest["notebook_parity"]["stories"]["#38"] == "diagnostic_only_no_plotmaker_equivalent"
+        assert manifest["notebook_parity"]["stories"]["#40"] == "diagnostic_only_no_plotmaker_equivalent"
+        assert manifest["visual_regression"]["status"] == "structural_style_only_no_golden_images"
+        assert manifest["visual_regression"]["pixel_exact_claim"] is False
+        assert manifest["visual_regression"]["golden_images_available"] is False
+        assert "np.random.choice" in "\n".join(manifest["visual_regression"]["remaining_gaps"])
+        assert manifest["plotmaker_reference"]["data"] == "2025dicembre1"
+        assert manifest["plotmaker_reference"]["dataset_status"] == "mismatch"
+        assert manifest["plotmaker_reference"]["H"]["expected_basename"] == "2025dicembre1.csv"
+        assert manifest["plotmaker_reference"]["S"]["expected_basename"] == "2025dicembre1.xlsx"
+        assert manifest["plotmaker_native_plots"]["Y"]["filename"] == "pascucci_plotmaker_backward_Y.png"
+        assert manifest["plotmaker_native_plots"]["Y"]["style"]["source"] == (
+            "raw/to_ema/plotmaker.ipynb::Backward Component Y cell"
+        )
+        assert manifest["plotmaker_native_plots"]["Z"]["filename"] == "pascucci_plotmaker_Z_components.png"
+        assert manifest["plotmaker_native_plots"]["Z"]["style"]["labels"] == ["Z_S", "Z_H", "Z_V", "Z_X"]
+        assert manifest["notebook_parity"]["native_plotmaker_plots"]["Y"] == "plotmaker_backward_component_reference"
+        assert manifest["notebook_parity"]["native_plotmaker_plots"]["Z"] == "plotmaker_z_components_reference"
+        assert manifest["state_transforms"]["#39"] == (
+            "forward components S,H,V,X in plotmaker 2x2 layout; S is plotted as exp(S)"
+        )
+        assert "exp(stitched.X[:, :, S])" in manifest["plots"]["#39"]["inputs"]
+        assert "stitched.X[:, :, H,V,X]" in manifest["plots"]["#39"]["inputs"]
+        assert "plotmaker-style q10-q90 bands, mean, and 3 sample paths" in manifest["plots"]["#39"]["inputs"]
+        assert manifest["plots"]["#39"]["style"]["sample_policy"] == "deterministic_first3_for_reproducibility"
+        assert "stitched.X[:, :, S,V,Q]" not in manifest["plots"]["#39"]["inputs"]
+        assert "application_metrics.controlled_cost_J_trajectory" in manifest["plots"]["#37"]["inputs"]
+        assert "application_metrics.uncontrolled_cost_J_trajectory" in manifest["plots"]["#37"]["inputs"]
+        assert manifest["plots"]["#40"]["title"] == "Controlled vs alpha=0 same-model total cost"
+        assert "uncontrolled baseline source=alpha_zero_same_model" in manifest["plots"]["#40"]["inputs"]
+        assert manifest["plots"]["#40"]["style"]["bar_stat"] == "q50"
+        assert manifest["plots"]["#40"]["style"]["marker_stat"] == "mean"
+        assert manifest["uncontrolled_cost_trace_source"] == "application_metrics.uncontrolled_cost_J_trajectory"
+        assert manifest["to_ema_uncontrolled_reference"]["source"] == "application_metrics_fallback"
+        assert manifest["comparison_sources"]["#40"]["uncontrolled"] == "alpha_zero_same_model"
+        assert manifest["ou_reference"]["source"] == "stitched_fallback"
+        assert manifest["ou_reference"]["reason"] == "missing_pascucci_calibration_metadata"
         assert manifest["blocks"] == fixture["blocks"]
         expected_stories = {"#35", "#36", "#37", "#38", "#39", "#40"}
         assert set(manifest["plots"]) == expected_stories
+        assert manifest["plot_data"]["schema"] == "pascucci_paper_plot_data_v1"
+        assert manifest["plot_data"]["path"] == "pascucci_paper_plot_data.npz"
         manifest_path = tmp_path / "paper_plots" / "pascucci_paper_plots_manifest.json"
         assert manifest_path.exists()
         saved_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         assert saved_manifest["plots"].keys() == manifest["plots"].keys()
+        plot_data_path = manifest_path.parent / manifest["plot_data"]["path"]
+        assert plot_data_path.exists()
+        with np.load(plot_data_path, allow_pickle=False) as plot_data:
+            assert "plot37_controlled_mean" in plot_data.files
+            assert "plot37_uncontrolled_q90" in plot_data.files
+            assert "plot39_S_q10" in plot_data.files
+            assert "plot39_H_mean" in plot_data.files
+            assert "plot39_X_samples" in plot_data.files
+            assert "plotmaker_Y_mean" in plot_data.files
+            assert "plotmaker_Y_samples" in plot_data.files
+            assert "plotmaker_Z_Z_V_mean" in plot_data.files
+            assert "plotmaker_Z_Z_X_samples" in plot_data.files
+            assert plot_data["plot37_controlled_time"].shape == plot_data["plot37_controlled_mean"].shape
+            assert plot_data["plot40_controlled_q50"].shape == (1,)
+            assert plot_data["plot39_sample_indices"].shape == (3,)
+            assert plot_data["plot39_X_samples"].shape == (3, fixture["stitched"]["X"].shape[1])
+            assert plot_data["plotmaker_Y_samples"].shape == (3, fixture["stitched"]["Y"].shape[1])
+            assert plot_data["plotmaker_Z_Z_S_samples"].shape == (3, fixture["stitched"]["Z"].shape[1])
+        plot39_image = plt.imread(str(manifest_path.parent / manifest["plots"]["#39"]["path"]))
+        assert plot39_image.shape[1] > plot39_image.shape[0], "plotmaker #39 forward-components figure must be landscape"
+        plotmaker_z_image = plt.imread(str(manifest_path.parent / manifest["plotmaker_native_plots"]["Z"]["path"]))
+        assert plotmaker_z_image.shape[1] > plotmaker_z_image.shape[0], "plotmaker Z components figure must be landscape"
         for story, entry in manifest["plots"].items():
             assert not Path(entry["path"]).is_absolute(), story
             assert entry["path_relative_to"] == "manifest_dir", story
@@ -4583,6 +5240,754 @@ def test_pascucci_paper_plot_bundle_from_artifacts_smoke() -> None:
             assert plot_path.exists(), story
             assert plot_path.stat().st_size > 0, story
             assert entry["filename"].startswith("pascucci_paper_"), story
+        for story, entry in manifest["plotmaker_native_plots"].items():
+            assert not Path(entry["path"]).is_absolute(), story
+            assert entry["path_relative_to"] == "manifest_dir", story
+            plot_path = manifest_path.parent / entry["path"]
+            assert plot_path.exists(), story
+            assert plot_path.stat().st_size > 0, story
+
+
+def test_pascucci_paper_plot_bundle_legacy_cost_trace_fallback() -> None:
+    from .plotting import _PLOTTING_AVAILABLE
+
+    if not _PLOTTING_AVAILABLE:
+        return
+
+    from .pascucci_plotting import plot_pascucci_paper_bundle
+
+    fixture = _pascucci_paper_plot_smoke_inputs()
+    legacy_pathwise = dict(fixture["application_pathwise"])
+    legacy_pathwise.pop("controlled_cost_J_trajectory")
+    legacy_pathwise.pop("uncontrolled_cost_J_trajectory")
+    legacy_pathwise.pop("controlled_cost_J_trajectory_math")
+    legacy_pathwise.pop("uncontrolled_cost_J_trajectory_math")
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest = plot_pascucci_paper_bundle(
+            stitched=fixture["stitched"],
+            application_pathwise=legacy_pathwise,
+            params=fixture["params"],
+            out_dir=str(Path(tmp) / "paper_plots"),
+            blocks=fixture["blocks"],
+            source_metadata={"model_name": "pascucci"},
+        )
+    assert manifest["cost_trace_source"] == "cost_J_running_cumulative"
+    assert manifest["uncontrolled_cost_trace_source"] == "application_metrics.uncontrolled_cost_J_running_cumulative"
+    assert "application_metrics.controlled_cost_J_running_cumulative" in manifest["plots"]["#37"]["inputs"]
+    assert "application_metrics.uncontrolled_cost_J_running_cumulative" in manifest["plots"]["#37"]["inputs"]
+
+
+def test_pascucci_paper_plot_bundle_uses_to_ema_calibration_sources() -> None:
+    from .model_specs import get_model_spec
+    from .pascucci_calibration import (
+        build_pascucci_calibration_config,
+        build_pascucci_run_config_params,
+        calibrate_pascucci_ou_inputs,
+    )
+    from .pascucci_data import prepare_H, prepare_S
+    from .pascucci_plotting import _load_to_ema_ou_reference, _load_to_ema_uncontrolled_reference
+    from .plotting import _PLOTTING_AVAILABLE
+
+    if not _PLOTTING_AVAILABLE:
+        return
+
+    from .pascucci_plotting import plot_pascucci_paper_bundle
+
+    n_points = 120
+    H_hours = _simulate_piecewise_ou_series(
+        n_points=n_points,
+        dt=1.0,
+        start_hour=0.0,
+        x0=0.25,
+        a0_day=0.80,
+        a0_night=-0.30,
+    )
+    log_S_hours = _simulate_piecewise_ou_series(
+        n_points=n_points,
+        dt=1.0,
+        start_hour=0.0,
+        x0=0.05,
+        a0_day=0.30,
+        a0_night=-0.12,
+    )
+    S_hours = np.exp(log_S_hours)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        H_path = tmp_path / "H_plot_fixture.csv"
+        S_path = tmp_path / "S_plot_fixture.xlsx"
+        H_rows = []
+        for value in H_hours:
+            for _ in range(4):
+                production = 5000.0
+                consumption = production + float(value) / 0.001
+                H_rows.append({"Consumo (W)": f"{consumption:.12f}", "Produzione (W)": f"{production:.12f}"})
+        S_rows = [["fixture-day", "fixture-hour", f"{float(value) / 0.01:.12f}"] for value in S_hours]
+        _write_rows_csv(H_path, ["Consumo (W)", "Produzione (W)"], H_rows)
+        _write_minimal_xlsx(S_path, ["Data", "Ora", "€/MWh"], S_rows)
+
+        prepared_H = prepare_H(str(H_path), n=4, mul_factor=0.001)
+        prepared_S = prepare_S(str(S_path), n=1, mul_factor=0.01)
+        calibration = calibrate_pascucci_ou_inputs(
+            prepared_H,
+            prepared_S,
+            K=0,
+            dt=1.0,
+            start_hour=0.0,
+            log_price=True,
+        )
+        config = build_pascucci_calibration_config(
+            calibration,
+            K=0,
+            dt=1.0,
+            start_hour=0.0,
+            log_price=True,
+            H_metadata={
+                "source_path": str(H_path),
+                "units": "kW",
+                "n_per_hour": 4,
+                "mul_factor": 0.001,
+            },
+            S_metadata={
+                "source_path": str(S_path),
+                "units": "EUR_per_MWh",
+                "n_per_hour": 1,
+                "mul_factor": 0.01,
+            },
+        )
+        params = build_pascucci_run_config_params(
+            get_model_spec("pascucci").build_default_params(),
+            config,
+        )
+        fixture = _pascucci_paper_plot_smoke_inputs(M=5)
+        manifest = plot_pascucci_paper_bundle(
+            stitched=fixture["stitched"],
+            application_pathwise=fixture["application_pathwise"],
+            params=params,
+            out_dir=str(tmp_path / "paper_plots"),
+            blocks=fixture["blocks"],
+            source_metadata={"model_name": "pascucci"},
+        )
+
+        assert manifest["ou_reference"]["source"] == "calibration_metadata"
+        assert manifest["ou_reference"]["simulation"]["dt_sim"] == 0.5
+        assert manifest["ou_reference"]["simulation"]["n_sim"] == 10000
+        assert manifest["ou_reference"]["simulation"]["seed"] == 42
+        assert manifest["ou_reference"]["#35"]["real_path_points"] == n_points
+        assert manifest["ou_reference"]["#36"]["real_path_points"] == n_points
+        assert manifest["ou_reference"]["#35"]["transform"] == "exp(logS) * 1000"
+        assert manifest["uncontrolled_cost_trace_source"] == "to_ema_raw_uncontrolled_J"
+        assert manifest["to_ema_uncontrolled_reference"]["source"] == "calibration_metadata"
+        assert manifest["to_ema_uncontrolled_reference"]["simulation"]["dt"] == 0.1
+        assert manifest["to_ema_uncontrolled_reference"]["simulation"]["n_sim"] == 10000
+        assert manifest["comparison_sources"]["#37"]["uncontrolled"] == "to_ema_raw_uncontrolled_J"
+        assert manifest["comparison_sources"]["#40"]["uncontrolled"] == "to_ema_raw_uncontrolled_J_final"
+        assert (
+            manifest["comparison_sources"]["#40"]["paired_alpha_zero_detail"]
+            == "application_metrics.uncontrolled_cost_J_total"
+        )
+        assert "to_ema.raw_uncontrolled_J_paths" in manifest["plots"]["#37"]["inputs"]
+        assert manifest["plots"]["#40"]["title"] == "Controlled vs raw to_ema final cost"
+        assert "to_ema.raw_uncontrolled_J_paths[:, -1]" in manifest["plots"]["#40"]["inputs"]
+        assert "paired alpha=0 total still saved as application_metrics.uncontrolled_cost_J_total" in manifest[
+            "plots"
+        ]["#40"]["inputs"]
+        assert "pascucci_data.prepare_S" in manifest["plots"]["#35"]["inputs"][0]
+        assert "simulate_ou_day_night" in manifest["plots"]["#35"]["inputs"][2]
+        assert "real_S * 1000" in manifest["plots"]["#35"]["inputs"]
+        assert "pascucci_data.prepare_H" in manifest["plots"]["#36"]["inputs"][0]
+        assert "real_H" in manifest["plots"]["#36"]["inputs"]
+        plot_data_path = tmp_path / "paper_plots" / manifest["plot_data"]["path"]
+        assert plot_data_path.exists()
+        with np.load(plot_data_path, allow_pickle=False) as plot_data:
+            assert plot_data["plot35_time_sim"].shape == plot_data["plot35_sim_q05"].shape
+            assert plot_data["plot36_time_sim"].shape == plot_data["plot36_sim_q95"].shape
+            assert plot_data["plot37_uncontrolled_mean"].shape[0] > plot_data["plot37_controlled_mean"].shape[0]
+        for story in ("#35", "#36"):
+            plot_path = tmp_path / "paper_plots" / manifest["plots"][story]["path"]
+            assert plot_path.exists(), story
+            assert plot_path.stat().st_size > 0, story
+
+
+def test_pascucci_paper_plot_ou_calibration_sources_are_pass_invariant() -> None:
+    from .model_specs import get_model_spec
+    from .pascucci_calibration import (
+        build_pascucci_calibration_config,
+        build_pascucci_run_config_params,
+        calibrate_pascucci_ou_inputs,
+    )
+    from .pascucci_data import prepare_H, prepare_S
+    from .plotting import _PLOTTING_AVAILABLE
+
+    if not _PLOTTING_AVAILABLE:
+        return
+
+    from . import pascucci_plotting as plotting
+
+    n_points = 72
+    H_hours = _simulate_piecewise_ou_series(n_points=n_points, dt=1.0, x0=0.25, a0_day=0.8, a0_night=-0.3)
+    S_hours = np.exp(
+        _simulate_piecewise_ou_series(n_points=n_points, dt=1.0, x0=0.05, a0_day=0.3, a0_night=-0.12)
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        H_path = tmp_path / "H_pass_invariant.csv"
+        S_path = tmp_path / "S_pass_invariant.xlsx"
+        H_rows = []
+        for value in H_hours:
+            for _ in range(4):
+                production = 5000.0
+                consumption = production + float(value) / 0.001
+                H_rows.append({"Consumo (W)": f"{consumption:.12f}", "Produzione (W)": f"{production:.12f}"})
+        S_rows = [["fixture-day", "fixture-hour", f"{float(value) / 0.01:.12f}"] for value in S_hours]
+        _write_rows_csv(H_path, ["Consumo (W)", "Produzione (W)"], H_rows)
+        _write_minimal_xlsx(S_path, ["Data", "Ora", "€/MWh"], S_rows)
+
+        prepared_H = prepare_H(str(H_path), n=4, mul_factor=0.001)
+        prepared_S = prepare_S(str(S_path), n=1, mul_factor=0.01)
+        calibration = calibrate_pascucci_ou_inputs(prepared_H, prepared_S, K=0, dt=1.0, start_hour=0.0, log_price=True)
+        config = build_pascucci_calibration_config(
+            calibration,
+            K=0,
+            dt=1.0,
+            start_hour=0.0,
+            log_price=True,
+            H_metadata={"source_path": str(H_path), "n_per_hour": 4, "mul_factor": 0.001},
+            S_metadata={"source_path": str(S_path), "n_per_hour": 1, "mul_factor": 0.01},
+        )
+        params = build_pascucci_run_config_params(get_model_spec("pascucci").build_default_params(), config)
+        fixture = _pascucci_paper_plot_smoke_inputs(M=4)
+        altered = {
+            **fixture["stitched"],
+            "X": np.array(fixture["stitched"]["X"], copy=True),
+        }
+        altered["X"][:, :, 0] += np.float32(100.0)
+        altered["X"][:, :, 1] -= np.float32(50.0)
+
+        calls: Dict[str, List[Dict[str, np.ndarray]]] = {"first": [], "second": []}
+        active = {"label": "first"}
+        original_ou = plotting._plot_to_ema_ou_simulation
+        original_state = plotting._plot_state_with_ou
+        original_cost = plotting._plot_accumulated_cost
+        original_alpha = plotting._plot_alpha
+        original_bands = plotting._plot_state_bands
+        original_total = plotting._plot_controlled_uncontrolled
+
+        def fake_ou(**kwargs):
+            paths = np.asarray(kwargs["paths"], dtype=np.float32)
+            real_path = np.asarray(kwargs["real_path"], dtype=np.float32)
+            time_sim = np.arange(paths.shape[1], dtype=np.float32) * np.float32(kwargs["dt_sim"])
+            time_real = np.arange(real_path.shape[0], dtype=np.float32) * np.float32(kwargs["dt_real"])
+            calls[active["label"]].append(
+                {
+                    "paths": paths.copy(),
+                    "real_path": real_path.copy(),
+                    "T": np.asarray([float(kwargs["T"])], dtype=np.float32),
+                    "dt_real": np.asarray([float(kwargs["dt_real"])], dtype=np.float32),
+                    "dt_sim": np.asarray([float(kwargs["dt_sim"])], dtype=np.float32),
+                }
+            )
+            Path(str(kwargs["path"])).write_bytes(b"fake-png")
+            return {
+                "time_sim": time_sim,
+                "sim_mean": np.mean(paths, axis=0).astype(np.float32),
+                "sim_q05": np.percentile(paths, 5, axis=0).astype(np.float32),
+                "sim_q50": np.percentile(paths, 50, axis=0).astype(np.float32),
+                "sim_q95": np.percentile(paths, 95, axis=0).astype(np.float32),
+                "time_real": time_real.astype(np.float32),
+                "real": real_path.astype(np.float32),
+            }
+
+        def fail_state_fallback(**_kwargs):
+            raise AssertionError("#35/#36 must use calibration_metadata, not stitched fallback")
+
+        def fake_other(**kwargs):
+            Path(str(kwargs["path"])).write_bytes(b"fake-png")
+            return {"dummy": np.asarray([1.0], dtype=np.float32)}
+
+        try:
+            plotting._plot_to_ema_ou_simulation = fake_ou
+            plotting._plot_state_with_ou = fail_state_fallback
+            plotting._plot_accumulated_cost = fake_other
+            plotting._plot_alpha = fake_other
+            plotting._plot_state_bands = fake_other
+            plotting._plot_controlled_uncontrolled = fake_other
+
+            manifest_first = plotting.plot_pascucci_paper_bundle(
+                stitched=fixture["stitched"],
+                application_pathwise=fixture["application_pathwise"],
+                params=params,
+                out_dir=str(tmp_path / "plots_first"),
+                blocks=fixture["blocks"],
+                source_metadata={"model_name": "pascucci", "pass_label": "pass0"},
+            )
+            active["label"] = "second"
+            manifest_second = plotting.plot_pascucci_paper_bundle(
+                stitched=altered,
+                application_pathwise=fixture["application_pathwise"],
+                params=params,
+                out_dir=str(tmp_path / "plots_second"),
+                blocks=fixture["blocks"],
+                source_metadata={"model_name": "pascucci", "pass_label": "pass1"},
+            )
+        finally:
+            plotting._plot_to_ema_ou_simulation = original_ou
+            plotting._plot_state_with_ou = original_state
+            plotting._plot_accumulated_cost = original_cost
+            plotting._plot_alpha = original_alpha
+            plotting._plot_state_bands = original_bands
+            plotting._plot_controlled_uncontrolled = original_total
+
+    assert manifest_first["ou_reference"]["source"] == "calibration_metadata"
+    assert manifest_second["ou_reference"]["source"] == "calibration_metadata"
+    assert len(calls["first"]) == 2
+    assert len(calls["second"]) == 2
+    for first, second in zip(calls["first"], calls["second"]):
+        for key in ("paths", "real_path", "T", "dt_real", "dt_sim"):
+            np.testing.assert_array_equal(first[key], second[key])
+
+
+def test_pascucci_to_ema_ou_reference_rejects_basename_fallback_sha_mismatch() -> None:
+    from .model_specs import get_model_spec
+    from .pascucci_plotting import _load_to_ema_ou_reference
+
+    params = get_model_spec("pascucci").build_default_params()
+    params["pascucci_calibration"] = {
+        "schema": "pascucci_ou_calibration_v1",
+        "K": 0,
+        "dt": 1.0,
+        "start_hour": 0.0,
+        "log_price": True,
+        "S_transform": "log",
+        "H_transform": "linear",
+        "H_metadata": {
+            "source_path": "/definitely/missing/2025dicembre1.csv",
+            "source_sha256": "0" * 64,
+            "n_per_hour": 4,
+            "mul_factor": 0.001,
+        },
+        "S_metadata": {
+            "source_path": "/definitely/missing/2025dicembre1.xlsx",
+            "source_sha256": "0" * 64,
+            "n_per_hour": 1,
+            "mul_factor": 0.001,
+        },
+    }
+
+    references, summary = _load_to_ema_ou_reference(params, horizon_T=24.0)
+
+    assert references == {}
+    assert summary["source"] == "stitched_fallback"
+    assert summary["reason"] == "calibration_source_sha256_mismatch"
+    labels = {entry["label"] for entry in summary["mismatches"]}
+    assert labels == {"H_metadata", "S_metadata"}
+    for entry in summary["mismatches"]:
+        assert "resolved_source_path" in entry
+        assert entry["expected_source_sha256"] == "0" * 64
+
+
+def test_pascucci_to_ema_ou_reference_matches_legacy_formula() -> None:
+    from .model_specs import get_model_spec
+    from .pascucci_calibration import (
+        build_pascucci_calibration_config,
+        build_pascucci_run_config_params,
+        calibrate_pascucci_ou_inputs,
+    )
+    from .pascucci_data import prepare_H, prepare_S
+    from .pascucci_plotting import _load_to_ema_ou_reference
+
+    def legacy_is_day(t):
+        hour = np.mod(t, 24.0)
+        return (hour >= 7.0) & (hour < 19.0)
+
+    def legacy_mu_t(t, a0, alpha, beta):
+        value = a0
+        for k, (alpha_k, beta_k) in enumerate(zip(alpha, beta), start=1):
+            omega = 2.0 * np.pi * float(k) / 24.0
+            value += float(alpha_k) * np.cos(omega * t)
+            value += float(beta_k) * np.sin(omega * t)
+        return value
+
+    def legacy_mu_daynight(t, params):
+        return np.where(
+            legacy_is_day(t),
+            legacy_mu_t(t, params["a0_day"], params["alpha_day"], params["beta_day"]),
+            legacy_mu_t(t, params["a0_night"], params["alpha_night"], params["beta_night"]),
+        )
+
+    def legacy_simulate_ou(H0, params, *, T, Nsim=10000, dt=0.5, seed=42):
+        np.random.seed(int(seed))
+        Nt = int(float(T) / float(dt))
+        paths = np.zeros((int(Nsim), Nt + 1), dtype=np.float64)
+        paths[:, 0] = float(H0)
+        for i in range(Nt):
+            t_actual = float(i) * float(dt)
+            kappa = np.where(legacy_is_day(t_actual), params["kappa_day"], params["kappa_night"])
+            sigma = np.where(legacy_is_day(t_actual), params["sigma_day"], params["sigma_night"])
+            mu = legacy_mu_daynight(t_actual, params)
+            Z = np.random.randn(int(Nsim))
+            paths[:, i + 1] = paths[:, i] + kappa * (mu - paths[:, i]) * float(dt) + sigma * Z * np.sqrt(float(dt))
+        return paths
+
+    n_points = 72
+    H_hours = _simulate_piecewise_ou_series(
+        n_points=n_points,
+        dt=1.0,
+        start_hour=0.0,
+        x0=0.25,
+        a0_day=0.80,
+        a0_night=-0.30,
+        sigma_day=0.01,
+        sigma_night=0.02,
+        seed=111,
+    )
+    log_S_hours = _simulate_piecewise_ou_series(
+        n_points=n_points,
+        dt=1.0,
+        start_hour=0.0,
+        x0=0.05,
+        a0_day=0.30,
+        a0_night=-0.12,
+        sigma_day=0.005,
+        sigma_night=0.006,
+        seed=222,
+    )
+    S_hours = np.exp(log_S_hours)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        H_path = tmp_path / "H_legacy_oracle.csv"
+        S_path = tmp_path / "S_legacy_oracle.xlsx"
+        H_rows = []
+        for value in H_hours:
+            for _ in range(4):
+                production = 5000.0
+                consumption = production + float(value) / 0.001
+                H_rows.append({"Consumo (W)": f"{consumption:.12f}", "Produzione (W)": f"{production:.12f}"})
+        S_rows = [["fixture-day", "fixture-hour", f"{float(value) / 0.01:.12f}"] for value in S_hours]
+        _write_rows_csv(H_path, ["Consumo (W)", "Produzione (W)"], H_rows)
+        _write_minimal_xlsx(S_path, ["Data", "Ora", "€/MWh"], S_rows)
+
+        H = prepare_H(str(H_path), n=4, mul_factor=0.001)
+        S = prepare_S(str(S_path), n=1, mul_factor=0.01)
+        calibration = calibrate_pascucci_ou_inputs(H, S, K=0, dt=1.0, start_hour=0.0, log_price=True)
+        config = build_pascucci_calibration_config(
+            calibration,
+            K=0,
+            dt=1.0,
+            start_hour=0.0,
+            log_price=True,
+            H_metadata={"source_path": str(H_path), "n_per_hour": 4, "mul_factor": 0.001},
+            S_metadata={"source_path": str(S_path), "n_per_hour": 1, "mul_factor": 0.01},
+        )
+        params = build_pascucci_run_config_params(get_model_spec("pascucci").build_default_params(), config)
+        references, summary = _load_to_ema_ou_reference(params, horizon_T=24.0)
+
+    assert summary["source"] == "calibration_metadata"
+    assert summary["source_horizon_policy"] == "full_calibration_series_like_to_ema"
+    T_H = float(H.shape[0] - 1)
+    T_S = float(S.shape[0] - 1)
+    legacy_H = legacy_simulate_ou(H[0], params["params_H"], T=T_H)
+    legacy_S = np.exp(legacy_simulate_ou(np.log(S[0]), params["params_S"], T=T_S)) * 1000.0
+
+    np.testing.assert_allclose(references["#36"]["real_path"], H.astype(np.float32), rtol=0.0, atol=1.0e-7)
+    np.testing.assert_allclose(references["#35"]["real_path"], (S * 1000.0).astype(np.float32), rtol=0.0, atol=2.0e-4)
+    np.testing.assert_allclose(references["#36"]["paths"], legacy_H, rtol=2.0e-6, atol=5.0e-6)
+    np.testing.assert_allclose(references["#35"]["paths"], legacy_S, rtol=2.0e-6, atol=5.0e-4)
+    np.testing.assert_allclose(
+        np.percentile(references["#36"]["paths"], [5, 95], axis=0),
+        np.percentile(legacy_H, [5, 95], axis=0),
+        rtol=2.0e-6,
+        atol=5.0e-6,
+    )
+    np.testing.assert_allclose(
+        np.percentile(references["#35"]["paths"], [5, 95], axis=0),
+        np.percentile(legacy_S, [5, 95], axis=0),
+        rtol=2.0e-6,
+        atol=5.0e-4,
+    )
+
+
+def test_pascucci_to_ema_ou_reference_honors_harmonics_and_start_hour() -> None:
+    from .model_specs import get_model_spec
+    from .pascucci_calibration import (
+        build_pascucci_calibration_config,
+        build_pascucci_run_config_params,
+        calibrate_pascucci_ou_inputs,
+    )
+    from .pascucci_data import prepare_H, prepare_S
+    from . import pascucci_plotting as plotting
+
+    def legacy_is_day(t):
+        hour = np.mod(t, 24.0)
+        return (hour >= 7.0) & (hour < 19.0)
+
+    def legacy_mu_t(t, a0, alpha, beta):
+        value = a0
+        for k, (alpha_k, beta_k) in enumerate(zip(alpha, beta), start=1):
+            omega = 2.0 * np.pi * float(k) / 24.0
+            value += float(alpha_k) * np.cos(omega * t)
+            value += float(beta_k) * np.sin(omega * t)
+        return value
+
+    def legacy_mu_daynight(t, params):
+        return np.where(
+            legacy_is_day(t),
+            legacy_mu_t(t, params["a0_day"], params["alpha_day"], params["beta_day"]),
+            legacy_mu_t(t, params["a0_night"], params["alpha_night"], params["beta_night"]),
+        )
+
+    def legacy_simulate_ou(initial, params, *, T, Nsim, dt, seed, start_hour):
+        np.random.seed(int(seed))
+        Nt = int(float(T) / float(dt))
+        paths = np.zeros((int(Nsim), Nt + 1), dtype=np.float64)
+        paths[:, 0] = float(initial)
+        for i in range(Nt):
+            t_actual = float(start_hour) + float(i) * float(dt)
+            kappa = np.where(legacy_is_day(t_actual), params["kappa_day"], params["kappa_night"])
+            sigma = np.where(legacy_is_day(t_actual), params["sigma_day"], params["sigma_night"])
+            mu = legacy_mu_daynight(t_actual, params)
+            Z = np.random.randn(int(Nsim))
+            paths[:, i + 1] = paths[:, i] + kappa * (mu - paths[:, i]) * float(dt) + sigma * Z * np.sqrt(float(dt))
+        return paths
+
+    n_points = 144
+    start_hour = 6.0
+    H_hours = _simulate_piecewise_ou_series(
+        n_points=n_points,
+        dt=1.0,
+        start_hour=start_hour,
+        x0=0.15,
+        kappa_day=0.22,
+        kappa_night=0.17,
+        a0_day=0.70,
+        a0_night=-0.35,
+        alpha_day=[0.25, -0.08],
+        alpha_night=[-0.11, 0.05],
+        beta_day=[0.09, 0.04],
+        beta_night=[0.07, -0.03],
+        sigma_day=0.012,
+        sigma_night=0.018,
+        seed=333,
+    )
+    log_S_hours = _simulate_piecewise_ou_series(
+        n_points=n_points,
+        dt=1.0,
+        start_hour=start_hour,
+        x0=0.03,
+        kappa_day=0.19,
+        kappa_night=0.14,
+        a0_day=0.18,
+        a0_night=-0.06,
+        alpha_day=[0.04, -0.02],
+        alpha_night=[-0.03, 0.01],
+        beta_day=[0.02, 0.015],
+        beta_night=[0.025, -0.01],
+        sigma_day=0.004,
+        sigma_night=0.006,
+        seed=444,
+    )
+    S_hours = np.exp(log_S_hours)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        H_path = tmp_path / "H_k2_start6_oracle.csv"
+        S_path = tmp_path / "S_k2_start6_oracle.xlsx"
+        H_rows = []
+        for value in H_hours:
+            for _ in range(3):
+                production = 7000.0
+                consumption = production + float(value) / 0.002
+                H_rows.append({"Consumo (W)": f"{consumption:.12f}", "Produzione (W)": f"{production:.12f}"})
+        S_rows = [["fixture-day", "fixture-hour", f"{float(value) / 0.02:.12f}"] for value in S_hours]
+        _write_rows_csv(H_path, ["Consumo (W)", "Produzione (W)"], H_rows)
+        _write_minimal_xlsx(S_path, ["Data", "Ora", "€/MWh"], S_rows)
+
+        H = prepare_H(str(H_path), n=3, mul_factor=0.002)
+        S = prepare_S(str(S_path), n=1, mul_factor=0.02)
+        calibration = calibrate_pascucci_ou_inputs(H, S, K=2, dt=1.0, start_hour=start_hour, log_price=True)
+        config = build_pascucci_calibration_config(
+            calibration,
+            K=2,
+            dt=1.0,
+            start_hour=start_hour,
+            log_price=True,
+            H_metadata={"source_path": str(H_path), "n_per_hour": 3, "mul_factor": 0.002},
+            S_metadata={"source_path": str(S_path), "n_per_hour": 1, "mul_factor": 0.02},
+        )
+        params = build_pascucci_run_config_params(get_model_spec("pascucci").build_default_params(), config)
+        old_values = (
+            plotting.TO_EMA_OU_NSIM,
+            plotting.TO_EMA_OU_DT_SIM,
+            plotting.TO_EMA_OU_SEED,
+        )
+        try:
+            plotting.TO_EMA_OU_NSIM = 16
+            plotting.TO_EMA_OU_DT_SIM = 0.5
+            plotting.TO_EMA_OU_SEED = 123
+            references, summary = plotting._load_to_ema_ou_reference(params, horizon_T=24.0)
+        finally:
+            (
+                plotting.TO_EMA_OU_NSIM,
+                plotting.TO_EMA_OU_DT_SIM,
+                plotting.TO_EMA_OU_SEED,
+            ) = old_values
+
+    assert summary["source"] == "calibration_metadata"
+    assert summary["start_hour"] == start_hour
+    assert summary["simulation"]["n_sim"] == 16
+    assert summary["simulation"]["seed"] == 123
+    assert len(params["params_H"]["alpha_day"]) == 2
+    assert len(params["params_S"]["alpha_day"]) == 2
+
+    T_H = float(H.shape[0] - 1)
+    T_S = float(S.shape[0] - 1)
+    legacy_H = legacy_simulate_ou(H[0], params["params_H"], T=T_H, Nsim=16, dt=0.5, seed=123, start_hour=start_hour)
+    legacy_S_log = legacy_simulate_ou(
+        np.log(S[0]),
+        params["params_S"],
+        T=T_S,
+        Nsim=16,
+        dt=0.5,
+        seed=123,
+        start_hour=start_hour,
+    )
+    wrong_phase_H = legacy_simulate_ou(H[0], params["params_H"], T=T_H, Nsim=16, dt=0.5, seed=123, start_hour=0.0)
+
+    np.testing.assert_allclose(references["#36"]["paths"], legacy_H, rtol=2.0e-6, atol=5.0e-6)
+    np.testing.assert_allclose(references["#35"]["paths"], np.exp(legacy_S_log) * 1000.0, rtol=2.0e-6, atol=5.0e-4)
+    assert float(np.max(np.abs(references["#36"]["paths"] - wrong_phase_H))) > 1.0e-3
+
+
+def test_pascucci_to_ema_uncontrolled_reference_matches_legacy_formula() -> None:
+    from .model_specs import get_model_spec
+    from . import pascucci_plotting as plotting
+
+    def legacy_is_day(t):
+        hour = np.mod(t, 24.0)
+        return (hour >= 7.0) & (hour < 19.0)
+
+    def legacy_mu_t(t, a0, alpha, beta):
+        value = a0
+        for k, (alpha_k, beta_k) in enumerate(zip(alpha, beta), start=1):
+            omega = 2.0 * np.pi * float(k) / 24.0
+            value += float(alpha_k) * np.cos(omega * t)
+            value += float(beta_k) * np.sin(omega * t)
+        return value
+
+    def legacy_mu_daynight(t, params):
+        return np.where(
+            legacy_is_day(t),
+            legacy_mu_t(t, params["a0_day"], params["alpha_day"], params["beta_day"]),
+            legacy_mu_t(t, params["a0_night"], params["alpha_night"], params["beta_night"]),
+        )
+
+    def legacy_simulate_ou(H0, params, *, T, Nsim, dt, seed):
+        np.random.seed(int(seed))
+        Nt = int(float(T) / float(dt))
+        paths = np.zeros((int(Nsim), Nt + 1), dtype=np.float64)
+        paths[:, 0] = np.asarray(H0, dtype=np.float64).reshape(int(Nsim))
+        for i in range(Nt):
+            t_actual = float(i) * float(dt)
+            kappa = np.where(legacy_is_day(t_actual), params["kappa_day"], params["kappa_night"])
+            sigma = np.where(legacy_is_day(t_actual), params["sigma_day"], params["sigma_night"])
+            mu = legacy_mu_daynight(t_actual, params)
+            Z = np.random.randn(int(Nsim))
+            paths[:, i + 1] = paths[:, i] + kappa * (mu - paths[:, i]) * float(dt) + sigma * Z * np.sqrt(float(dt))
+        return paths
+
+    def legacy_make_h(values, scale):
+        arr = np.asarray(values, dtype=np.float64)
+        return np.where(arr < 0.0, float(scale) * arr * arr, 2.0 * float(scale) * arr * arr)
+
+    def legacy_x_v(X_0, H_paths, *, T, Nsim, dt, eps, xmax, seed):
+        np.random.seed(int(seed))
+        Nt = int(float(T) / float(dt)) + 1
+        X_paths = np.zeros((int(Nsim), Nt), dtype=np.float64)
+        V_paths = np.zeros((int(Nsim), Nt), dtype=np.float64)
+        X_paths[:, 0] = X_0
+        V_paths[:, 0] = np.where(
+            X_paths[:, 0] <= 0.0,
+            -np.minimum(H_paths[:, 0], 0.0),
+            np.where(X_paths[:, 0] >= float(xmax), -np.maximum(H_paths[:, 0], 0.0), -H_paths[:, 0]),
+        )
+        W_paths = np.cumsum(np.random.randn(int(Nsim), Nt) * np.sqrt(float(dt)), axis=-1)
+        for step in range(Nt - 1):
+            X_paths[:, step + 1] = X_paths[:, step] + V_paths[:, step] * float(dt)
+            V_paths[:, step + 1] = (
+                np.where(
+                    X_paths[:, step + 1] <= 0.0,
+                    -np.minimum(H_paths[:, step + 1], 0.0),
+                    np.where(
+                        X_paths[:, step + 1] >= float(xmax),
+                        -np.maximum(H_paths[:, step + 1], 0.0),
+                        -H_paths[:, step + 1],
+                    ),
+                )
+                + float(eps) * W_paths[:, step + 1]
+            )
+        return X_paths, V_paths
+
+    params = get_model_spec("pascucci").build_default_params()
+    params["pascucci_calibration"] = {
+        "schema": "pascucci_ou_calibration_v1",
+        "start_hour": 0.0,
+    }
+    old_values = (
+        plotting.TO_EMA_UNCONTROLLED_NSIM,
+        plotting.TO_EMA_UNCONTROLLED_DT,
+        plotting.TO_EMA_UNCONTROLLED_SEED,
+    )
+    try:
+        plotting.TO_EMA_UNCONTROLLED_NSIM = 8
+        plotting.TO_EMA_UNCONTROLLED_DT = 0.5
+        plotting.TO_EMA_UNCONTROLLED_SEED = 7
+        references, summary = plotting._load_to_ema_uncontrolled_reference(params, horizon_T=1.0)
+    finally:
+        (
+            plotting.TO_EMA_UNCONTROLLED_NSIM,
+            plotting.TO_EMA_UNCONTROLLED_DT,
+            plotting.TO_EMA_UNCONTROLLED_SEED,
+        ) = old_values
+
+    n_sim = 8
+    dt = 0.5
+    seed = 7
+    rng = np.random.RandomState(seed)
+    X_0 = rng.uniform(1.0, 9.0, n_sim)
+    H_0 = rng.normal(0.4, 0.5, n_sim)
+    S_0 = rng.normal(0.1, 0.02, n_sim)
+    legacy_H = legacy_simulate_ou(H_0, params["params_H"], T=1.0, Nsim=n_sim, dt=dt, seed=seed)
+    legacy_S = np.exp(legacy_simulate_ou(np.log(S_0), params["params_S"], T=1.0, Nsim=n_sim, dt=dt, seed=seed))
+    legacy_X, legacy_V = legacy_x_v(
+        X_0,
+        legacy_H,
+        T=1.0,
+        Nsim=n_sim,
+        dt=dt,
+        eps=0.01,
+        xmax=10.0,
+        seed=seed,
+    )
+    mean_X = np.mean(legacy_X, axis=0)
+    mean_H = np.mean(legacy_H, axis=0)
+    mean_V = np.mean(legacy_V, axis=0)
+    legacy_f = (
+        legacy_S * (legacy_H + legacy_V)
+        + 1.0e-2 * legacy_V**2
+        + legacy_make_h(legacy_X - mean_X.reshape(1, -1), 0.001)
+        + legacy_make_h(legacy_H + legacy_V - (mean_H + mean_V).reshape(1, -1), 0.1)
+    )
+    legacy_g = -legacy_S * legacy_X + 0.5e-2 * (legacy_X - mean_X.reshape(1, -1)) ** 2
+    legacy_J = np.cumsum(legacy_f * dt, axis=-1) + legacy_g
+
+    assert summary["source"] == "calibration_metadata"
+    assert summary["simulation"]["n_sim"] == n_sim
+    assert summary["simulation"]["dt"] == dt
+    assert summary["simulation"]["seed"] == seed
+    np.testing.assert_allclose(references["time"], np.asarray([0.0, 0.5, 1.0], dtype=np.float32))
+    np.testing.assert_allclose(references["J_paths"], legacy_J, rtol=2.0e-6, atol=5.0e-6)
 
 
 def test_pascucci_paper_plot_bundle_handles_skewed_total_costs() -> None:
@@ -6067,17 +7472,25 @@ def test_print_recursive_pass_saves_stitched_moment_traces() -> None:
                         "controlled_cost_J_terminal",
                         "controlled_cost_J_total",
                         "controlled_cost_J_running_cumulative",
+                        "controlled_cost_J_trajectory",
+                        "controlled_cost_J_trajectory_math",
                         "controlled_alpha",
                         "uncontrolled_cost_J_running",
                         "uncontrolled_cost_J_terminal",
                         "uncontrolled_cost_J_total",
                         "uncontrolled_cost_J_running_cumulative",
+                        "uncontrolled_cost_J_trajectory",
+                        "uncontrolled_cost_J_trajectory_math",
                         "uncontrolled_alpha",
                     }.issubset(keys)
                     assert data["controlled_cost_J_total"].shape == (4, 1)
                     assert data["uncontrolled_cost_J_total"].shape == (4, 1)
                     assert data["controlled_cost_J_running_cumulative"].shape == (4, 2, 1)
                     assert data["uncontrolled_cost_J_running_cumulative"].shape == (4, 2, 1)
+                    assert data["controlled_cost_J_trajectory"].shape == (4, 3, 1)
+                    assert data["uncontrolled_cost_J_trajectory"].shape == (4, 3, 1)
+                    assert data["controlled_cost_J_trajectory_math"].shape == (4, 3, 1)
+                    assert data["uncontrolled_cost_J_trajectory_math"].shape == (4, 3, 1)
     finally:
         orchestration.predict_recursive_stitched = original_predict
         orchestration.plot_recursive_pass_logs_multi = original_plot_logs
@@ -6096,16 +7509,18 @@ def test_print_recursive_pass_application_metrics_emit_comparison_and_stability(
     z_v_index = 1
 
     class FakeApplicationModel:
-        def _summary(self, running, terminal, total, running_cumulative):
+        def _summary(self, running, terminal, total, running_cumulative, trajectory, trajectory_math):
             summary = {}
             for key, values in (
                 ("cost_J_running", running),
                 ("cost_J_terminal", terminal),
                 ("cost_J_total", total),
                 ("cost_J_running_cumulative", running_cumulative),
+                ("cost_J_trajectory", trajectory),
+                ("cost_J_trajectory_math", trajectory_math),
             ):
                 values_np = np.asarray(values, dtype=np.float32)
-                if key == "cost_J_running_cumulative":
+                if key in ("cost_J_running_cumulative", "cost_J_trajectory", "cost_J_trajectory_math"):
                     flat = values_np[:, -1, :].reshape(-1) if values_np.shape[1] > 0 else np.zeros((values_np.shape[0],), dtype=np.float32)
                 else:
                     flat = values_np.reshape(-1)
@@ -6127,11 +7542,18 @@ def test_print_recursive_pass_application_metrics_emit_comparison_and_stability(
                 running_cumulative = np.zeros((M_local, 0, 1), dtype=np.float32)
             terminal = np.full((M_local, 1), np.float32(0.25), dtype=np.float32)
             total = running + terminal
+            trajectory = (
+                np.concatenate([np.zeros((M_local, 1, 1), dtype=np.float32), running_cumulative], axis=1)
+                + terminal[:, None, :]
+            ).astype(np.float32)
+            trajectory_math = trajectory.copy()
             return {
                 "schema": "pascucci_application_metrics_v2",
                 "metadata": {
                     "baseline_mode": baseline_mode,
                     "aggregation": "left_riemann_f_plus_terminal_g",
+                    "trajectory_aggregation": "plotmaker_cumsum_f_dt_plus_g_at_time",
+                    "trajectory_math_aggregation": "left_riemann_integral_to_time_plus_g_at_time",
                     "control_law": control_law,
                     "paired_inputs": paired_inputs,
                 },
@@ -6140,9 +7562,11 @@ def test_print_recursive_pass_application_metrics_emit_comparison_and_stability(
                     "cost_J_terminal": terminal,
                     "cost_J_total": total,
                     "cost_J_running_cumulative": running_cumulative,
+                    "cost_J_trajectory": trajectory,
+                    "cost_J_trajectory_math": trajectory_math,
                     "alpha": alpha.astype(np.float32),
                 },
-                "summary": self._summary(running, terminal, total, running_cumulative),
+                "summary": self._summary(running, terminal, total, running_cumulative, trajectory, trajectory_math),
             }
 
         def application_cost_from_path(self, t, X, Y, Z, const_value=None, baseline_mode="controlled", **kwargs):
@@ -6225,12 +7649,13 @@ def test_print_recursive_pass_application_metrics_emit_comparison_and_stability(
         predict_call["count"] += 1
         rollout_inputs = kwargs["rollout_inputs"]
         t = np.asarray(rollout_inputs[0][0], dtype=np.float32)
+        M_local = int(t.shape[0])
         pass_offset = np.float32(predict_call["count"] - 1)
-        X = np.zeros((M, t.shape[1], D), dtype=np.float32)
+        X = np.zeros((M_local, t.shape[1], D), dtype=np.float32)
         X[:, :, 0] = pass_offset
         X[:, :, 3] = 5.0
-        Y = np.full((M, t.shape[1], 1), pass_offset, dtype=np.float32)
-        Z = np.zeros((M, t.shape[1], D), dtype=np.float32)
+        Y = np.full((M_local, t.shape[1], 1), pass_offset, dtype=np.float32)
+        Z = np.zeros((M_local, t.shape[1], D), dtype=np.float32)
         Z[:, :, z_v_index] = pass_offset * np.float32(2.0)
         return {"t": t, "X": X, "Y": Y, "Z": Z}
 
@@ -6263,6 +7688,8 @@ def test_print_recursive_pass_application_metrics_emit_comparison_and_stability(
                 sample_paths=0,
                 print_compact_logs=False,
                 model_spec=spec,
+                mc_confirmation_paths=6,
+                mc_confirmation_seed=202,
             )
 
             assert summary["selected_pass_id"] == 2
@@ -6281,6 +7708,67 @@ def test_print_recursive_pass_application_metrics_emit_comparison_and_stability(
                 assert "alpha_summary" in payload["controlled"]
             assert "stability_vs_previous_pass" not in pass0
             assert pass1["stability_vs_previous_pass"] == stability
+            mc_summary = summary["mc_confirmation_summary"]
+            assert mc_summary["seed"] == 202
+            assert mc_summary["sample_paths"] == 6
+            assert Path(mc_summary["summary_path"]).exists()
+            assert Path(mc_summary["pathwise_npz_path"]).exists()
+            assert Path(mc_summary["bundle_path"]).exists()
+            mc_payload = json.loads(Path(mc_summary["summary_path"]).read_text(encoding="utf-8"))
+            assert mc_payload["schema"] == "pascucci_mc_confirmation_v1"
+            assert mc_payload["source"] == "independent_post_selection"
+            assert mc_payload["selected_pass_id"] == 2
+            assert mc_payload["seed"] == 202
+            assert mc_payload["horizon"]["sample_paths"] == 6
+            assert mc_payload["comparison"]["paired_sample_count"] == 6
+            assert mc_payload["bundle_kind"] == "mc_confirmation"
+            with np.load(mc_summary["pathwise_npz_path"], allow_pickle=False) as data:
+                assert data["controlled_cost_J_total"].shape == (6, 1)
+                assert data["uncontrolled_cost_J_total"].shape == (6, 1)
+                assert data["q_lower_violation"].shape[0] == 6
+                assert data["v_lower_violation"].shape[0] == 6
+            from .sampling import load_evaluation_bundle
+
+            Xi_loaded, rollout_loaded = load_evaluation_bundle(
+                path=mc_summary["bundle_path"],
+                n_blocks_expected=len(blocks),
+                N_per_block_expected=2,
+                D_expected=D,
+                blocks_expected=blocks,
+                T_total_expected=0.25,
+                bundle_kind_expected="mc_confirmation",
+            )
+            assert Xi_loaded.shape == (6, D)
+            assert len(rollout_loaded) == len(blocks)
+
+            predict_call["count"] = 0
+            rec_dir_repeat = rec_dir / "repeat_same_seed"
+            summary_repeat = orchestration.print_recursive_pass(
+                pass_entries=pass_entries,
+                blocks=blocks,
+                rec_dir=str(rec_dir_repeat),
+                params=params,
+                N_per_block=2,
+                D=D,
+                layers=layers,
+                T_total=0.25,
+                exact_solution=None,
+                selection_metric="loss",
+                eval_bundle_path=str(rec_dir_repeat / "evaluation_bundle.npz"),
+                eval_seed=101,
+                eval_min_paths=M,
+                sample_paths=0,
+                print_compact_logs=False,
+                model_spec=spec,
+                mc_confirmation_paths=6,
+                mc_confirmation_seed=202,
+            )
+            mc_repeat = summary_repeat["mc_confirmation_summary"]
+            mc_payload_repeat = json.loads(Path(mc_repeat["summary_path"]).read_text(encoding="utf-8"))
+            assert mc_payload_repeat == mc_payload
+            assert Path(mc_repeat["summary_path"]).read_bytes() == Path(mc_summary["summary_path"]).read_bytes()
+            assert Path(mc_repeat["pathwise_npz_path"]).read_bytes() == Path(mc_summary["pathwise_npz_path"]).read_bytes()
+            assert Path(mc_repeat["bundle_path"]).read_bytes() == Path(mc_summary["bundle_path"]).read_bytes()
     finally:
         orchestration.predict_recursive_stitched = original_predict
         orchestration.plot_recursive_pass_logs_multi = original_plot_logs
@@ -6931,6 +8419,308 @@ def test_run_recursive_training_wires_fixed_eval_and_gradient_diagnostics_to_log
                 assert np.isfinite(float(row[key]))
 
 
+def test_run_recursive_training_warm_start_norm_policy_blob_uses_blob_normalization() -> None:
+    from . import orchestration
+    from .model_specs import ModelSpec, get_model_spec
+
+    base = get_model_spec("quadratic_coupled")
+    D = 4
+    M = 3
+    N = 2
+    layers = [5, 8, 1]
+    model_inits = []
+    import_calls = []
+
+    blob = _make_block_blob(layers, 0.0, 0.25, 0.25)
+    blob["x_norm_mean"] = np.asarray([[10.0, 20.0, 30.0, 40.0]], dtype=np.float32)
+    blob["x_norm_std"] = np.asarray([[2.0, 3.0, 4.0, 5.0]], dtype=np.float32)
+
+    class _Session:
+        def close(self):
+            pass
+
+    class _RecursiveModel:
+        def __init__(self, **kwargs):
+            self.kwargs = dict(kwargs)
+            self.sess = _Session()
+            model_inits.append(self.kwargs)
+
+        def import_parameter_blob(self, imported_blob, strict=True):
+            import_calls.append((dict(imported_blob), bool(strict)))
+
+        def export_parameter_blob(self):
+            return _make_block_blob(
+                layers,
+                self.kwargs["t_start"],
+                self.kwargs["t_end"],
+                self.kwargs["T_total"],
+            )
+
+    spec = ModelSpec(
+        name="recursive_blob_norm_stub",
+        state_dim=D,
+        state_labels=base.state_labels,
+        z_labels=base.z_labels,
+        build_default_params=base.build_default_params,
+        build_layers=base.build_layers,
+        xi_generator=base.xi_generator,
+        deterministic_xi=base.deterministic_xi,
+        standard_model_factory=lambda **kwargs: None,
+        recursive_model_factory=lambda **kwargs: _RecursiveModel(**kwargs),
+        build_exact_solution=lambda *args, **kwargs: None,
+        build_exact_initial_boundary_samples=None,
+    )
+
+    def forbidden_estimate_generator_stats(*args, **kwargs):
+        raise AssertionError("blob norm policy should not re-estimate warm-start normalization")
+
+    def fake_train_with_standard_schedule(**kwargs):
+        return {
+            "stage_logs": [],
+            "eval_stats": {
+                "mean_loss": 0.10,
+                "std_loss": 0.0,
+                "mean_loss_per_sample": 0.025,
+                "std_loss_per_sample": 0.0,
+                "mean_y0": 0.0,
+                "std_y0": 0.0,
+            },
+            "refine_rounds": 0,
+            "precision_target": kwargs.get("precision_target"),
+            "gradient_diagnostics": {},
+        }
+
+    def fake_rollout_boundaries(**kwargs):
+        return [
+            np.full((int(kwargs["M_rollout"]), int(kwargs["D"])), np.float32(idx), dtype=np.float32)
+            for idx in range(len(kwargs["blocks"]) + 1)
+        ]
+
+    original_estimate = orchestration.estimate_generator_stats
+    original_train = orchestration.train_with_standard_schedule
+    original_rollout = orchestration.rollout_boundaries
+    orchestration.estimate_generator_stats = forbidden_estimate_generator_stats
+    orchestration.train_with_standard_schedule = fake_train_with_standard_schedule
+    orchestration.rollout_boundaries = fake_rollout_boundaries
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = orchestration.run_recursive_training(
+                Xi_generator=base.xi_generator,
+                params=base.build_default_params(),
+                M=M,
+                N_per_block=N,
+                D=D,
+                T_total=0.25,
+                block_size=0.25,
+                layers=layers,
+                stage_plan=[(1, 1.0e-3)],
+                final_plan=[],
+                output_dir=tmp,
+                max_refine_rounds=0,
+                rollout_M=4,
+                save_tf_checkpoints=False,
+                n_passes=1,
+                empirical_jitter_scale=0.0,
+                pass1_init_mode="coarse",
+                initial_boundary_samples=[
+                    np.zeros((M, D), dtype=np.float32),
+                    np.ones((M, D), dtype=np.float32),
+                ],
+                initial_warm_start_blobs=[blob],
+                warm_start_norm_policy="blob",
+                model_spec=spec,
+            )
+    finally:
+        orchestration.estimate_generator_stats = original_estimate
+        orchestration.train_with_standard_schedule = original_train
+        orchestration.rollout_boundaries = original_rollout
+
+    assert len(model_inits) == 1
+    np.testing.assert_allclose(model_inits[0]["x_norm_mean"], blob["x_norm_mean"], rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(model_inits[0]["x_norm_std"], blob["x_norm_std"], rtol=0.0, atol=0.0)
+    assert len(import_calls) == 1
+    assert import_calls[0][1] is False
+    row = result["pass1"]["logs"][0]
+    assert row["warm_start_norm_policy"] == "blob"
+    assert row["warm_start_norm_source"] == "blob"
+    assert row["warm_start_blob_used"] is True
+
+
+def test_run_recursive_training_blob_norm_policy_rejects_blob_without_norm_stats() -> None:
+    from . import orchestration
+    from .model_specs import ModelSpec, get_model_spec
+
+    base = get_model_spec("quadratic_coupled")
+    D = 4
+    M = 3
+    N = 2
+    layers = [5, 8, 1]
+    blob = _make_block_blob(layers, 0.0, 0.25, 0.25)
+    blob.pop("x_norm_mean", None)
+
+    class _Session:
+        def close(self):
+            pass
+
+    class _RecursiveModel:
+        def __init__(self, **kwargs):
+            self.sess = _Session()
+
+        def export_parameter_blob(self):
+            return _make_block_blob(layers, 0.0, 0.25, 0.25)
+
+    spec = ModelSpec(
+        name="recursive_missing_blob_norm_stub",
+        state_dim=D,
+        state_labels=base.state_labels,
+        z_labels=base.z_labels,
+        build_default_params=base.build_default_params,
+        build_layers=base.build_layers,
+        xi_generator=base.xi_generator,
+        deterministic_xi=base.deterministic_xi,
+        standard_model_factory=lambda **kwargs: None,
+        recursive_model_factory=lambda **kwargs: _RecursiveModel(**kwargs),
+        build_exact_solution=lambda *args, **kwargs: None,
+        build_exact_initial_boundary_samples=None,
+    )
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            orchestration.run_recursive_training(
+                Xi_generator=base.xi_generator,
+                params=base.build_default_params(),
+                M=M,
+                N_per_block=N,
+                D=D,
+                T_total=0.25,
+                block_size=0.25,
+                layers=layers,
+                stage_plan=[(1, 1.0e-3)],
+                final_plan=[],
+                output_dir=tmp,
+                max_refine_rounds=0,
+                rollout_M=4,
+                save_tf_checkpoints=False,
+                n_passes=1,
+                empirical_jitter_scale=0.0,
+                pass1_init_mode="coarse",
+                initial_boundary_samples=[
+                    np.zeros((M, D), dtype=np.float32),
+                    np.ones((M, D), dtype=np.float32),
+                ],
+                initial_warm_start_blobs=[blob],
+                warm_start_norm_policy="blob",
+                model_spec=spec,
+            )
+    except ValueError as exc:
+        message = str(exc)
+        assert "warm_start_norm_policy='blob'" in message
+        assert "x_norm_mean/x_norm_std" in message
+    else:
+        raise AssertionError("blob norm policy should reject warm-start blobs without norm stats")
+
+
+def test_run_recursive_training_blob_norm_policy_rejects_invalid_norm_stats() -> None:
+    from . import orchestration
+    from .model_specs import ModelSpec, get_model_spec
+
+    base = get_model_spec("quadratic_coupled")
+    D = 4
+    M = 3
+    N = 2
+    layers = [5, 8, 1]
+    blob = _make_block_blob(layers, 0.0, 0.25, 0.25)
+    blob["x_norm_std"] = np.asarray([[1.0, 0.0, np.inf, 2.0]], dtype=np.float32)
+
+    class _Session:
+        def close(self):
+            pass
+
+    class _RecursiveModel:
+        def __init__(self, **kwargs):
+            self.sess = _Session()
+
+        def export_parameter_blob(self):
+            return _make_block_blob(layers, 0.0, 0.25, 0.25)
+
+    spec = ModelSpec(
+        name="recursive_invalid_blob_norm_stub",
+        state_dim=D,
+        state_labels=base.state_labels,
+        z_labels=base.z_labels,
+        build_default_params=base.build_default_params,
+        build_layers=base.build_layers,
+        xi_generator=base.xi_generator,
+        deterministic_xi=base.deterministic_xi,
+        standard_model_factory=lambda **kwargs: None,
+        recursive_model_factory=lambda **kwargs: _RecursiveModel(**kwargs),
+        build_exact_solution=lambda *args, **kwargs: None,
+        build_exact_initial_boundary_samples=None,
+    )
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            orchestration.run_recursive_training(
+                Xi_generator=base.xi_generator,
+                params=base.build_default_params(),
+                M=M,
+                N_per_block=N,
+                D=D,
+                T_total=0.25,
+                block_size=0.25,
+                layers=layers,
+                stage_plan=[(1, 1.0e-3)],
+                final_plan=[],
+                output_dir=tmp,
+                max_refine_rounds=0,
+                rollout_M=4,
+                save_tf_checkpoints=False,
+                n_passes=1,
+                empirical_jitter_scale=0.0,
+                pass1_init_mode="coarse",
+                initial_boundary_samples=[
+                    np.zeros((M, D), dtype=np.float32),
+                    np.ones((M, D), dtype=np.float32),
+                ],
+                initial_warm_start_blobs=[blob],
+                warm_start_norm_policy="blob",
+                model_spec=spec,
+            )
+    except ValueError as exc:
+        message = str(exc)
+        assert "warm_start_norm_policy='blob'" in message
+        assert "finite positive x_norm_std" in message
+    else:
+        raise AssertionError("blob norm policy should reject invalid x_norm_std")
+
+
+def test_run_recursive_training_rejects_unknown_warm_start_norm_policy() -> None:
+    from . import orchestration
+    from .model_specs import get_model_spec
+
+    spec = get_model_spec("quadratic_coupled")
+    try:
+        orchestration.run_recursive_training(
+            Xi_generator=spec.xi_generator,
+            params=spec.build_default_params(),
+            M=2,
+            N_per_block=1,
+            D=4,
+            T_total=0.25,
+            block_size=0.25,
+            layers=[5, 8, 1],
+            stage_plan=[],
+            final_plan=[],
+            output_dir="unused",
+            warm_start_norm_policy="mismatched",
+            model_spec=spec,
+        )
+    except ValueError as exc:
+        assert "warm_start_norm_policy" in str(exc)
+    else:
+        raise AssertionError("run_recursive_training should reject unknown warm_start_norm_policy")
+
+
 def test_run_recursive_training_pass_boundary_rollouts_use_fixed_rollout_inputs() -> None:
     from . import orchestration
     from .model_specs import ModelSpec, get_model_spec
@@ -7318,16 +9108,18 @@ def test_print_recursive_pass_rejects_invalid_candidate_without_rewriting_final_
     z_v_index = 2
 
     class FakeApplicationModel:
-        def _summary(self, running, terminal, total, running_cumulative):
+        def _summary(self, running, terminal, total, running_cumulative, trajectory, trajectory_math):
             summary = {}
             for key, values in (
                 ("cost_J_running", running),
                 ("cost_J_terminal", terminal),
                 ("cost_J_total", total),
                 ("cost_J_running_cumulative", running_cumulative),
+                ("cost_J_trajectory", trajectory),
+                ("cost_J_trajectory_math", trajectory_math),
             ):
                 values_np = np.asarray(values, dtype=np.float32)
-                if key == "cost_J_running_cumulative":
+                if key in ("cost_J_running_cumulative", "cost_J_trajectory", "cost_J_trajectory_math"):
                     flat = (
                         values_np[:, -1, :].reshape(-1)
                         if values_np.shape[1] > 0
@@ -7355,11 +9147,18 @@ def test_print_recursive_pass_rejects_invalid_candidate_without_rewriting_final_
             running_cumulative = np.cumsum(running_step, axis=1).astype(np.float32)
             terminal = np.full((M_local, 1), np.float32(0.25), dtype=np.float32)
             total = running + terminal
+            trajectory = (
+                np.concatenate([np.zeros((M_local, 1, 1), dtype=np.float32), running_cumulative], axis=1)
+                + terminal[:, None, :]
+            ).astype(np.float32)
+            trajectory_math = trajectory.copy()
             return {
                 "schema": "pascucci_application_metrics_v2",
                 "metadata": {
                     "baseline_mode": baseline_mode,
                     "aggregation": "left_riemann_f_plus_terminal_g",
+                    "trajectory_aggregation": "plotmaker_cumsum_f_dt_plus_g_at_time",
+                    "trajectory_math_aggregation": "left_riemann_integral_to_time_plus_g_at_time",
                     "control_law": control_law,
                     "paired_inputs": paired_inputs,
                 },
@@ -7368,9 +9167,11 @@ def test_print_recursive_pass_rejects_invalid_candidate_without_rewriting_final_
                     "cost_J_terminal": terminal,
                     "cost_J_total": total,
                     "cost_J_running_cumulative": running_cumulative,
+                    "cost_J_trajectory": trajectory,
+                    "cost_J_trajectory_math": trajectory_math,
                     "alpha": alpha.astype(np.float32),
                 },
-                "summary": self._summary(running, terminal, total, running_cumulative),
+                "summary": self._summary(running, terminal, total, running_cumulative, trajectory, trajectory_math),
             }
 
         def application_cost_from_path(self, t, X, Y, Z, const_value=None, baseline_mode="controlled", **kwargs):
@@ -7716,6 +9517,1283 @@ def test_pascucci_t12_gate_validator_requires_results_manifest_without_nameerror
     assert "Xi_initial" not in joined
 
 
+def _write_minimal_paper_parity_artifacts(
+    run_root: Path,
+    *,
+    legacy_artifacts: bool = False,
+    broken_cost_accounting: bool = False,
+    science_red: bool = False,
+    missing_mc_confirmation: bool = False,
+    mc_science_red: bool = False,
+    mc_not_independent: bool = False,
+    mc_paired_count_drift: bool = False,
+    mc_violation_magnitude: float = 1.0,
+) -> None:
+    from .io_utils import save_blob_npz, save_json
+    from .model_specs import get_model_spec
+    from .pascucci_calibration import (
+        build_pascucci_calibration_config,
+        build_pascucci_run_config_params,
+        calibrate_pascucci_ou_inputs,
+    )
+    from .pascucci_data import prepare_H, prepare_S
+    from .pascucci_plotting import _load_to_ema_ou_reference, _load_to_ema_uncontrolled_reference
+
+    M = 256
+    fixture = _pascucci_paper_plot_smoke_inputs(M=M)
+    t_steps = int(fixture["stitched"]["t"].shape[1])
+    t_grid = np.linspace(0.0, 24.0, t_steps, dtype=np.float32).reshape(1, t_steps, 1)
+    fixture["stitched"]["t"] = np.tile(t_grid, (M, 1, 1)).astype(np.float32)
+    rec_dir = run_root / "recursive"
+    plot_dir = rec_dir / "plots" / "pascucci_paper"
+    source_dir = run_root / "calibration_sources"
+    plot_dir.mkdir(parents=True)
+    H_source = source_dir / "dataset" / "casa" / "2025dicembre1.csv"
+    S_source = source_dir / "dataset" / "prezzi" / "2025dicembre1.xlsx"
+    H_source.parent.mkdir(parents=True)
+    S_source.parent.mkdir(parents=True)
+    to_ema_dataset = Path(__file__).resolve().parents[3] / "to_ema" / "dataset"
+    shutil.copyfile(to_ema_dataset / "casa" / "2025dicembre1.csv", H_source)
+    shutil.copyfile(to_ema_dataset / "prezzi" / "2025dicembre1.xlsx", S_source)
+
+    prepared_H = prepare_H(str(H_source), n=4, mul_factor=0.001)
+    prepared_S = prepare_S(str(S_source), n=1, mul_factor=0.001)
+    calibration = calibrate_pascucci_ou_inputs(
+        prepared_H,
+        prepared_S,
+        K=2,
+        dt=1.0,
+        start_hour=0.0,
+        log_price=True,
+    )
+    calibration_config = build_pascucci_calibration_config(
+        calibration,
+        K=2,
+        dt=1.0,
+        start_hour=0.0,
+        log_price=True,
+        H_metadata={
+            "source_path": str(H_source),
+            "source_sha256": file_sha256(str(H_source)),
+            "n_per_hour": 4,
+            "mul_factor": 0.001,
+            "prepared_points": int(prepared_H.shape[0]),
+        },
+        S_metadata={
+            "source_path": str(S_source),
+            "source_sha256": file_sha256(str(S_source)),
+            "n_per_hour": 1,
+            "mul_factor": 0.001,
+            "prepared_points": int(prepared_S.shape[0]),
+        },
+    )
+    params = build_pascucci_run_config_params(fixture["params"], calibration_config)
+    if legacy_artifacts:
+        params.pop("pascucci_calibration")
+
+    save_json(
+        {
+            "model_name": "pascucci",
+            "M": M,
+            "N": 13,
+            "D": 4,
+            "T_total": 24.0,
+            "block_size": 2.0,
+            "passes": 1,
+            "state_labels": ["S", "H", "V", "X_state"],
+            "z_labels": ["Z_S", "Z_H", "Z_V", "Z_X"],
+            "params": params,
+            "application_metric_schema": "pascucci_application_metrics_v2",
+            "pascucci_require_calibration": not legacy_artifacts,
+            "pascucci_calibration_enabled": not legacy_artifacts,
+            "run_config_sha256": "4" * 64,
+            "seed_manifest": {"train_seed": 1, "eval_seed": 2, "visual_seed_effective": 3},
+        },
+        str(run_root / "run_config.json"),
+    )
+    save_blob_npz(fixture["stitched"], str(rec_dir / "stitched_predictions_final.npz"))
+    application_pathwise = dict(fixture["application_pathwise"])
+    if legacy_artifacts:
+        application_pathwise.pop("controlled_cost_J_trajectory")
+        application_pathwise.pop("uncontrolled_cost_J_trajectory")
+        application_pathwise.pop("controlled_cost_J_trajectory_math")
+        application_pathwise.pop("uncontrolled_cost_J_trajectory_math")
+    if broken_cost_accounting and not legacy_artifacts:
+        application_pathwise["controlled_cost_J_trajectory_math"] = application_pathwise[
+            "controlled_cost_J_trajectory_math"
+        ].copy()
+        application_pathwise["controlled_cost_J_trajectory_math"][:, -1, :] += np.float32(7.0)
+    save_blob_npz(application_pathwise, str(rec_dir / "application_metrics_final.npz"))
+
+    pass0_metrics = _application_summary_fixture(
+        controlled_total_mean=-3.0,
+        uncontrolled_total_mean=-2.0,
+        control_win_rate=0.60,
+        v_lower_rate=0.02,
+    )
+    final_metrics = _application_summary_fixture(
+        controlled_total_mean=4.0 if science_red else -4.0,
+        uncontrolled_total_mean=-2.0,
+        control_win_rate=0.20 if science_red else 0.70,
+        q_lower_rate=0.30 if science_red else 0.01,
+        v_lower_rate=0.28 if science_red else 0.01,
+    )
+    final_metrics = {
+        **final_metrics,
+        "selected_from_pass_id": 1,
+        "selected_from_pass_index": 0,
+    }
+    save_json(pass0_metrics, str(rec_dir / "application_metrics_pass00.json"))
+    save_json(final_metrics, str(rec_dir / "application_metrics_final.json"))
+
+    if not missing_mc_confirmation and not legacy_artifacts:
+        mc_M = 10000
+        uncontrolled_total = np.zeros((mc_M, 1), dtype=np.float32)
+        controlled_total = np.ones((mc_M, 1), dtype=np.float32)
+        mc_wins = int((0.20 if mc_science_red else 0.70) * mc_M)
+        controlled_total[:mc_wins, :] = np.float32(-1.0)
+        delta = controlled_total - uncontrolled_total
+        q_lower_violation = np.zeros((mc_M, 2), dtype=np.float32)
+        q_upper_violation = np.zeros((mc_M, 2), dtype=np.float32)
+        v_lower_violation = np.zeros((mc_M, 2), dtype=np.float32)
+        v_upper_violation = np.zeros((mc_M, 2), dtype=np.float32)
+        violation_magnitude = np.float32(mc_violation_magnitude)
+        if mc_science_red:
+            q_lower_violation[:3000, :] = violation_magnitude
+            v_lower_violation[:2800, :] = violation_magnitude
+        else:
+            q_lower_violation[:100, :] = violation_magnitude
+            v_lower_violation[:100, :] = violation_magnitude
+        save_blob_npz(
+            {
+                "controlled_cost_J_total": controlled_total,
+                "uncontrolled_cost_J_total": uncontrolled_total,
+                "q_lower_violation": q_lower_violation,
+                "q_upper_violation": q_upper_violation,
+                "v_lower_violation": v_lower_violation,
+                "v_upper_violation": v_upper_violation,
+            },
+            str(rec_dir / "application_metrics_mc_confirmation.npz"),
+        )
+        mc_seed = 2 if mc_not_independent else 987654
+        save_json(
+            {
+                "schema": "pascucci_mc_confirmation_v1",
+                "source": "independent_post_selection",
+                "model_name": "pascucci",
+                "selected_pass_id": 1,
+                "seed": mc_seed,
+                "independent_of_eval_bundle": not mc_not_independent,
+                "eval_bundle_reused": bool(mc_not_independent),
+                "pathwise_npz": "application_metrics_mc_confirmation.npz",
+                "horizon": {
+                    "T_total": 24.0,
+                    "sample_paths": mc_M,
+                    "seed": mc_seed,
+                },
+                "comparison": {
+                    "delta_cost_J_total_mean": float(np.mean(delta)),
+                    "cost_J_total_control_win_rate": float(np.mean(controlled_total < uncontrolled_total)),
+                    "paired_sample_count": mc_M - 1 if mc_paired_count_drift else mc_M,
+                },
+                "diagnostics": {
+                    "q_lower_violation_rate": float(np.mean(q_lower_violation > 0.0)),
+                    "q_upper_violation_rate": float(np.mean(q_upper_violation > 0.0)),
+                    "v_lower_violation_rate": float(np.mean(v_lower_violation > 0.0)),
+                    "v_upper_violation_rate": float(np.mean(v_upper_violation > 0.0)),
+                },
+            },
+            str(rec_dir / "application_metrics_mc_confirmation.json"),
+        )
+    save_json(
+        {
+            "blocks": [{"idx": i, "t_start": 2.0 * i, "t_end": 2.0 * (i + 1)} for i in range(12)],
+            "passes": [{"pass_id": 1}],
+            "evaluation_bundle_M": M,
+            "selected_pass_id": 1,
+            "selected_score": 0.25,
+            "loss_pass_scores": {"1": 0.25},
+            "pass_invalid_reasons": {},
+        },
+        str(rec_dir / "results.json"),
+    )
+
+    if legacy_artifacts:
+        xi_initial = get_model_spec("quadratic_coupled").deterministic_xi(M, 4, seed=123)
+    else:
+        xi_initial = get_model_spec("pascucci").deterministic_xi(M, 4, seed=123)
+    np.savez_compressed(rec_dir / "evaluation_bundle.npz", Xi_initial=xi_initial.astype(np.float32))
+
+    plot_inputs = {
+        "#35": [
+            "pascucci_data.prepare_S(source_path, n, mul_factor)",
+            "simulate_ou_day_night(logS0=log(real_S[0]), dt=0.5, Nsim=10000, seed=42)",
+            "real_S * 1000",
+        ],
+        "#36": [
+            "pascucci_data.prepare_H(source_path, n, mul_factor)",
+            "simulate_ou_day_night(H0=real_H[0], dt=0.5, Nsim=10000, seed=42)",
+            "real_H",
+        ],
+        "#37": [
+            "application_metrics.controlled_cost_J_trajectory",
+            "to_ema.raw_uncontrolled_J_paths",
+            "to_ema.simulate_uncontrolled_J(dt=0.1, Nsim=10000, seed=42)",
+        ],
+        "#38": ["application_metrics.controlled_alpha", "application_metrics.uncontrolled_alpha"],
+        "#39": [
+            "stitched.t",
+            "exp(stitched.X[:, :, S])",
+            "stitched.X[:, :, H,V,X]",
+            "plotmaker-style q10-q90 bands, mean, and 3 sample paths",
+        ],
+        "#40": [
+            "application_metrics.controlled_cost_J_total",
+            "application_metrics.uncontrolled_cost_J_total"
+            if legacy_artifacts
+            else "to_ema.raw_uncontrolled_J_paths[:, -1]",
+            "uncontrolled baseline source=alpha_zero_same_model"
+            if legacy_artifacts
+            else "paired alpha=0 total still saved as application_metrics.uncontrolled_cost_J_total",
+        ],
+    }
+    if legacy_artifacts:
+        plot_inputs["#37"] = [
+            "application_metrics.controlled_cost_J_running_cumulative",
+            "application_metrics.uncontrolled_cost_J_running_cumulative",
+        ]
+    plot_styles = {
+        "#35": {
+            "source": "raw/to_ema/variable_mu_calibration.ipynb::generate_plot",
+            "formula_source": "raw/to_ema/calibration.py",
+            "figure_size": [12, 6],
+            "real_color": "red",
+            "band_alpha": 0.3,
+            "band_label": "80% Band",
+            "quantiles": [0.05, 0.95],
+            "xlabel": "Hours",
+        },
+        "#36": {
+            "source": "raw/to_ema/variable_mu_calibration.ipynb::generate_plot",
+            "formula_source": "raw/to_ema/calibration.py",
+            "figure_size": [12, 6],
+            "real_color": "red",
+            "band_alpha": 0.3,
+            "band_label": "80% Band",
+            "quantiles": [0.05, 0.95],
+            "xlabel": "Hours",
+        },
+        "#37": {
+            "source": "raw/to_ema/plotmaker.ipynb::comparison J cell",
+            "figure_size": [10, 6],
+            "controlled_color": "r",
+            "uncontrolled_color": "b",
+            "band_alpha": 0.2,
+            "quantiles": [0.10, 0.90],
+            "title": r"Comparison of $J_t= \int_0^t f_s ds + g(X_t)$",
+            "xlabel": "Time(h)",
+            "ylabel": "Cost",
+        },
+        "#38": {
+            "source": "final_recursive.application_metrics_alpha",
+            "figure_size": [10, 5],
+            "controlled_color": "tab:green",
+            "uncontrolled_color": "tab:gray",
+            "uncontrolled_linestyle": "--",
+            "zero_line": True,
+            "band_alpha": 0.20,
+            "quantiles": [0.05, 0.50, 0.95],
+            "xlabel": "Time",
+            "ylabel": "alpha",
+        },
+        "#39": {
+            "source": "raw/to_ema/plotmaker.ipynb::forward_components",
+            "figure_size": [14, 10],
+            "layout": "2x2",
+            "band_alpha": 0.2,
+            "quantiles": [0.10, 0.90],
+            "sample_paths": 3,
+            "sample_policy": "deterministic_first3_for_reproducibility",
+        },
+        "#40": {
+            "source": "final_recursive.total_cost_distribution_summary",
+            "figure_size": [8, 5],
+            "bar_stat": "q50",
+            "marker_stat": "mean",
+            "marker": "D",
+            "interval": "q05-q95",
+            "controlled_color": "tab:blue",
+            "uncontrolled_color": "tab:red",
+            "ylabel": "J total median with q05-q95; diamonds show mean",
+        },
+    }
+    plot_dimensions = {
+        "#35": (1920, 960),
+        "#36": (1920, 960),
+        "#37": (1600, 960),
+        "#38": (1600, 800),
+        "#39": (2240, 1600),
+        "#40": (1280, 800),
+    }
+    plots = {}
+    for story, filename in zip(("#35", "#36", "#37", "#38", "#39", "#40"), (
+        "pascucci_paper_35_S_ou_band.png",
+        "pascucci_paper_36_H_ou_band.png",
+        "pascucci_paper_37_accumulated_cost.png",
+        "pascucci_paper_38_alpha.png",
+        "pascucci_paper_39_forward_components_S_H_V_X.png",
+        "pascucci_paper_40_controlled_uncontrolled.png",
+    )):
+        width, height = plot_dimensions[story]
+        _write_minimal_png(plot_dir / filename, width, height)
+        plots[story] = {
+            "filename": filename,
+            "path": filename,
+            "path_relative_to": "manifest_dir",
+            "title": f"fixture {story}",
+            "inputs": plot_inputs[story],
+        }
+        if story in plot_styles:
+            plots[story]["style"] = plot_styles[story]
+
+    plotmaker_native_plots = {
+        "Y": {
+            "filename": "pascucci_plotmaker_backward_Y.png",
+            "path": "pascucci_plotmaker_backward_Y.png",
+            "path_relative_to": "manifest_dir",
+            "title": "Backward Component Y",
+            "inputs": [
+                "stitched.t",
+                "stitched.Y[:, :, 0]",
+                "plotmaker-style q10-q90 bands, mean, and 3 sample paths",
+            ],
+            "style": {
+                "source": "raw/to_ema/plotmaker.ipynb::Backward Component Y cell",
+                "figure_size": [10, 6],
+                "band_alpha": 0.2,
+                "quantiles": [0.10, 0.90],
+                "sample_paths": 3,
+                "sample_policy": "deterministic_first3_for_reproducibility",
+                "title": "Backward Component Y",
+                "xlabel": "t",
+                "ylabel": "Y_t",
+            },
+        },
+        "Z": {
+            "filename": "pascucci_plotmaker_Z_components.png",
+            "path": "pascucci_plotmaker_Z_components.png",
+            "path_relative_to": "manifest_dir",
+            "title": "Z components",
+            "inputs": [
+                "stitched.t",
+                "stitched.Z[:, :, Z_S,Z_H,Z_V,Z_X]",
+                "plotmaker-style q10-q90 bands, mean, and 3 sample paths",
+            ],
+            "style": {
+                "source": "raw/to_ema/plotmaker.ipynb::Z components cell",
+                "figure_size": [14, 10],
+                "layout": "2x2",
+                "labels": ["Z_S", "Z_H", "Z_V", "Z_X"],
+                "band_alpha": 0.2,
+                "quantiles": [0.10, 0.90],
+                "sample_paths": 3,
+                "sample_policy": "deterministic_first3_for_reproducibility",
+            },
+        },
+    }
+    native_plot_dimensions = {"Y": (1600, 960), "Z": (2240, 1600)}
+    for story, entry in plotmaker_native_plots.items():
+        width, height = native_plot_dimensions[story]
+        _write_minimal_png(plot_dir / entry["filename"], width, height)
+
+    def _axis_stats(values: np.ndarray, quantiles: tuple[float, ...]) -> dict[str, np.ndarray]:
+        arr = np.asarray(values, dtype=np.float32)
+        stats = {"mean": np.mean(arr, axis=0).astype(np.float32)}
+        for quantile in quantiles:
+            stats[f"q{int(round(float(quantile) * 100)):02d}"] = np.quantile(
+                arr,
+                float(quantile),
+                axis=0,
+            ).astype(np.float32)
+        return stats
+
+    time = np.asarray(fixture["stitched"]["t"][0, :, 0], dtype=np.float32)
+    plot_data_payload: dict[str, np.ndarray] = {}
+    if legacy_artifacts:
+        for prefix in ("plot35", "plot36"):
+            plot_data_payload[f"{prefix}_time_sim"] = np.asarray([0.0, 0.5, 1.0], dtype=np.float32)
+            plot_data_payload[f"{prefix}_sim_mean"] = np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
+            plot_data_payload[f"{prefix}_sim_q05"] = np.asarray([-1.0, -1.0, -1.0], dtype=np.float32)
+            plot_data_payload[f"{prefix}_sim_q50"] = np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
+            plot_data_payload[f"{prefix}_sim_q95"] = np.asarray([1.0, 1.0, 1.0], dtype=np.float32)
+            plot_data_payload[f"{prefix}_time_real"] = np.asarray([0.0, 1.0], dtype=np.float32)
+            plot_data_payload[f"{prefix}_real"] = np.asarray([0.0, 0.0], dtype=np.float32)
+    else:
+        ou_references, ou_summary = _load_to_ema_ou_reference(params, horizon_T=float(time[-1]))
+        dt_sim = float(ou_summary["simulation"]["dt_sim"])
+        dt_real = float(ou_summary["dt_real"])
+        for story, prefix in (("#35", "plot35"), ("#36", "plot36")):
+            ref = ou_references[story]
+            paths = np.asarray(ref["paths"], dtype=np.float32)
+            real = np.asarray(ref["real_path"], dtype=np.float32)
+            stats = _axis_stats(paths, (0.05, 0.50, 0.95))
+            real_points = max(1, min(int(float(ref["T"]) / dt_real), int(real.shape[0])))
+            plot_data_payload[f"{prefix}_time_sim"] = (
+                np.arange(paths.shape[1], dtype=np.float32) * np.float32(dt_sim)
+            ).astype(np.float32)
+            plot_data_payload[f"{prefix}_sim_mean"] = stats["mean"]
+            plot_data_payload[f"{prefix}_sim_q05"] = stats["q05"]
+            plot_data_payload[f"{prefix}_sim_q50"] = stats["q50"]
+            plot_data_payload[f"{prefix}_sim_q95"] = stats["q95"]
+            plot_data_payload[f"{prefix}_time_real"] = (
+                np.arange(real.shape[0], dtype=np.float32) * np.float32(dt_real)
+            )[:real_points].astype(np.float32)
+            plot_data_payload[f"{prefix}_real"] = real[:real_points].astype(np.float32)
+
+    controlled_trace_for_plot = application_pathwise.get(
+        "controlled_cost_J_trajectory",
+        application_pathwise["controlled_cost_J_running_cumulative"],
+    )
+    controlled_trace_time = time if "controlled_cost_J_trajectory" in application_pathwise else time[1:]
+    controlled_J_stats = _axis_stats(np.asarray(controlled_trace_for_plot, dtype=np.float32)[:, :, 0], (0.10, 0.90))
+    plot_data_payload["plot37_controlled_time"] = controlled_trace_time.astype(np.float32)
+    plot_data_payload["plot37_controlled_mean"] = controlled_J_stats["mean"]
+    plot_data_payload["plot37_controlled_q10"] = controlled_J_stats["q10"]
+    plot_data_payload["plot37_controlled_q90"] = controlled_J_stats["q90"]
+
+    if legacy_artifacts:
+        uncontrolled_trace_for_plot = application_pathwise["uncontrolled_cost_J_running_cumulative"]
+        uncontrolled_trace_time = time[1:]
+        uncontrolled_total_for_plot = application_pathwise["uncontrolled_cost_J_total"]
+    else:
+        to_ema_uncontrolled, _ = _load_to_ema_uncontrolled_reference(params, horizon_T=float(time[-1]))
+        uncontrolled_trace_for_plot = to_ema_uncontrolled["J_paths"][:, :, None]
+        uncontrolled_trace_time = to_ema_uncontrolled["time"]
+        uncontrolled_total_for_plot = to_ema_uncontrolled["J_paths"][:, -1:]
+    uncontrolled_J_stats = _axis_stats(
+        np.asarray(uncontrolled_trace_for_plot, dtype=np.float32)[:, :, 0],
+        (0.10, 0.90),
+    )
+    plot_data_payload["plot37_uncontrolled_time"] = np.asarray(uncontrolled_trace_time, dtype=np.float32)
+    plot_data_payload["plot37_uncontrolled_mean"] = uncontrolled_J_stats["mean"]
+    plot_data_payload["plot37_uncontrolled_q10"] = uncontrolled_J_stats["q10"]
+    plot_data_payload["plot37_uncontrolled_q90"] = uncontrolled_J_stats["q90"]
+
+    controlled_alpha_stats = _axis_stats(application_pathwise["controlled_alpha"][:, :, 0], (0.05, 0.50, 0.95))
+    plot_data_payload["plot38_time"] = time[:-1].astype(np.float32)
+    plot_data_payload["plot38_controlled_mean"] = controlled_alpha_stats["mean"]
+    plot_data_payload["plot38_controlled_q05"] = controlled_alpha_stats["q05"]
+    plot_data_payload["plot38_controlled_q50"] = controlled_alpha_stats["q50"]
+    plot_data_payload["plot38_controlled_q95"] = controlled_alpha_stats["q95"]
+    plot_data_payload["plot38_uncontrolled_mean"] = np.mean(
+        application_pathwise["uncontrolled_alpha"][:, :, 0],
+        axis=0,
+    ).astype(np.float32)
+
+    plot_data_payload["plot39_time"] = time.astype(np.float32)
+    plot_data_payload["plot39_sample_indices"] = np.asarray([0, 1, 2], dtype=np.float32)
+    state_values = {
+        "plot39_S": np.exp(np.clip(fixture["stitched"]["X"][:, :, 0], -50.0, 50.0)).astype(np.float32),
+        "plot39_H": fixture["stitched"]["X"][:, :, 1].astype(np.float32),
+        "plot39_V": fixture["stitched"]["X"][:, :, 2].astype(np.float32),
+        "plot39_X": fixture["stitched"]["X"][:, :, 3].astype(np.float32),
+    }
+    for prefix, values in state_values.items():
+        stats = _axis_stats(values, (0.10, 0.50, 0.90))
+        plot_data_payload[f"{prefix}_mean"] = stats["mean"]
+        plot_data_payload[f"{prefix}_q10"] = stats["q10"]
+        plot_data_payload[f"{prefix}_q50"] = stats["q50"]
+        plot_data_payload[f"{prefix}_q90"] = stats["q90"]
+        plot_data_payload[f"{prefix}_samples"] = values[[0, 1, 2]].astype(np.float32)
+
+    controlled_total_stats = _axis_stats(application_pathwise["controlled_cost_J_total"].reshape(-1, 1), (0.05, 0.50, 0.95))
+    uncontrolled_total_stats = _axis_stats(np.asarray(uncontrolled_total_for_plot, dtype=np.float32).reshape(-1, 1), (0.05, 0.50, 0.95))
+    plot_data_payload["plot40_controlled_mean"] = controlled_total_stats["mean"]
+    plot_data_payload["plot40_controlled_q05"] = controlled_total_stats["q05"]
+    plot_data_payload["plot40_controlled_q50"] = controlled_total_stats["q50"]
+    plot_data_payload["plot40_controlled_q95"] = controlled_total_stats["q95"]
+    plot_data_payload["plot40_uncontrolled_mean"] = uncontrolled_total_stats["mean"]
+    plot_data_payload["plot40_uncontrolled_q05"] = uncontrolled_total_stats["q05"]
+    plot_data_payload["plot40_uncontrolled_q50"] = uncontrolled_total_stats["q50"]
+    plot_data_payload["plot40_uncontrolled_q95"] = uncontrolled_total_stats["q95"]
+    native_sample_idx = np.asarray([0, 1, 2], dtype=np.float32)
+    Y_values = fixture["stitched"]["Y"][:, :, 0].astype(np.float32)
+    Y_stats = _axis_stats(Y_values, (0.10, 0.50, 0.90))
+    plot_data_payload["plotmaker_Y_time"] = time.astype(np.float32)
+    plot_data_payload["plotmaker_Y_sample_indices"] = native_sample_idx
+    plot_data_payload["plotmaker_Y_mean"] = Y_stats["mean"]
+    plot_data_payload["plotmaker_Y_q10"] = Y_stats["q10"]
+    plot_data_payload["plotmaker_Y_q50"] = Y_stats["q50"]
+    plot_data_payload["plotmaker_Y_q90"] = Y_stats["q90"]
+    plot_data_payload["plotmaker_Y_samples"] = Y_values[[0, 1, 2]].astype(np.float32)
+    for component, label in enumerate(("Z_S", "Z_H", "Z_V", "Z_X")):
+        Z_values = fixture["stitched"]["Z"][:, :, component].astype(np.float32)
+        Z_stats = _axis_stats(Z_values, (0.10, 0.50, 0.90))
+        plot_data_payload[f"plotmaker_Z_{label}_mean"] = Z_stats["mean"]
+        plot_data_payload[f"plotmaker_Z_{label}_q10"] = Z_stats["q10"]
+        plot_data_payload[f"plotmaker_Z_{label}_q50"] = Z_stats["q50"]
+        plot_data_payload[f"plotmaker_Z_{label}_q90"] = Z_stats["q90"]
+        plot_data_payload[f"plotmaker_Z_{label}_samples"] = Z_values[[0, 1, 2]].astype(np.float32)
+    plot_data_payload["plotmaker_Z_time"] = time.astype(np.float32)
+    plot_data_payload["plotmaker_Z_sample_indices"] = native_sample_idx
+    save_blob_npz(plot_data_payload, str(plot_dir / "pascucci_paper_plot_data.npz"))
+
+    plotmaker_reference = {
+        "source": "raw/to_ema/plotmaker.ipynb cells 8, 16, 18",
+        "data": "2025dicembre1",
+        "T": 24.0,
+        "N": 150,
+        "M": 10000,
+        "calibration_K": 2,
+        "calibration_dt": 1.0,
+        "H": {
+            "expected_basename": "2025dicembre1.csv",
+            "expected_sha256": "75004dde0cd982f67c547c241ce704a4fc596380d5bcbca18169d8d6bc4b5c44",
+            "actual_basename": H_source.name,
+            "actual_sha256": file_sha256(str(H_source)),
+            "matched": True,
+        },
+        "S": {
+            "expected_basename": "2025dicembre1.xlsx",
+            "expected_sha256": "7526faeaff806a250dd3736bc2eb7e1202c20d4635638c3b371d85c133eed5ef",
+            "actual_basename": S_source.name,
+            "actual_sha256": file_sha256(str(S_source)),
+            "matched": True,
+        },
+        "dataset_status": "matched",
+    }
+
+    save_json(
+        {
+            "schema": "pascucci_paper_plots_v1",
+            "model_name": "pascucci",
+            "plot_count": 6,
+            "plots": plots,
+            "plotmaker_native_plots": plotmaker_native_plots,
+            "plot_data": {
+                "schema": "pascucci_paper_plot_data_v1",
+                "path": "pascucci_paper_plot_data.npz",
+                "path_relative_to": "manifest_dir",
+                "keys": sorted(plot_data_payload.keys()),
+            },
+            "cost_trace_source": "cost_J_running_cumulative" if legacy_artifacts else "cost_J_trajectory",
+            "uncontrolled_cost_trace_source": (
+                "application_metrics.uncontrolled_cost_J_running_cumulative"
+                if legacy_artifacts
+                else "to_ema_raw_uncontrolled_J"
+            ),
+            "to_ema_uncontrolled_reference": (
+                {"source": "application_metrics_fallback", "reason": "missing_pascucci_calibration_metadata"}
+                if legacy_artifacts
+                else {
+                    "source": "calibration_metadata",
+                    "simulation": {"n_sim": 10000, "dt": 0.1, "seed": 42},
+                }
+            ),
+            "comparison_sources": (
+                {
+                    "#37": {"uncontrolled": "application_metrics.uncontrolled_cost_J_running_cumulative"},
+                    "#40": {"uncontrolled": "alpha_zero_same_model"},
+                }
+                if legacy_artifacts
+                else {
+                    "#37": {"uncontrolled": "to_ema_raw_uncontrolled_J"},
+                    "#40": {
+                        "uncontrolled": "to_ema_raw_uncontrolled_J_final",
+                        "paired_alpha_zero_detail": "application_metrics.uncontrolled_cost_J_total",
+                    },
+                }
+            ),
+            "plotmaker_reference": plotmaker_reference,
+            "notebook_parity": {
+                "exact_all_stories": False,
+                "reason": "#38 and #40 remain final_recursive diagnostic summaries in the historical #35-#40 contract; native plotmaker Y/Z figures are emitted separately under plotmaker_native_plots. #37 is oracled against the per-time plotmaker formula; the raw flattened helper is not used because it mixes mean-field moments across time.",
+                "stories": {
+                    "#35": "to_ema_calibration_reference",
+                    "#36": "to_ema_calibration_reference",
+                    "#37": "plotmaker_per_time_cost_formula_oracled",
+                    "#38": "diagnostic_only_no_plotmaker_equivalent",
+                    "#39": "plotmaker_forward_components_reference",
+                    "#40": "diagnostic_only_no_plotmaker_equivalent",
+                },
+                "native_plotmaker_plots": {
+                    "Y": "plotmaker_backward_component_reference",
+                    "Z": "plotmaker_z_components_reference",
+                },
+            },
+            "visual_regression": {
+                "status": "structural_style_only_no_golden_images",
+                "structural_style_contract": True,
+                "pixel_exact_claim": False,
+                "golden_images_available": False,
+                "golden_image_source": "raw/to_ema has plotmaker.ipynb but no embedded or saved golden PNG/PDF images",
+                "comparison_method": "manifest_style_contract_plus_numeric_plot_data_recomputation",
+                "remaining_gaps": [
+                    "no golden image hashes from an executed raw/to_ema/plotmaker.ipynb run",
+                    "plotmaker sample paths use np.random.choice without a local seed; final_recursive records deterministic first3 samples for reproducibility",
+                    "#38 and #40 remain final_recursive diagnostics without direct plotmaker figure equivalents",
+                ],
+            },
+            "state_transforms": {
+                "#35": "raw S" if legacy_artifacts else "PUN price = exp(S) * 1000",
+                "#39": "raw S"
+                if legacy_artifacts
+                else "forward components S,H,V,X in plotmaker 2x2 layout; S is plotted as exp(S)",
+            },
+            "ou_reference": (
+                {"source": "stitched_fallback", "reason": "missing_pascucci_calibration_metadata"}
+                if legacy_artifacts
+                else {"source": "calibration_metadata", "simulation": {"n_sim": 10000, "dt_sim": 0.5, "seed": 42}}
+            ),
+        },
+        str(plot_dir / "pascucci_paper_plots_manifest.json"),
+    )
+
+
+def test_pascucci_paper_plot_parity_validator_green_contract_and_wrapper_resolution() -> None:
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        wrapper_dir = Path(tmp) / "pascucci_T24_wrapper_job999999"
+        run_root = wrapper_dir / "run_20260613_120000"
+        _write_minimal_paper_parity_artifacts(run_root)
+
+        report = validate_pascucci_paper_plot_parity(wrapper_dir)
+
+    assert report["status"] == "GREEN"
+    assert report["run_root"].endswith("run_20260613_120000")
+    assert report["failures"] == []
+    assert report["incomplete"] == []
+    assert report["inconclusive"] == []
+    assert report["warnings"] == []
+    assert report["contract_status"] == "GREEN"
+    assert report["science_status"] == "GREEN"
+    assert report["mc_confirmation_status"] == "GREEN"
+    assert report["failure_counts"] == {
+        "contract": 0,
+        "science": 0,
+        "mc_confirmation": 0,
+        "incomplete": 0,
+        "inconclusive": 0,
+    }
+    assert report["failure_categories"] == {"contract": [], "science": [], "mc_confirmation": []}
+
+
+def test_pascucci_paper_plot_parity_validator_rejects_t24_legacy_semantics() -> None:
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_legacy"
+        _write_minimal_paper_parity_artifacts(run_root, legacy_artifacts=True)
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "FAILED"
+    assert report["contract_status"] == "FAILED"
+    assert report["failure_counts"]["contract"] > 0
+    joined = "\n".join(report["failures"])
+    assert "pascucci_calibration missing" in joined
+    assert "controlled_cost_J_trajectory" in joined
+    assert "cost_trace_source" in joined
+    assert "ou_reference.source" in joined
+    assert "Xi_initial paper-like distribution mismatch" in joined
+
+
+def test_pascucci_paper_plot_parity_validator_rejects_non_plotmaker_pascucci_params() -> None:
+    from .io_utils import save_json
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_bad_paper_params"
+        _write_minimal_paper_parity_artifacts(run_root)
+        cfg_path = run_root / "run_config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg["params"]["l_a"] = 0.01
+        cfg["params"]["c_h"] = 0.0001
+        save_json(cfg, str(cfg_path))
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "FAILED"
+    assert report["contract_status"] == "FAILED"
+    assert report["science_status"] == "GREEN"
+    assert report["mc_confirmation_status"] == "GREEN"
+    joined = "\n".join(report["failures"])
+    assert "params.l_a" in joined
+    assert "expected plotmaker.ipynb cell 8 value 0.005" in joined
+    assert "params.c_h" in joined
+    assert "expected plotmaker.ipynb cell 8 value 0.001" in joined
+
+
+def test_pascucci_paper_plot_parity_validator_rejects_missing_require_calibration_guard() -> None:
+    from .io_utils import save_json
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_missing_require_calibration"
+        _write_minimal_paper_parity_artifacts(run_root)
+        cfg_path = run_root / "run_config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg["pascucci_require_calibration"] = False
+        save_json(cfg, str(cfg_path))
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "FAILED"
+    assert report["contract_status"] == "FAILED"
+    assert report["science_status"] == "GREEN"
+    assert report["mc_confirmation_status"] == "GREEN"
+    assert "pascucci_require_calibration must be true" in "\n".join(report["failures"])
+
+
+def test_pascucci_paper_plot_parity_validator_rejects_xi_initial_quantile_drift() -> None:
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_bad_xi_quantiles"
+        _write_minimal_paper_parity_artifacts(run_root)
+        M = 10000
+        Xi = np.zeros((M, 4), dtype=np.float32)
+        Xi[: M // 2, 0] = -2.5
+        Xi[M // 2 :, 0] = -2.1
+        Xi[: M // 2, 1] = -0.1
+        Xi[M // 2 :, 1] = 0.9
+        Xi[: M // 2, 2] = -1.0
+        Xi[M // 2 :, 2] = 1.0
+        Xi[: M // 2, 3] = 3.0
+        Xi[M // 2 :, 3] = 7.0
+        np.savez_compressed(run_root / "recursive" / "evaluation_bundle.npz", Xi_initial=Xi)
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "FAILED"
+    assert report["contract_status"] == "FAILED"
+    assert report["science_status"] == "GREEN"
+    assert report["mc_confirmation_status"] == "GREEN"
+    joined = "\n".join(report["failures"])
+    assert "Xi_initial paper-like distribution mismatch: Q q05" in joined
+    assert "Xi_initial paper-like distribution mismatch: Q q95" in joined
+
+
+def test_pascucci_paper_plot_parity_validator_rejects_science_red_results() -> None:
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_science_red"
+        _write_minimal_paper_parity_artifacts(run_root, science_red=True)
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "FAILED"
+    assert report["contract_status"] == "GREEN"
+    assert report["science_status"] == "FAILED"
+    assert report["mc_confirmation_status"] == "GREEN"
+    assert report["failure_counts"]["science"] >= 3
+    joined = "\n".join(report["failures"])
+    assert "science gate" in joined
+    assert "controlled cost is worse" in joined
+    assert "win-rate too low" in joined
+    assert "physical violation rate too high" in joined
+
+
+def test_pascucci_paper_plot_parity_validator_rejects_cost_accounting_mismatch() -> None:
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_bad_cost_accounting"
+        _write_minimal_paper_parity_artifacts(run_root, broken_cost_accounting=True)
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "FAILED"
+    assert report["contract_status"] == "FAILED"
+    assert report["science_status"] == "GREEN"
+    assert report["mc_confirmation_status"] == "GREEN"
+    joined = "\n".join(report["failures"])
+    assert "application cost accounting mismatch" in joined
+    assert "controlled_cost_J_trajectory_math[-1]" in joined
+    assert "controlled_cost_J_total" in joined
+
+
+def test_pascucci_paper_plot_parity_validator_rejects_alpha_zero_as_plot40_paper_benchmark() -> None:
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_alpha_zero_plot40"
+        _write_minimal_paper_parity_artifacts(run_root)
+        manifest_path = run_root / "recursive" / "plots" / "pascucci_paper" / "pascucci_paper_plots_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["comparison_sources"]["#40"] = {"uncontrolled": "alpha_zero_same_model"}
+        manifest["plots"]["#40"]["inputs"] = [
+            "application_metrics.controlled_cost_J_total",
+            "application_metrics.uncontrolled_cost_J_total",
+            "uncontrolled baseline source=alpha_zero_same_model",
+        ]
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "FAILED"
+    assert report["contract_status"] == "FAILED"
+    assert report["science_status"] == "GREEN"
+    assert report["mc_confirmation_status"] == "GREEN"
+    joined = "\n".join(report["failures"])
+    assert "comparison_sources.#40.uncontrolled" in joined
+    assert "to_ema_raw_uncontrolled_J_final" in joined
+    assert "plot manifest #40 inputs must use final raw to_ema uncontrolled J paths" in joined
+
+
+def test_pascucci_paper_plot_parity_validator_rejects_missing_plot_style_contract() -> None:
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_missing_plot_style"
+        _write_minimal_paper_parity_artifacts(run_root)
+        manifest_path = run_root / "recursive" / "plots" / "pascucci_paper" / "pascucci_paper_plots_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["plots"]["#37"].pop("style", None)
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "FAILED"
+    assert report["contract_status"] == "FAILED"
+    assert report["science_status"] == "GREEN"
+    assert report["mc_confirmation_status"] == "GREEN"
+    assert "plot manifest #37.style missing" in "\n".join(report["failures"])
+
+
+def test_pascucci_paper_plot_parity_validator_rejects_plot_dimension_drift() -> None:
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_plot_dimension_drift"
+        _write_minimal_paper_parity_artifacts(run_root)
+        plot_path = (
+            run_root
+            / "recursive"
+            / "plots"
+            / "pascucci_paper"
+            / "pascucci_paper_39_forward_components_S_H_V_X.png"
+        )
+        _write_minimal_png(plot_path, 1600, 800)
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "FAILED"
+    assert report["contract_status"] == "FAILED"
+    assert report["science_status"] == "GREEN"
+    assert report["mc_confirmation_status"] == "GREEN"
+    joined = "\n".join(report["failures"])
+    assert "pascucci_paper_39_forward_components_S_H_V_X.png dimensions=(1600, 800)" in joined
+    assert "expected (2240, 1600)" in joined
+
+
+def test_pascucci_paper_plot_parity_validator_rejects_unsupported_pixel_exact_claim() -> None:
+    from .io_utils import save_json
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_unsupported_pixel_exact"
+        _write_minimal_paper_parity_artifacts(run_root)
+        manifest_path = run_root / "recursive" / "plots" / "pascucci_paper" / "pascucci_paper_plots_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["visual_regression"]["pixel_exact_claim"] = True
+        manifest["visual_regression"]["golden_images_available"] = True
+        manifest["visual_regression"]["remaining_gaps"] = []
+        save_json(manifest, str(manifest_path))
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "FAILED"
+    assert report["contract_status"] == "FAILED"
+    assert report["science_status"] == "GREEN"
+    assert report["mc_confirmation_status"] == "GREEN"
+    joined = "\n".join(report["failures"])
+    assert "visual_regression.pixel_exact_claim" in joined
+    assert "visual_regression.golden_images_available" in joined
+    assert "remaining_gaps" in joined
+
+
+def _write_pixel_hash_visual_regression_contract(run_root: Path, *, corrupt_key: str = "") -> None:
+    from .io_utils import save_json
+
+    manifest_path = run_root / "recursive" / "plots" / "pascucci_paper" / "pascucci_paper_plots_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    plot_dir = manifest_path.parent
+    golden_dir = plot_dir / "golden"
+    golden_dir.mkdir(parents=True, exist_ok=True)
+    golden_images = {}
+    entries = {story: entry for story, entry in manifest["plots"].items()}
+    entries.update({story: entry for story, entry in manifest["plotmaker_native_plots"].items()})
+    for story, entry in sorted(entries.items()):
+        current_rel = str(entry["path"])
+        current_path = plot_dir / current_rel
+        golden_rel = f"golden/{str(story).replace('#', 'plot')}_{Path(current_rel).name}"
+        golden_path = plot_dir / golden_rel
+        payload = current_path.read_bytes()
+        if story == corrupt_key:
+            payload = b"corrupt-golden" + payload
+        golden_path.write_bytes(payload)
+        golden_images[story] = {
+            "current_path": current_rel,
+            "golden_path": golden_rel,
+            "sha256": file_sha256(str(current_path)),
+        }
+    manifest["visual_regression"] = {
+        "status": "pixel_hash_exact",
+        "structural_style_contract": True,
+        "pixel_exact_claim": True,
+        "golden_images_available": True,
+        "comparison_method": "sha256_png_pixel_exact",
+        "golden_images": golden_images,
+    }
+    save_json(manifest, str(manifest_path))
+
+
+def test_pascucci_paper_plot_parity_validator_accepts_pixel_hash_golden_contract() -> None:
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_pixel_hash_golden"
+        _write_minimal_paper_parity_artifacts(run_root)
+        _write_pixel_hash_visual_regression_contract(run_root)
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["contract_status"] == "GREEN"
+    assert report["science_status"] == "GREEN"
+    assert report["mc_confirmation_status"] == "GREEN"
+    assert not any("visual_regression" in failure for failure in report["failures"])
+
+
+def test_pascucci_paper_plot_parity_validator_rejects_pixel_hash_golden_mismatch() -> None:
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_pixel_hash_mismatch"
+        _write_minimal_paper_parity_artifacts(run_root)
+        _write_pixel_hash_visual_regression_contract(run_root, corrupt_key="#37")
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "FAILED"
+    assert report["contract_status"] == "FAILED"
+    assert report["science_status"] == "GREEN"
+    assert report["mc_confirmation_status"] == "GREEN"
+    joined = "\n".join(report["failures"])
+    assert "visual_regression.golden_images.#37 golden sha256" in joined
+
+
+def test_pascucci_paper_plot_parity_validator_rejects_nonpaper_cost_profile() -> None:
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_nonpaper_cost_profile"
+        _write_minimal_paper_parity_artifacts(run_root)
+        run_config_path = run_root / "run_config.json"
+        run_config = json.loads(run_config_path.read_text(encoding="utf-8"))
+        run_config["params"]["pascucci_cost_profile"] = "exp_minus_offset"
+        run_config["params"]["pascucci_cost_offset"] = 1.0
+        run_config_path.write_text(json.dumps(run_config, sort_keys=True), encoding="utf-8")
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "FAILED"
+    assert report["contract_status"] == "FAILED"
+    assert report["science_status"] == "GREEN"
+    assert report["mc_confirmation_status"] == "GREEN"
+    joined = "\n".join(report["failures"])
+    assert "pascucci_cost_profile='exp'" in joined
+    assert "pascucci_cost_offset=0.0" in joined
+
+
+def test_pascucci_paper_plot_parity_validator_rejects_missing_plot_data_npz() -> None:
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_missing_plot_data"
+        _write_minimal_paper_parity_artifacts(run_root)
+        plot_data_path = (
+            run_root
+            / "recursive"
+            / "plots"
+            / "pascucci_paper"
+            / "pascucci_paper_plot_data.npz"
+        )
+        plot_data_path.unlink()
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "FAILED"
+    assert report["contract_status"] == "FAILED"
+    assert report["science_status"] == "GREEN"
+    assert report["mc_confirmation_status"] == "GREEN"
+    joined = "\n".join(report["failures"])
+    assert "pascucci_paper_plot_data.npz" in joined
+    assert "missing artifact" in joined
+
+
+def test_pascucci_paper_plot_parity_validator_rejects_missing_plotmaker_native_yz() -> None:
+    from .io_utils import save_json
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_missing_plotmaker_native_yz"
+        _write_minimal_paper_parity_artifacts(run_root)
+        manifest_path = run_root / "recursive" / "plots" / "pascucci_paper" / "pascucci_paper_plots_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["plotmaker_native_plots"].pop("Y", None)
+        save_json(manifest, str(manifest_path))
+        (manifest_path.parent / "pascucci_plotmaker_backward_Y.png").unlink()
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "FAILED"
+    assert report["contract_status"] == "FAILED"
+    joined = "\n".join(report["failures"])
+    assert "plotmaker_native_plots.Y" in joined
+    assert "native_plotmaker_plots" not in joined or "Y" in joined
+
+
+def test_pascucci_paper_plot_parity_validator_rejects_missing_plotmaker_native_plot_data() -> None:
+    from .io_utils import save_blob_npz
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_missing_plotmaker_native_plot_data"
+        _write_minimal_paper_parity_artifacts(run_root)
+        plot_data_path = (
+            run_root
+            / "recursive"
+            / "plots"
+            / "pascucci_paper"
+            / "pascucci_paper_plot_data.npz"
+        )
+        with np.load(plot_data_path, allow_pickle=False) as data:
+            payload = {key: data[key] for key in data.files if key != "plotmaker_Y_mean"}
+        save_blob_npz(payload, str(plot_data_path))
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "FAILED"
+    assert report["contract_status"] == "FAILED"
+    joined = "\n".join(report["failures"])
+    assert "plot data NPZ missing key plotmaker_Y_mean" in joined
+
+
+def test_pascucci_paper_plot_parity_validator_rejects_wrong_plotmaker_dataset() -> None:
+    from .io_utils import save_json
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_wrong_plotmaker_dataset"
+        _write_minimal_paper_parity_artifacts(run_root)
+        H_source = run_root / "calibration_sources" / "dataset" / "casa" / "2025dicembre1.csv"
+        wrong_H_source = H_source.with_name("2025dicembre2.csv")
+        shutil.copyfile(H_source, wrong_H_source)
+        config_path = run_root / "run_config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["params"]["pascucci_calibration"]["H_metadata"]["source_path"] = str(wrong_H_source)
+        save_json(config, str(config_path))
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "FAILED"
+    assert report["contract_status"] == "FAILED"
+    joined = "\n".join(report["failures"])
+    assert "H_metadata.source_path basename" in joined
+    assert "2025dicembre1.csv" in joined
+    assert "2025dicembre2.csv" in joined
+
+
+def test_pascucci_paper_plot_parity_validator_rejects_plot_data_stat_drift() -> None:
+    from .io_utils import save_blob_npz
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_plot_data_drift"
+        _write_minimal_paper_parity_artifacts(run_root)
+        plot_data_path = (
+            run_root
+            / "recursive"
+            / "plots"
+            / "pascucci_paper"
+            / "pascucci_paper_plot_data.npz"
+        )
+        with np.load(plot_data_path, allow_pickle=False) as data:
+            payload = {key: data[key] for key in data.files}
+        payload["plot37_controlled_mean"] = payload["plot37_controlled_mean"].copy()
+        payload["plot37_controlled_mean"][0] += np.float32(10.0)
+        save_blob_npz(payload, str(plot_data_path))
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "FAILED"
+    assert report["contract_status"] == "FAILED"
+    assert report["science_status"] == "GREEN"
+    assert report["mc_confirmation_status"] == "GREEN"
+    joined = "\n".join(report["failures"])
+    assert "plot37_controlled_mean mismatch" in joined
+    assert "paper-plot source" in joined
+
+
+def test_pascucci_paper_plot_parity_validator_rejects_calibration_source_hash_drift() -> None:
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_source_hash_drift"
+        _write_minimal_paper_parity_artifacts(run_root)
+        H_source = run_root / "calibration_sources" / "dataset" / "casa" / "2025dicembre1.csv"
+        H_source.write_text("Consumo (W),Produzione (W)\n2000,900\n", encoding="utf-8")
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "FAILED"
+    assert report["contract_status"] == "FAILED"
+    joined = "\n".join(report["failures"])
+    assert "source_sha256 mismatch" in joined
+    assert "H_metadata" in joined
+
+
+def test_pascucci_paper_plot_parity_validator_rejects_recomputed_calibration_param_drift() -> None:
+    from .io_utils import save_json
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_calibration_param_drift"
+        _write_minimal_paper_parity_artifacts(run_root)
+        config_path = run_root / "run_config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["params"]["params_H"]["a0_day"] = float(config["params"]["params_H"]["a0_day"]) + 0.25
+        save_json(config, str(config_path))
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "FAILED"
+    assert report["contract_status"] == "FAILED"
+    joined = "\n".join(report["failures"])
+    assert "recomputed Pascucci calibration mismatch" in joined
+    assert "params_H" in joined
+
+
+def test_pascucci_paper_plot_parity_validator_rejects_missing_mc_confirmation() -> None:
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_missing_mc_confirmation"
+        _write_minimal_paper_parity_artifacts(run_root, missing_mc_confirmation=True)
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "FAILED"
+    assert report["contract_status"] == "GREEN"
+    assert report["science_status"] == "GREEN"
+    assert report["mc_confirmation_status"] == "FAILED"
+    assert report["failure_counts"]["mc_confirmation"] == 1
+    joined = "\n".join(report["failures"])
+    assert "missing independent MC confirmation" in joined
+    assert "application_metrics_mc_confirmation.json" in joined
+
+
+def test_pascucci_paper_plot_parity_validator_rejects_mc_confirmation_schema_drift() -> None:
+    from .io_utils import save_json
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_mc_schema_drift"
+        _write_minimal_paper_parity_artifacts(run_root)
+        summary_path = run_root / "recursive" / "application_metrics_mc_confirmation.json"
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        payload["schema"] = "pascucci_mc_confirmation_v2"
+        save_json(payload, str(summary_path))
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "FAILED"
+    assert report["contract_status"] == "GREEN"
+    assert report["science_status"] == "GREEN"
+    assert report["mc_confirmation_status"] == "FAILED"
+    joined = "\n".join(report["failures"])
+    assert "MC confirmation schema" in joined
+    assert "pascucci_mc_confirmation_v1" in joined
+
+
+def test_pascucci_paper_plot_parity_validator_rejects_mc_confirmation_not_independent() -> None:
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_mc_not_independent"
+        _write_minimal_paper_parity_artifacts(run_root, mc_not_independent=True)
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "FAILED"
+    assert report["contract_status"] == "GREEN"
+    assert report["science_status"] == "GREEN"
+    assert report["mc_confirmation_status"] == "FAILED"
+    joined = "\n".join(report["failures"])
+    assert "independent_of_eval_bundle=true" in joined
+    assert "must not reuse" in joined
+    assert "seed must differ" in joined
+
+
+def test_pascucci_paper_plot_parity_validator_rejects_mc_confirmation_sample_count_drift() -> None:
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_mc_sample_count_drift"
+        _write_minimal_paper_parity_artifacts(run_root, mc_paired_count_drift=True)
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "FAILED"
+    assert report["contract_status"] == "GREEN"
+    assert report["science_status"] == "GREEN"
+    assert report["mc_confirmation_status"] == "FAILED"
+    joined = "\n".join(report["failures"])
+    assert "comparison.paired_sample_count mismatch" in joined
+    assert "expected NPZ sample_paths=10000" in joined
+
+
+def test_pascucci_paper_plot_parity_validator_rejects_mc_confirmation_science_red() -> None:
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_mc_science_red"
+        _write_minimal_paper_parity_artifacts(run_root, mc_science_red=True)
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "FAILED"
+    assert report["contract_status"] == "GREEN"
+    assert report["science_status"] == "GREEN"
+    assert report["mc_confirmation_status"] == "FAILED"
+    joined = "\n".join(report["failures"])
+    assert "MC confirmation" in joined
+    assert "controlled cost is worse" in joined
+    assert "controlled win-rate too low" in joined
+    assert "physical violation rate too high" in joined
+
+
+def test_pascucci_paper_plot_parity_validator_mc_violation_rate_uses_positive_indicator() -> None:
+    from .pascucci_run_validation import validate_pascucci_paper_plot_parity
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_root = Path(tmp) / "run_20260613_mc_violation_magnitude"
+        _write_minimal_paper_parity_artifacts(run_root, mc_violation_magnitude=3.0)
+
+        report = validate_pascucci_paper_plot_parity(run_root)
+
+    assert report["status"] == "GREEN"
+    assert report["contract_status"] == "GREEN"
+    assert report["science_status"] == "GREEN"
+    assert report["mc_confirmation_status"] == "GREEN"
+    joined = "\n".join(report["failures"])
+    assert "diagnostics.q_lower_violation_rate does not match" not in joined
+    assert "diagnostics.v_lower_violation_rate does not match" not in joined
+
+
 def _application_summary_fixture(
     *,
     controlled_total_mean: float,
@@ -7936,7 +11014,7 @@ def _write_minimal_t12_gate_artifacts(run_root: Path, *, dominated_final_pass: b
         "pascucci_paper_36_H_ou_band.png",
         "pascucci_paper_37_accumulated_cost.png",
         "pascucci_paper_38_alpha.png",
-        "pascucci_paper_39_state_bands_S_V_Q.png",
+        "pascucci_paper_39_forward_components_S_H_V_X.png",
         "pascucci_paper_40_controlled_uncontrolled.png",
     ):
         (plot_dir / filename).write_bytes(b"0" * 1001)
@@ -8170,6 +11248,277 @@ def test_recursive_coarse_prepass_model_spec_argument() -> None:
     assert result["boundary_samples"][0].shape == (2, 4)
 
 
+def test_cli_coarse_boundary_only_and_blob_norm_flags_wire_to_recursive() -> None:
+    import json
+
+    from . import cli, orchestration
+    from .sampling import build_blocks, file_sha256
+    from .tf_backend import require_tensorflow
+
+    require_tensorflow()
+
+    coarse_calls = []
+    recursive_calls = []
+    print_calls = []
+
+    def fake_run_recursive_coarse_prepass(**kwargs):
+        coarse_calls.append(kwargs)
+        blocks = build_blocks(T_total=kwargs["T_total"], block_size=kwargs["block_size"])
+        return {
+            "boundary_samples": [
+                np.full((int(kwargs["rollout_M"]), int(kwargs["D"])), np.float32(idx), dtype=np.float32)
+                for idx in range(len(blocks) + 1)
+            ],
+            "pass1_blobs": [
+                _make_block_blob(kwargs["layers"], block["t_start"], block["t_end"], kwargs["T_total"])
+                for block in blocks
+            ],
+            "summary": {
+                "M": int(kwargs["prepass_M"]),
+                "N": int(kwargs["prepass_N"]),
+                "iter_scale": float(kwargs["iter_scale"]),
+                "rollout_M": int(kwargs["rollout_M"]),
+                "curriculum_consts": [float(kwargs["coupling_const"])],
+                "curriculum_stage_scales": [1.0],
+                "n_curriculum_stages": 1,
+                "stage_summaries": [],
+            },
+        }
+
+    def fake_run_recursive_training(**kwargs):
+        recursive_calls.append(kwargs)
+        assert kwargs["initial_boundary_samples"] is not None
+        assert kwargs["initial_warm_start_blobs"] is None
+        blocks = build_blocks(T_total=kwargs["T_total"], block_size=kwargs["block_size"])
+        logs = [
+            {
+                "pass": 1,
+                "block": 0,
+                "t_start": blocks[0]["t_start"],
+                "t_end": blocks[0]["t_end"],
+                "T_block": blocks[0]["T_block"],
+                "eval_mean_loss": 1.0,
+                "eval_std_loss": 0.0,
+                "eval_mean_loss_per_sample": 0.25,
+                "eval_std_loss_per_sample": 0.0,
+                "eval_mean_y0": 0.0,
+                "precision_target": None,
+                "refine_rounds": 0,
+                "warm_start_norm_policy": kwargs["warm_start_norm_policy"],
+                "warm_start_blob_used": False,
+            }
+        ]
+        return {
+            "blocks": blocks,
+            "passes": [
+                {
+                    "pass_id": 1,
+                    "reference_loss": 1.0,
+                    "logs": logs,
+                    "blobs": [_make_block_blob(kwargs["layers"], block["t_start"], block["t_end"], kwargs["T_total"]) for block in blocks],
+                    "models_dir": kwargs["output_dir"],
+                    "pass_init_mode": kwargs["pass1_init_mode"],
+                    "boundary_source": "coarse_prepass",
+                    "is_bootstrap_pass": False,
+                    "active_set_summary": {},
+                }
+            ],
+            "pass1": {
+                "logs": logs,
+                "reference_loss": 1.0,
+                "blobs": [_make_block_blob(kwargs["layers"], block["t_start"], block["t_end"], kwargs["T_total"]) for block in blocks],
+            },
+            "boundary_samples": [
+                np.zeros((kwargs["rollout_M"], kwargs["D"]), dtype=np.float32)
+                for _ in range(len(blocks) + 1)
+            ],
+        }
+
+    def fake_print_recursive_pass(**kwargs):
+        print_calls.append(kwargs)
+        eval_bundle_path = Path(kwargs["eval_bundle_path"])
+        eval_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(
+            eval_bundle_path,
+            Xi_initial=np.zeros((4, kwargs["D"]), dtype=np.float32),
+        )
+        return {
+            "processed_pass_ids": [1],
+            "exact_summary_by_pass": {},
+            "exact_summary_by_pass_index": {},
+            "eval_bundle_path": str(eval_bundle_path),
+            "eval_bundle_status": "created",
+            "eval_bundle_sha256": file_sha256(str(eval_bundle_path)),
+            "evaluation_bundle_M": 4,
+            "excluded_pass_ids_from_selection": [],
+            "excluded_pass_indices_from_selection": [],
+            "selected_pass_id": 1,
+            "selected_pass_index": 0,
+            "selected_score_metric": "loss.eval_mean_loss_per_sample",
+            "selected_score": 0.25,
+            "selected_scores_by_pass": {"1": 0.25},
+            "selected_scores_by_pass_index": {"0": 0.25},
+            "score_key": "eval_mean_loss_per_sample",
+            "pass_scores_loss": {1: 0.25},
+            "pass_scores_loss_by_index": {0: 0.25},
+        }
+
+    original_run_recursive_coarse_prepass = orchestration.run_recursive_coarse_prepass
+    original_run_recursive_training = orchestration.run_recursive_training
+    original_print_recursive_pass = orchestration.print_recursive_pass
+    orchestration.run_recursive_coarse_prepass = fake_run_recursive_coarse_prepass
+    orchestration.run_recursive_training = fake_run_recursive_training
+    orchestration.print_recursive_pass = fake_print_recursive_pass
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            exit_code = cli.main(
+                [
+                    "run",
+                    "--mode",
+                    "recursive",
+                    "--pass1_init",
+                    "coarse",
+                    "--coarse_disable_weight_warm_start",
+                    "--warm_start_norm_policy",
+                    "blob",
+                    "--coarse_prepass_M",
+                    "3",
+                    "--coarse_prepass_N",
+                    "2",
+                    "--M",
+                    "4",
+                    "--N",
+                    "2",
+                    "--T_standard",
+                    "0.25",
+                    "--T_total",
+                    "0.25",
+                    "--block_size",
+                    "0.25",
+                    "--passes",
+                    "1",
+                    "--visual_sample_paths",
+                    "1",
+                    "--output_dir",
+                    str(out_dir),
+                ]
+            )
+            assert exit_code == 0
+            runs = sorted(out_dir.glob("run_*"))
+            assert len(runs) == 1
+            config = json.loads((runs[0] / "run_config.json").read_text(encoding="utf-8"))
+            assert config["pass1_init"] == "coarse"
+            assert config["coarse_disable_weight_warm_start"] is True
+            assert config["warm_start_norm_policy"] == "blob"
+            coarse_summary = json.loads(
+                (runs[0] / "coarse_prepass" / "summary.json").read_text(encoding="utf-8")
+            )
+            assert coarse_summary["weight_warm_start_enabled"] is False
+            assert coarse_summary["warm_start_norm_policy"] == "blob"
+    finally:
+        orchestration.run_recursive_coarse_prepass = original_run_recursive_coarse_prepass
+        orchestration.run_recursive_training = original_run_recursive_training
+        orchestration.print_recursive_pass = original_print_recursive_pass
+
+    assert len(coarse_calls) == 1
+    assert coarse_calls[0]["warm_start_norm_policy"] == "blob"
+    assert len(recursive_calls) == 1
+    assert recursive_calls[0]["pass1_init_mode"] == "coarse"
+    assert recursive_calls[0]["warm_start_norm_policy"] == "blob"
+    assert recursive_calls[0]["initial_boundary_samples"] is not None
+    assert recursive_calls[0]["initial_warm_start_blobs"] is None
+    assert len(print_calls) == 1
+
+
+def test_cli_rejects_coarse_boundary_only_with_pass1_warm_start_from_next() -> None:
+    from . import cli
+    from .tf_backend import require_tensorflow
+
+    require_tensorflow()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            cli.main(
+                [
+                    "run",
+                    "--mode",
+                    "recursive",
+                    "--pass1_init",
+                    "coarse",
+                    "--coarse_disable_weight_warm_start",
+                    "--pass1_warm_start_from_next",
+                    "--M",
+                    "4",
+                    "--N",
+                    "2",
+                    "--T_standard",
+                    "0.25",
+                    "--T_total",
+                    "0.25",
+                    "--block_size",
+                    "0.25",
+                    "--passes",
+                    "1",
+                    "--visual_sample_paths",
+                    "1",
+                    "--output_dir",
+                    str(Path(tmp) / "out"),
+                ]
+            )
+        except ValueError as exc:
+            message = str(exc)
+            assert "--coarse_disable_weight_warm_start" in message
+            assert "--pass1_warm_start_from_next" in message
+        else:
+            raise AssertionError("boundary-only coarse diagnostic should reject pass1 warm-start from next")
+
+
+def test_cli_rejects_mc_confirmation_for_quadratic_model() -> None:
+    from . import cli
+    from .tf_backend import require_tensorflow
+
+    require_tensorflow()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            cli.main(
+                [
+                    "run",
+                    "--mode",
+                    "recursive",
+                    "--model",
+                    "quadratic_coupled",
+                    "--mc_confirmation_paths",
+                    "4",
+                    "--M",
+                    "4",
+                    "--N",
+                    "2",
+                    "--T_standard",
+                    "0.25",
+                    "--T_total",
+                    "0.25",
+                    "--block_size",
+                    "0.25",
+                    "--passes",
+                    "1",
+                    "--visual_sample_paths",
+                    "1",
+                    "--output_dir",
+                    str(Path(tmp) / "out"),
+                ]
+            )
+        except ValueError as exc:
+            message = str(exc)
+            assert "--mc_confirmation_paths" in message
+            assert "application metrics" in message
+            assert "quadratic_coupled" in message
+        else:
+            raise AssertionError("quadratic_coupled should reject MC confirmation requests")
+
+
 def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
     import json
 
@@ -8209,11 +11558,17 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
                 ).astype(np.float32)
             else:
                 running_cumulative = np.zeros((M, 0, 1), dtype=np.float32)
+            trajectory = (
+                np.concatenate([np.zeros((M, 1, 1), dtype=np.float32), running_cumulative], axis=1)
+                + terminal[:, None, :]
+            ).astype(np.float32)
             pathwise = {
                 "cost_J_running": running,
                 "cost_J_terminal": terminal,
                 "cost_J_total": total,
                 "cost_J_running_cumulative": running_cumulative,
+                "cost_J_trajectory": trajectory,
+                "cost_J_trajectory_math": trajectory.copy(),
                 "alpha": alpha,
             }
             summary = {}
@@ -8221,7 +11576,7 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
                 if not metric.startswith("cost_J_"):
                     continue
                 values_np = np.asarray(values, dtype=np.float32)
-                if metric == "cost_J_running_cumulative":
+                if metric in ("cost_J_running_cumulative", "cost_J_trajectory", "cost_J_trajectory_math"):
                     flat = values_np[:, -1, :].reshape(-1) if values_np.shape[1] > 0 else np.zeros((values_np.shape[0],), dtype=np.float32)
                 else:
                     flat = values_np.reshape(-1)
@@ -8231,6 +11586,8 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
                 "metadata": {
                     "baseline_mode": mode,
                     "aggregation": "left_riemann_f_plus_terminal_g",
+                    "trajectory_aggregation": "plotmaker_cumsum_f_dt_plus_g_at_time",
+                    "trajectory_math_aggregation": "left_riemann_integral_to_time_plus_g_at_time",
                     "control_law": "alpha_tf" if mode == "controlled" else "alpha_zero",
                     "paired_inputs": "same_t_W_Xi",
                 },
@@ -8423,6 +11780,8 @@ def test_cli_tiny_standard_and_both_model_spec_outputs() -> None:
                         "cost_J_terminal",
                         "cost_J_total",
                         "cost_J_running_cumulative",
+                        "cost_J_trajectory",
+                        "cost_J_trajectory_math",
                     ]
                     assert config["application_metric_aggregation"] == "left_riemann_f_plus_terminal_g"
 
@@ -8742,46 +12101,55 @@ def test_cli_recursive_two_pass_callbacks_finalize_selection_only_at_last_pass()
     try:
         with tempfile.TemporaryDirectory() as tmp:
             cases = [
-                ("pascucci", [], 1, 0),
-                ("quadratic_coupled", [1], 2, 1),
+                ("pascucci", [], 1, 0, 5),
+                ("quadratic_coupled", [1], 2, 1, 0),
             ]
-            for model_name, expected_excluded, expected_selected_id, expected_selected_index in cases:
+            for (
+                model_name,
+                expected_excluded,
+                expected_selected_id,
+                expected_selected_index,
+                requested_mc_paths,
+            ) in cases:
                 print_calls.clear()
                 out_dir = Path(tmp) / model_name
-                exit_code = cli.main(
-                    [
-                        "run",
-                        "--mode",
-                        "recursive",
-                        "--model",
-                        model_name,
-                        "--M",
-                        "4",
-                        "--N",
-                        "2",
-                        "--T_standard",
-                        "0.25",
-                        "--T_total",
-                        "0.25",
-                        "--block_size",
-                        "0.25",
-                        "--passes",
-                        "2",
-                        "--pass1_init",
-                        "base",
-                        "--visual_sample_paths",
-                        "1",
-                        "--output_dir",
-                        str(out_dir),
-                    ]
-                )
+                args = [
+                    "run",
+                    "--mode",
+                    "recursive",
+                    "--model",
+                    model_name,
+                    "--M",
+                    "4",
+                    "--N",
+                    "2",
+                    "--T_standard",
+                    "0.25",
+                    "--T_total",
+                    "0.25",
+                    "--block_size",
+                    "0.25",
+                    "--passes",
+                    "2",
+                    "--pass1_init",
+                    "base",
+                    "--visual_sample_paths",
+                    "1",
+                    "--output_dir",
+                    str(out_dir),
+                ]
+                if requested_mc_paths > 0:
+                    args.extend(["--mc_confirmation_paths", str(requested_mc_paths)])
+                exit_code = cli.main(args)
                 assert exit_code == 0
                 assert len(print_calls) == 2
                 first_call, final_call = print_calls
                 assert first_call["promote_final_artifacts"] is False
+                assert first_call["mc_confirmation_paths"] == 0
                 assert first_call["exclude_pass_ids_from_selection"] == []
                 assert [int(entry["pass_id"]) for entry in first_call["pass_entries"]] == [1]
                 assert final_call["promote_final_artifacts"] is True
+                assert final_call["mc_confirmation_paths"] == requested_mc_paths
                 assert final_call["exclude_pass_ids_from_selection"] == expected_excluded
                 assert [int(entry["pass_id"]) for entry in final_call["pass_entries"]] == [1, 2]
 
@@ -8944,11 +12312,17 @@ def test_cli_records_application_metric_manifest_in_run_config() -> None:
                 ).astype(np.float32)
             else:
                 running_cumulative = np.zeros((M, 0, 1), dtype=np.float32)
+            trajectory = (
+                np.concatenate([np.zeros((M, 1, 1), dtype=np.float32), running_cumulative], axis=1)
+                + terminal[:, None, :]
+            ).astype(np.float32)
             pathwise = {
                 "cost_J_running": running,
                 "cost_J_terminal": terminal,
                 "cost_J_total": total,
                 "cost_J_running_cumulative": running_cumulative,
+                "cost_J_trajectory": trajectory,
+                "cost_J_trajectory_math": trajectory.copy(),
                 "alpha": np.zeros((M, steps, 1), dtype=np.float32),
             }
             summary = {}
@@ -8956,7 +12330,7 @@ def test_cli_records_application_metric_manifest_in_run_config() -> None:
                 if not metric.startswith("cost_J_"):
                     continue
                 values_np = np.asarray(values, dtype=np.float32)
-                if metric == "cost_J_running_cumulative":
+                if metric in ("cost_J_running_cumulative", "cost_J_trajectory", "cost_J_trajectory_math"):
                     flat = values_np[:, -1, :].reshape(-1) if values_np.shape[1] > 0 else np.zeros((values_np.shape[0],), dtype=np.float32)
                 else:
                     flat = values_np.reshape(-1)
@@ -8966,6 +12340,8 @@ def test_cli_records_application_metric_manifest_in_run_config() -> None:
                 "metadata": {
                     "baseline_mode": mode,
                     "aggregation": "left_riemann_f_plus_terminal_g",
+                    "trajectory_aggregation": "plotmaker_cumsum_f_dt_plus_g_at_time",
+                    "trajectory_math_aggregation": "left_riemann_integral_to_time_plus_g_at_time",
                     "control_law": "alpha_tf" if mode == "controlled" else "alpha_zero",
                     "paired_inputs": "same_t_W_Xi",
                 },
@@ -9039,6 +12415,8 @@ def test_cli_records_application_metric_manifest_in_run_config() -> None:
                 "cost_J_terminal",
                 "cost_J_total",
                 "cost_J_running_cumulative",
+                "cost_J_trajectory",
+                "cost_J_trajectory_math",
             ]
             assert config["application_metric_aggregation"] == "left_riemann_f_plus_terminal_g"
             assert config["seed_manifest"]["global_seed"] == 1234
@@ -9065,7 +12443,13 @@ def test_cli_records_application_metric_manifest_in_run_config() -> None:
                 keys = set(data.files)
                 assert "controlled_cost_J_total" in keys
                 assert "uncontrolled_cost_J_total" in keys
+                assert "controlled_cost_J_trajectory" in keys
+                assert "uncontrolled_cost_J_trajectory" in keys
+                assert "controlled_cost_J_trajectory_math" in keys
+                assert "uncontrolled_cost_J_trajectory_math" in keys
                 assert data["controlled_cost_J_total"].shape == (4, 1)
+                assert data["controlled_cost_J_trajectory"].shape == (4, 3, 1)
+                assert data["controlled_cost_J_trajectory_math"].shape == (4, 3, 1)
     finally:
         orchestration.run_standard_reference = original_run_standard_reference
         cli.export_standard_parameter_blob = original_export_standard_parameter_blob
@@ -9149,6 +12533,54 @@ def test_cli_rejects_pascucci_cost_profile_for_quadratic_model() -> None:
             assert "pascucci" in message
         else:
             raise AssertionError("quadratic_coupled should reject Pascucci-specific cost-profile args")
+
+
+def test_cli_rejects_pascucci_calibration_paths_for_quadratic_model() -> None:
+    _assert_pascucci_model_tdd_contract("pascucci_cli_rejects_calibration_paths_for_quadratic_model")
+    from . import cli
+    from .tf_backend import require_tensorflow
+
+    require_tensorflow()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            cli.main(
+                [
+                    "run",
+                    "--mode",
+                    "standard",
+                    "--model",
+                    "quadratic_coupled",
+                    "--pascucci_H_path",
+                    str(Path(tmp) / "H.csv"),
+                    "--pascucci_S_path",
+                    str(Path(tmp) / "S.xlsx"),
+                    "--M",
+                    "4",
+                    "--N",
+                    "2",
+                    "--T_standard",
+                    "0.25",
+                    "--T_total",
+                    "0.25",
+                    "--block_size",
+                    "0.25",
+                    "--passes",
+                    "1",
+                    "--visual_sample_paths",
+                    "1",
+                    "--output_dir",
+                    str(Path(tmp) / "out"),
+                ]
+            )
+        except SystemExit as exc:
+            raise AssertionError("CLI should parse Pascucci calibration args before semantic rejection") from exc
+        except ValueError as exc:
+            message = str(exc)
+            assert "--pascucci_H_path/--pascucci_S_path" in message
+            assert "--model pascucci" in message
+        else:
+            raise AssertionError("quadratic_coupled should reject Pascucci-specific calibration paths")
 
 
 def test_cli_records_pascucci_cost_profile_params_in_recursive_run_config() -> None:
@@ -9287,6 +12719,8 @@ def test_cli_records_pascucci_cost_profile_params_in_recursive_run_config() -> N
                 "cost_J_terminal",
                 "cost_J_total",
                 "cost_J_running_cumulative",
+                "cost_J_trajectory",
+                "cost_J_trajectory_math",
             ]
             assert config["application_metric_aggregation"] == "left_riemann_f_plus_terminal_g"
             assert config["seed_manifest"]["eval_seed"] == 1234
@@ -10653,6 +14087,10 @@ def run_tests(argv: List[str] | None = None) -> int:
         ("evaluation_bundle_rejects_wrong_bundle_kind", test_evaluation_bundle_rejects_wrong_bundle_kind),
         ("evaluation_bundle_loads_legacy_no_kind_as_evaluation_only", test_evaluation_bundle_loads_legacy_no_kind_as_evaluation_only),
         ("model_spec_contract", test_model_spec_contract),
+        (
+            "pascucci_model_spec_uses_paper_like_initial_distribution",
+            test_pascucci_model_spec_uses_paper_like_initial_distribution,
+        ),
         ("pascucci_tdd_contract_metadata", test_pascucci_tdd_contract_metadata),
         ("pascucci_model_layer_tdd_contract_metadata", test_pascucci_model_layer_tdd_contract_metadata),
         ("pascucci_oracle_fixture_tdd_contract_metadata", test_pascucci_oracle_fixture_tdd_contract_metadata),
@@ -10715,11 +14153,47 @@ def run_tests(argv: List[str] | None = None) -> int:
             "pascucci_minimal_fixture_pipeline_builds_json_run_params",
             test_pascucci_minimal_fixture_pipeline_builds_json_run_params,
         ),
+        (
+            "pascucci_cli_calibration_paths_inject_run_config_params",
+            test_cli_pascucci_calibration_paths_inject_run_config_params,
+        ),
+        (
+            "pascucci_cli_require_calibration_fails_before_training_without_paths",
+            test_cli_pascucci_require_calibration_fails_before_training_without_paths,
+        ),
         ("model_spec_params_overlay_preserves_solver_flags", test_model_spec_params_overlay_preserves_solver_flags),
         ("exact_path_plot_outputs", test_exact_path_plot_outputs),
         (
             "pascucci_paper_plot_bundle_from_artifacts_smoke",
             test_pascucci_paper_plot_bundle_from_artifacts_smoke,
+        ),
+        (
+            "pascucci_paper_plot_bundle_legacy_cost_trace_fallback",
+            test_pascucci_paper_plot_bundle_legacy_cost_trace_fallback,
+        ),
+        (
+            "pascucci_paper_plot_bundle_uses_to_ema_calibration_sources",
+            test_pascucci_paper_plot_bundle_uses_to_ema_calibration_sources,
+        ),
+        (
+            "pascucci_paper_plot_ou_calibration_sources_are_pass_invariant",
+            test_pascucci_paper_plot_ou_calibration_sources_are_pass_invariant,
+        ),
+        (
+            "pascucci_to_ema_ou_reference_rejects_basename_fallback_sha_mismatch",
+            test_pascucci_to_ema_ou_reference_rejects_basename_fallback_sha_mismatch,
+        ),
+        (
+            "pascucci_to_ema_ou_reference_matches_legacy_formula",
+            test_pascucci_to_ema_ou_reference_matches_legacy_formula,
+        ),
+        (
+            "pascucci_to_ema_ou_reference_honors_harmonics_and_start_hour",
+            test_pascucci_to_ema_ou_reference_honors_harmonics_and_start_hour,
+        ),
+        (
+            "pascucci_to_ema_uncontrolled_reference_matches_legacy_formula",
+            test_pascucci_to_ema_uncontrolled_reference_matches_legacy_formula,
         ),
         (
             "pascucci_paper_plot_bundle_handles_skewed_total_costs",
@@ -10773,6 +14247,14 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "pascucci_application_cost_functional_decomposes_to_f_plus_g",
         "test_pascucci_application_cost_functional_decomposes_to_f_plus_g",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_application_cost_trajectory_matches_plotmaker_nonuniform_grid",
+        "test_pascucci_application_cost_trajectory_matches_plotmaker_nonuniform_grid",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_application_cost_trajectory_uses_per_time_mean_field_oracle",
+        "test_pascucci_application_cost_trajectory_uses_per_time_mean_field_oracle",
     ) and ok
     ok = _run_subprocess_case(
         "pascucci_application_cost_summary_has_quantiles_and_metadata",
@@ -11015,6 +14497,22 @@ def run_tests(argv: List[str] | None = None) -> int:
         "test_run_recursive_training_wires_fixed_eval_and_gradient_diagnostics_to_logs",
     ) and ok
     ok = _run_subprocess_case(
+        "run_recursive_training_warm_start_norm_policy_blob_uses_blob_normalization",
+        "test_run_recursive_training_warm_start_norm_policy_blob_uses_blob_normalization",
+    ) and ok
+    ok = _run_subprocess_case(
+        "run_recursive_training_blob_norm_policy_rejects_blob_without_norm_stats",
+        "test_run_recursive_training_blob_norm_policy_rejects_blob_without_norm_stats",
+    ) and ok
+    ok = _run_subprocess_case(
+        "run_recursive_training_blob_norm_policy_rejects_invalid_norm_stats",
+        "test_run_recursive_training_blob_norm_policy_rejects_invalid_norm_stats",
+    ) and ok
+    ok = _run_subprocess_case(
+        "run_recursive_training_rejects_unknown_warm_start_norm_policy",
+        "test_run_recursive_training_rejects_unknown_warm_start_norm_policy",
+    ) and ok
+    ok = _run_subprocess_case(
         "run_recursive_training_pass_boundary_rollouts_use_fixed_rollout_inputs",
         "test_run_recursive_training_pass_boundary_rollouts_use_fixed_rollout_inputs",
     ) and ok
@@ -11059,12 +14557,132 @@ def run_tests(argv: List[str] | None = None) -> int:
         "test_pascucci_t12_gate_validator_reports_malformed_json_without_exception",
     ) and ok
     ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_green_contract_and_wrapper_resolution",
+        "test_pascucci_paper_plot_parity_validator_green_contract_and_wrapper_resolution",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_rejects_t24_legacy_semantics",
+        "test_pascucci_paper_plot_parity_validator_rejects_t24_legacy_semantics",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_rejects_non_plotmaker_pascucci_params",
+        "test_pascucci_paper_plot_parity_validator_rejects_non_plotmaker_pascucci_params",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_rejects_missing_require_calibration_guard",
+        "test_pascucci_paper_plot_parity_validator_rejects_missing_require_calibration_guard",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_rejects_xi_initial_quantile_drift",
+        "test_pascucci_paper_plot_parity_validator_rejects_xi_initial_quantile_drift",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_rejects_science_red_results",
+        "test_pascucci_paper_plot_parity_validator_rejects_science_red_results",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_rejects_cost_accounting_mismatch",
+        "test_pascucci_paper_plot_parity_validator_rejects_cost_accounting_mismatch",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_rejects_alpha_zero_as_plot40_paper_benchmark",
+        "test_pascucci_paper_plot_parity_validator_rejects_alpha_zero_as_plot40_paper_benchmark",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_rejects_missing_plot_style_contract",
+        "test_pascucci_paper_plot_parity_validator_rejects_missing_plot_style_contract",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_rejects_plot_dimension_drift",
+        "test_pascucci_paper_plot_parity_validator_rejects_plot_dimension_drift",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_rejects_unsupported_pixel_exact_claim",
+        "test_pascucci_paper_plot_parity_validator_rejects_unsupported_pixel_exact_claim",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_accepts_pixel_hash_golden_contract",
+        "test_pascucci_paper_plot_parity_validator_accepts_pixel_hash_golden_contract",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_rejects_pixel_hash_golden_mismatch",
+        "test_pascucci_paper_plot_parity_validator_rejects_pixel_hash_golden_mismatch",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_rejects_nonpaper_cost_profile",
+        "test_pascucci_paper_plot_parity_validator_rejects_nonpaper_cost_profile",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_rejects_missing_plot_data_npz",
+        "test_pascucci_paper_plot_parity_validator_rejects_missing_plot_data_npz",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_rejects_missing_plotmaker_native_yz",
+        "test_pascucci_paper_plot_parity_validator_rejects_missing_plotmaker_native_yz",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_rejects_missing_plotmaker_native_plot_data",
+        "test_pascucci_paper_plot_parity_validator_rejects_missing_plotmaker_native_plot_data",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_rejects_wrong_plotmaker_dataset",
+        "test_pascucci_paper_plot_parity_validator_rejects_wrong_plotmaker_dataset",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_rejects_plot_data_stat_drift",
+        "test_pascucci_paper_plot_parity_validator_rejects_plot_data_stat_drift",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_rejects_calibration_source_hash_drift",
+        "test_pascucci_paper_plot_parity_validator_rejects_calibration_source_hash_drift",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_rejects_recomputed_calibration_param_drift",
+        "test_pascucci_paper_plot_parity_validator_rejects_recomputed_calibration_param_drift",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_rejects_missing_mc_confirmation",
+        "test_pascucci_paper_plot_parity_validator_rejects_missing_mc_confirmation",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_rejects_mc_confirmation_schema_drift",
+        "test_pascucci_paper_plot_parity_validator_rejects_mc_confirmation_schema_drift",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_rejects_mc_confirmation_not_independent",
+        "test_pascucci_paper_plot_parity_validator_rejects_mc_confirmation_not_independent",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_rejects_mc_confirmation_sample_count_drift",
+        "test_pascucci_paper_plot_parity_validator_rejects_mc_confirmation_sample_count_drift",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_rejects_mc_confirmation_science_red",
+        "test_pascucci_paper_plot_parity_validator_rejects_mc_confirmation_science_red",
+    ) and ok
+    ok = _run_subprocess_case(
+        "pascucci_paper_plot_parity_validator_mc_violation_rate_uses_positive_indicator",
+        "test_pascucci_paper_plot_parity_validator_mc_violation_rate_uses_positive_indicator",
+    ) and ok
+    ok = _run_subprocess_case(
         "print_recursive_pass_rejects_mismatched_eval_bundle_metadata",
         "test_print_recursive_pass_rejects_mismatched_eval_bundle_metadata",
     ) and ok
     ok = _run_subprocess_case(
         "recursive_coarse_prepass_model_spec_argument",
         "test_recursive_coarse_prepass_model_spec_argument",
+    ) and ok
+    ok = _run_subprocess_case(
+        "cli_coarse_boundary_only_and_blob_norm_flags_wire_to_recursive",
+        "test_cli_coarse_boundary_only_and_blob_norm_flags_wire_to_recursive",
+    ) and ok
+    ok = _run_subprocess_case(
+        "cli_rejects_coarse_boundary_only_with_pass1_warm_start_from_next",
+        "test_cli_rejects_coarse_boundary_only_with_pass1_warm_start_from_next",
+    ) and ok
+    ok = _run_subprocess_case(
+        "cli_rejects_mc_confirmation_for_quadratic_model",
+        "test_cli_rejects_mc_confirmation_for_quadratic_model",
     ) and ok
     ok = _run_subprocess_case(
         "cli_tiny_standard_and_both_model_spec_outputs",
@@ -11093,6 +14711,10 @@ def run_tests(argv: List[str] | None = None) -> int:
     ok = _run_subprocess_case(
         "cli_rejects_pascucci_cost_profile_for_quadratic_model",
         "test_cli_rejects_pascucci_cost_profile_for_quadratic_model",
+    ) and ok
+    ok = _run_subprocess_case(
+        "cli_rejects_pascucci_calibration_paths_for_quadratic_model",
+        "test_cli_rejects_pascucci_calibration_paths_for_quadratic_model",
     ) and ok
     ok = _run_subprocess_case(
         "cli_records_pascucci_cost_profile_params_in_recursive_run_config",

@@ -1199,15 +1199,22 @@ class NN_Pascucci(FBSNN):
 
     def _application_summary_np(self, pathwise):
         summary = {}
-        for key in ("cost_J_running", "cost_J_terminal", "cost_J_total", "cost_J_running_cumulative"):
-            if key == "cost_J_running_cumulative":
-                cumulative = np.asarray(pathwise[key], dtype=np.float32)
-                if cumulative.ndim != 3:
-                    raise ValueError(f"{key} must have shape (M, n_steps, 1), got {cumulative.shape}")
-                if cumulative.shape[1] == 0:
-                    values = np.zeros((cumulative.shape[0], 1), dtype=np.float32)
+        for key in (
+            "cost_J_running",
+            "cost_J_terminal",
+            "cost_J_total",
+            "cost_J_running_cumulative",
+            "cost_J_trajectory",
+            "cost_J_trajectory_math",
+        ):
+            if key in ("cost_J_running_cumulative", "cost_J_trajectory", "cost_J_trajectory_math"):
+                trace = np.asarray(pathwise[key], dtype=np.float32)
+                if trace.ndim != 3:
+                    raise ValueError(f"{key} must have shape (M, n_time, 1), got {trace.shape}")
+                if trace.shape[1] == 0:
+                    values = np.zeros((trace.shape[0], 1), dtype=np.float32)
                 else:
-                    values = cumulative[:, -1, :]
+                    values = trace[:, -1, :]
             else:
                 values = np.asarray(pathwise[key], dtype=np.float32)
             values = values.reshape(-1)
@@ -1276,7 +1283,40 @@ class NN_Pascucci(FBSNN):
             running = tf.zeros([tf.shape(X)[0], 1], dtype=tf.float32)
         terminal_moments = self.mean_field_moments_tf(X[:, -1, :])
         terminal = self.g_tf(X[:, -1, :], moment_state=terminal_moments)
-        return running, terminal, running + terminal, running_cumulative
+        trajectory_terms = []
+        terminal_terms = []
+        time_points = int(t.shape[1])
+        for step in range(time_points):
+            moments = self.mean_field_moments_tf(X[:, step, :])
+            terminal_terms.append(self.g_tf(X[:, step, :], moment_state=moments))
+            if time_points == 1:
+                dt_step = tf.zeros_like(t[:, step, :])
+            elif step == 0:
+                dt_step = t[:, 1, :] - t[:, 0, :]
+            else:
+                dt_step = t[:, step, :] - t[:, step - 1, :]
+            trajectory_terms.append(
+                self.f_tf(
+                    t[:, step, :],
+                    X[:, step, :],
+                    tf.zeros_like(Y[:, step, :]),
+                    Z[:, step, :],
+                    moment_state=moments,
+                )
+                * dt_step
+            )
+        cost_trajectory = (
+            tf.cumsum(tf.stack(trajectory_terms, axis=1), axis=1)
+            + tf.stack(terminal_terms, axis=1)
+        )
+        terminal_trace = tf.stack(terminal_terms, axis=1)
+        if running_terms:
+            zero_prefix = tf.zeros([tf.shape(X)[0], 1, 1], dtype=tf.float32)
+            integral_to_time = tf.concat([zero_prefix, running_cumulative], axis=1)
+        else:
+            integral_to_time = tf.zeros([tf.shape(X)[0], 1, 1], dtype=tf.float32)
+        cost_trajectory_math = integral_to_time + terminal_trace
+        return running, terminal, running + terminal, running_cumulative, cost_trajectory, cost_trajectory_math
 
     def _application_cost_result_np(
         self,
@@ -1284,6 +1324,8 @@ class NN_Pascucci(FBSNN):
         terminal,
         total,
         running_cumulative,
+        cost_trajectory,
+        cost_trajectory_math,
         alpha,
         *,
         baseline_mode,
@@ -1295,6 +1337,8 @@ class NN_Pascucci(FBSNN):
             "cost_J_terminal": terminal.numpy().astype(np.float32),
             "cost_J_total": total.numpy().astype(np.float32),
             "cost_J_running_cumulative": running_cumulative.numpy().astype(np.float32),
+            "cost_J_trajectory": cost_trajectory.numpy().astype(np.float32),
+            "cost_J_trajectory_math": cost_trajectory_math.numpy().astype(np.float32),
             "alpha": alpha.numpy().astype(np.float32),
         }
         return {
@@ -1302,6 +1346,8 @@ class NN_Pascucci(FBSNN):
             "metadata": {
                 "baseline_mode": str(baseline_mode),
                 "aggregation": "left_riemann_f_plus_terminal_g",
+                "trajectory_aggregation": "plotmaker_cumsum_f_dt_plus_g_at_time",
+                "trajectory_math_aggregation": "left_riemann_integral_to_time_plus_g_at_time",
                 "control_law": str(control_law),
                 "paired_inputs": str(paired_inputs),
             },
@@ -1333,13 +1379,22 @@ class NN_Pascucci(FBSNN):
             mode = str(baseline_mode or "controlled").strip().lower()
             if mode not in ("controlled", "uncontrolled"):
                 raise ValueError(f"baseline_mode must be 'controlled' or 'uncontrolled'")
-            running, terminal, total, running_cumulative = self._application_cost_pathwise_tf(t, X, Y, Z)
+            (
+                running,
+                terminal,
+                total,
+                running_cumulative,
+                cost_trajectory,
+                cost_trajectory_math,
+            ) = self._application_cost_pathwise_tf(t, X, Y, Z)
             alpha = self._application_alpha_trace_tf(t, X, Z)
             return self._application_cost_result_np(
                 running,
                 terminal,
                 total,
                 running_cumulative,
+                cost_trajectory,
+                cost_trajectory_math,
                 alpha,
                 baseline_mode=mode,
                 control_law=control_law,
@@ -1371,12 +1426,21 @@ class NN_Pascucci(FBSNN):
             else:
                 raise ValueError(f"baseline_mode must be 'controlled' or 'uncontrolled'")
 
-            running, terminal, total, running_cumulative = self._application_cost_pathwise_tf(t, X, Y, Z)
+            (
+                running,
+                terminal,
+                total,
+                running_cumulative,
+                cost_trajectory,
+                cost_trajectory_math,
+            ) = self._application_cost_pathwise_tf(t, X, Y, Z)
             return self._application_cost_result_np(
                 running,
                 terminal,
                 total,
                 running_cumulative,
+                cost_trajectory,
+                cost_trajectory_math,
                 alpha,
                 baseline_mode=mode,
                 control_law=control_law,

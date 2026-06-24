@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 from .application_metrics import (
+    _physical_violation_values_from_x,
     summarize_application_alpha,
     summarize_application_pass_stability,
     summarize_controlled_uncontrolled_comparison,
@@ -457,6 +458,147 @@ def _compute_application_metric_artifact(
         model.close()
 
 
+def _augment_pathwise_with_physical_violations(
+    pathwise_npz: Dict[str, np.ndarray],
+    *,
+    stitched: Dict[str, np.ndarray],
+    params: Dict[str, Any],
+) -> Dict[str, np.ndarray]:
+    augmented = dict(pathwise_npz)
+    violations = _physical_violation_values_from_x(stitched, params)
+    for key, value in violations.items():
+        augmented[key] = np.asarray(value, dtype=np.float32)
+    return augmented
+
+
+def _compute_mc_confirmation_artifact(
+    *,
+    selected_pass_id: int,
+    selected_pass_entry: Dict[str, Any],
+    blocks: List[Dict[str, float]],
+    rec_dir: str,
+    params: Dict[str, np.ndarray],
+    N_per_block: int,
+    D: int,
+    layers: List[int],
+    T_total: float,
+    coupling_const: float,
+    model_spec: ModelSpec,
+    sample_paths: int,
+    seed: int,
+    eval_seed: int,
+) -> Optional[Dict[str, Any]]:
+    if int(sample_paths) <= 0:
+        return None
+    if str(model_spec.application_metric_schema) == "none":
+        raise ValueError("MC confirmation requires a model with application metrics")
+    if int(seed) == int(eval_seed):
+        raise ValueError("MC confirmation seed must differ from eval_seed")
+
+    os.makedirs(rec_dir, exist_ok=True)
+    bundle_path = os.path.join(rec_dir, "mc_confirmation_bundle.npz")
+    pathwise_npz_path = os.path.join(rec_dir, "application_metrics_mc_confirmation.npz")
+    summary_json_path = os.path.join(rec_dir, "application_metrics_mc_confirmation.json")
+
+    Xi_mc = model_spec.deterministic_xi(int(sample_paths), int(D), seed=int(seed))
+    rollout_inputs = build_stitched_rollout_inputs(
+        blocks=blocks,
+        M=int(Xi_mc.shape[0]),
+        N_per_block=int(N_per_block),
+        D=int(D),
+        seed=int(seed),
+    )
+    save_evaluation_bundle(
+        path=bundle_path,
+        Xi_initial=Xi_mc,
+        rollout_inputs=rollout_inputs,
+        blocks=blocks,
+        bundle_kind="mc_confirmation",
+    )
+    stitched = predict_recursive_stitched(
+        block_blobs=selected_pass_entry["blobs"],
+        blocks=blocks,
+        Xi_initial=Xi_mc,
+        params=params,
+        N_per_block=N_per_block,
+        D=D,
+        layers=layers,
+        T_total=T_total,
+        rollout_inputs=rollout_inputs,
+        coupling_const=float(coupling_const),
+        model_spec=model_spec,
+    )
+    nonfinite_reason = _nonfinite_stitched_reason(
+        stitched,
+        pass_label=f"{_pass_label(int(selected_pass_id))} MC confirmation",
+    )
+    if nonfinite_reason is not None:
+        raise RuntimeError(nonfinite_reason)
+
+    application_artifact = _compute_application_metric_artifact(
+        stitched=stitched,
+        blocks=blocks,
+        rollout_inputs=rollout_inputs,
+        params=params,
+        D=D,
+        layers=layers,
+        T_total=T_total,
+        coupling_const=float(coupling_const),
+        model_spec=model_spec,
+    )
+    if application_artifact is None:
+        raise ValueError("MC confirmation could not compute application metrics")
+
+    application_summary, pathwise_npz = application_artifact
+    if "comparison" not in application_summary or "uncontrolled" not in application_summary:
+        raise ValueError("MC confirmation requires controlled/uncontrolled application metrics")
+    pathwise_npz = _augment_pathwise_with_physical_violations(
+        pathwise_npz,
+        stitched=stitched,
+        params=params,
+    )
+    save_blob_npz(pathwise_npz, pathwise_npz_path)
+
+    payload = {
+        "schema": "pascucci_mc_confirmation_v1",
+        "source": "independent_post_selection",
+        "model_name": model_spec.name,
+        "selected_pass_id": int(selected_pass_id),
+        "selected_pass_index": int(_pass_index(selected_pass_id)),
+        "seed": int(seed),
+        "independent_of_eval_bundle": True,
+        "eval_bundle_reused": False,
+        "pathwise_npz": os.path.basename(pathwise_npz_path),
+        "pathwise_npz_sha256": file_sha256(pathwise_npz_path),
+        "bundle_path": os.path.basename(bundle_path),
+        "bundle_sha256": file_sha256(bundle_path),
+        "bundle_kind": "mc_confirmation",
+        "eval_seed": int(eval_seed),
+        "horizon": {
+            **dict(application_summary.get("horizon", {})),
+            "sample_paths": int(sample_paths),
+            "seed": int(seed),
+        },
+        "controlled": application_summary.get("controlled", {}),
+        "uncontrolled": application_summary.get("uncontrolled", {}),
+        "comparison": application_summary.get("comparison", {}),
+        "diagnostics": application_summary.get("diagnostics", {}),
+        "pathwise_npz_keys": sorted(pathwise_npz),
+    }
+    save_json(payload, summary_json_path)
+    return {
+        "summary_path": summary_json_path,
+        "pathwise_npz_path": pathwise_npz_path,
+        "bundle_path": bundle_path,
+        "summary_sha256": file_sha256(summary_json_path),
+        "pathwise_npz_sha256": file_sha256(pathwise_npz_path),
+        "bundle_sha256": file_sha256(bundle_path),
+        "seed": int(seed),
+        "sample_paths": int(sample_paths),
+        "payload": payload,
+    }
+
+
 def print_recursive_pass(
     pass_entries: List[Dict[str, Any]],
     blocks: List[Dict[str, float]],
@@ -482,6 +624,8 @@ def print_recursive_pass(
     exclude_pass_ids_from_selection: Optional[List[int]] = None,
     coupling_const: float = 1.0,
     model_spec: Optional[ModelSpec] = None,
+    mc_confirmation_paths: int = 0,
+    mc_confirmation_seed: Optional[int] = None,
 ) -> Dict[str, Any]:
     if pass_entries is None or len(pass_entries) == 0:
         raise RuntimeError("print_recursive_pass called with empty pass_entries")
@@ -837,6 +981,7 @@ def print_recursive_pass(
                 str(_pass_index(k)): v for k, v in application_stability_by_pass.items()
             },
             "selected_application_summary": None,
+            "mc_confirmation_summary": None,
             "eval_bundle_path": eval_bundle_path,
             "eval_bundle_status": eval_bundle_status,
             "eval_bundle_sha256": file_sha256(eval_bundle_path),
@@ -892,10 +1037,13 @@ def print_recursive_pass(
     )
 
     selected_stitched = stitched_by_pass[selected_pass_id]
+    pass_entry_by_id = {int(p["pass_id"]): p for p in pass_entries}
+    selected_pass_entry = pass_entry_by_id[int(selected_pass_id)]
     selected_exact_bundle = exact_bundle_by_pass.get(selected_pass_id, None)
     selected_visual_stitched = visual_stitched_by_pass.get(selected_pass_id, None)
     selected_visual_exact_bundle = visual_exact_bundle_by_pass.get(selected_pass_id, None)
     selected_application_summary = application_summary_by_pass.get(selected_pass_id, None)
+    mc_confirmation_summary = None
     if promote_final_artifacts:
         save_blob_npz(
             selected_stitched,
@@ -961,6 +1109,28 @@ def print_recursive_pass(
             save_json(application_final_summary, application_final_json_path)
             selected_application_summary = application_final_summary
 
+        mc_seed_effective = (
+            int(eval_seed) + 104729
+            if mc_confirmation_seed is None
+            else int(mc_confirmation_seed)
+        )
+        mc_confirmation_summary = _compute_mc_confirmation_artifact(
+            selected_pass_id=int(selected_pass_id),
+            selected_pass_entry=selected_pass_entry,
+            blocks=blocks,
+            rec_dir=rec_dir,
+            params=params,
+            N_per_block=N_per_block,
+            D=D,
+            layers=layers,
+            T_total=T_total,
+            coupling_const=float(coupling_const),
+            model_spec=spec,
+            sample_paths=int(mc_confirmation_paths),
+            seed=int(mc_seed_effective),
+            eval_seed=int(eval_seed),
+        )
+
     plot_recursive_stitched_y_convergence(
         stitched_by_pass=stitched_by_pass,
         blocks=blocks,
@@ -1008,6 +1178,7 @@ def print_recursive_pass(
             str(_pass_index(k)): v for k, v in application_stability_by_pass.items()
         },
         "selected_application_summary": selected_application_summary,
+        "mc_confirmation_summary": mc_confirmation_summary,
         "eval_bundle_path": eval_bundle_path,
         "eval_bundle_status": eval_bundle_status,
         "eval_bundle_sha256": file_sha256(eval_bundle_path),
@@ -1783,11 +1954,18 @@ def run_recursive_training(
     fixed_boundary_Xi_initial: Optional[np.ndarray] = None,
     fixed_boundary_rollout_inputs: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
     return_gradient_diagnostics: bool = False,
+    warm_start_norm_policy: str = "generator",
 ):
     if int(n_passes) < 1:
         raise ValueError("n_passes must be >= 1")
     spec = _resolve_model_spec(model_spec)
     spec.validate_state_dim(D)
+    norm_policy = str(warm_start_norm_policy or "generator").strip().lower()
+    if norm_policy not in {"generator", "blob"}:
+        raise ValueError(
+            "warm_start_norm_policy must be 'generator' or 'blob', "
+            f"got {warm_start_norm_policy!r}"
+        )
 
     blocks = build_blocks(T_total=T_total, block_size=block_size)
     validate_boundary_samples(
@@ -1972,7 +2150,39 @@ def run_recursive_training(
                 print(f"[ActiveSet] {label} frozen -> reusing {_pass_label(int(pass_id) - 1)} block{b}")
                 continue
 
-            x_mean, x_std = estimate_generator_stats(generators_per_block[b], D=D, n_samples=max(4096, M))
+            warm_start_blob = None
+            if warm_start_blobs is not None and warm_start_blobs[b] is not None:
+                warm_start_blob = _as_blob_dict(warm_start_blobs[b])
+
+            warm_start_norm_source = "generator"
+            if norm_policy == "blob" and warm_start_blob is not None:
+                missing_norm_keys = [
+                    key for key in ("x_norm_mean", "x_norm_std") if key not in warm_start_blob
+                ]
+                if missing_norm_keys:
+                    raise ValueError(
+                        "warm_start_norm_policy='blob' requires warm-start blobs with "
+                        f"x_norm_mean/x_norm_std; missing {missing_norm_keys} for block {b}"
+                    )
+                x_mean = np.asarray(warm_start_blob["x_norm_mean"], dtype=np.float32).reshape(1, D)
+                x_std = np.asarray(warm_start_blob["x_norm_std"], dtype=np.float32).reshape(1, D)
+                if not np.isfinite(x_mean).all():
+                    raise ValueError(
+                        "warm_start_norm_policy='blob' requires finite x_norm_mean "
+                        f"for block {b}"
+                    )
+                if (not np.isfinite(x_std).all()) or np.any(x_std <= 0.0):
+                    raise ValueError(
+                        "warm_start_norm_policy='blob' requires finite positive x_norm_std "
+                        f"for block {b}"
+                    )
+                warm_start_norm_source = "blob"
+            else:
+                x_mean, x_std = estimate_generator_stats(
+                    generators_per_block[b],
+                    D=D,
+                    n_samples=max(4096, M),
+                )
 
             reset_backend_state()
             model = spec.build_recursive_model(
@@ -1996,8 +2206,8 @@ def run_recursive_training(
             if warm_start_from_next and next_blob is not None:
                 model.import_parameter_blob(next_blob, strict=False)
 
-            if warm_start_blobs is not None and warm_start_blobs[b] is not None:
-                model.import_parameter_blob(warm_start_blobs[b], strict=False)
+            if warm_start_blob is not None:
+                model.import_parameter_blob(warm_start_blob, strict=False)
 
             precision_target = None
             if prev_pass_loss_by_block is not None and b in prev_pass_loss_by_block:
@@ -2073,6 +2283,9 @@ def run_recursive_training(
                 "freeze_threshold": float(freeze_loss_threshold),
                 "freeze_neighbor_radius": int(freeze_neighbor_radius),
                 "active_set_enabled": bool(active_set_summary.get("enabled", False)),
+                "warm_start_norm_policy": norm_policy,
+                "warm_start_norm_source": warm_start_norm_source,
+                "warm_start_blob_used": bool(warm_start_blob is not None),
             } | _prefixed_eval_diagnostics(block_stats["eval_stats"])
             log_row.update(block_stats.get("gradient_diagnostics", {}) or {})
             logs.append(log_row)
@@ -2249,6 +2462,7 @@ def run_recursive_coarse_prepass(
     curriculum_jitter_scale: Optional[float] = None,
     coupling_const: float = 1.0,
     model_spec: Optional[ModelSpec] = None,
+    warm_start_norm_policy: str = "generator",
 ) -> Dict[str, Any]:
     spec = _resolve_model_spec(model_spec)
     spec.validate_state_dim(D)
@@ -2360,6 +2574,7 @@ def run_recursive_coarse_prepass(
             coupling_const=float(stage_const),
             on_pass_end=None,
             model_spec=spec,
+            warm_start_norm_policy=warm_start_norm_policy,
         )
 
         stage_input_boundary_samples = prepass_result.get("boundary_samples", [])

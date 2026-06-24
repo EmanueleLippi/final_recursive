@@ -8,7 +8,12 @@ from typing import Any, Callable, Optional
 import numpy as np
 
 from .exact import build_exact_initial_boundary_samples, build_exact_solution_functions
-from .sampling import Xi_generator_default, make_deterministic_xi_default
+from .sampling import (
+    Xi_generator_default,
+    Xi_generator_pascucci_paper,
+    make_deterministic_xi_default,
+    make_deterministic_xi_pascucci_paper,
+)
 
 
 def _require_state_dim_4(D: int) -> None:
@@ -59,7 +64,7 @@ def _build_default_ou_params() -> dict:
 def _build_pascucci_params(const: float = 1.0) -> dict:
     return {
         "l_v": np.float32(0.01),
-        "l_a": np.float32(0.01),
+        "l_a": np.float32(0.005),
         "c3": np.float32(10.0),
         "c4": np.float32(10.0),
         "gamma": np.float32(1.0),
@@ -72,7 +77,7 @@ def _build_pascucci_params(const: float = 1.0) -> dict:
         "s3v": np.float32(0.001),
         "s3k": np.float32(0.001),
         "omega": np.float32(0.01),
-        "c_h": np.float32(0.0001),
+        "c_h": np.float32(0.001),
         "c_con": np.float32(0.01),
         "const": np.float32(const),
         "pascucci_cost_profile": "exp",
@@ -197,8 +202,8 @@ def get_model_spec(name: Optional[str] = None) -> ModelSpec:
             z_labels=("Z_S", "Z_H", "Z_V", "Z_X"),
             build_default_params=_build_pascucci_params,
             build_layers=_build_pascucci_layers,
-            xi_generator=Xi_generator_default,
-            deterministic_xi=make_deterministic_xi_default,
+            xi_generator=Xi_generator_pascucci_paper,
+            deterministic_xi=make_deterministic_xi_pascucci_paper,
             standard_model_factory=_build_pascucci_standard_model,
             recursive_model_factory=_build_pascucci_recursive_model,
             build_exact_solution=_build_pascucci_exact_solution,
@@ -210,6 +215,8 @@ def get_model_spec(name: Optional[str] = None) -> ModelSpec:
                 "cost_J_terminal",
                 "cost_J_total",
                 "cost_J_running_cumulative",
+                "cost_J_trajectory",
+                "cost_J_trajectory_math",
             ),
             application_metric_aggregation="left_riemann_f_plus_terminal_g",
             exclude_bootstrap_pass_from_selection=False,

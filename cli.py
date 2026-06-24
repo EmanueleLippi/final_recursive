@@ -53,6 +53,13 @@ def _run_config_sha256(config: dict) -> str:
         "recursive_rollout_bundle_path_effective",
         "recursive_rollout_bundle_sha256",
         "recursive_rollout_bundle_status",
+        "mc_confirmation_status",
+        "mc_confirmation_summary_path",
+        "mc_confirmation_summary_sha256",
+        "mc_confirmation_npz_path",
+        "mc_confirmation_npz_sha256",
+        "mc_confirmation_bundle_path",
+        "mc_confirmation_bundle_sha256",
     }
     payload = {k: v for k, v in config.items() if k not in runtime_keys}
     encoded = json.dumps(_to_serializable(payload), sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -64,6 +71,92 @@ def _json_safe_score(value) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return score if np.isfinite(score) else None
+
+
+def _maybe_apply_pascucci_calibration(args, params: dict, model_name: str) -> dict:
+    H_path = str(args.pascucci_H_path or "").strip()
+    S_path = str(args.pascucci_S_path or "").strip()
+    require_calibration = bool(getattr(args, "pascucci_require_calibration", False))
+    if require_calibration and str(model_name) != "pascucci":
+        raise ValueError("--pascucci_require_calibration is supported only with --model pascucci")
+    if require_calibration and (H_path == "" or S_path == ""):
+        raise ValueError(
+            "--pascucci_require_calibration requires both --pascucci_H_path and --pascucci_S_path"
+        )
+    if H_path == "" and S_path == "":
+        return params
+    if str(model_name) != "pascucci":
+        raise ValueError("--pascucci_H_path/--pascucci_S_path are supported only with --model pascucci")
+    if H_path == "" or S_path == "":
+        raise ValueError("--pascucci_H_path and --pascucci_S_path must be provided together")
+
+    H_points_per_hour = int(args.pascucci_H_points_per_hour)
+    S_points_per_hour = int(args.pascucci_S_points_per_hour)
+    H_mul_factor = float(args.pascucci_H_mul_factor)
+    S_mul_factor = float(args.pascucci_S_mul_factor)
+    K = int(args.pascucci_calibration_K)
+    dt = float(args.pascucci_calibration_dt)
+    start_hour = float(args.pascucci_calibration_start_hour)
+    log_price = not bool(args.pascucci_no_log_price)
+    if H_points_per_hour <= 0 or S_points_per_hour <= 0:
+        raise ValueError("Pascucci calibration points-per-hour values must be positive")
+    if not np.isfinite(H_mul_factor) or not np.isfinite(S_mul_factor):
+        raise ValueError("Pascucci calibration mul_factor values must be finite")
+    if K < 0:
+        raise ValueError("--pascucci_calibration_K must be non-negative")
+    if not np.isfinite(dt) or dt <= 0.0:
+        raise ValueError("--pascucci_calibration_dt must be a positive finite value")
+    if not np.isfinite(start_hour):
+        raise ValueError("--pascucci_calibration_start_hour must be finite")
+
+    from .pascucci_calibration import (
+        build_pascucci_calibration_config,
+        build_pascucci_run_config_params,
+        calibrate_pascucci_ou_inputs,
+    )
+    from .pascucci_data import prepare_H, prepare_S
+
+    H_abs = os.path.abspath(H_path)
+    S_abs = os.path.abspath(S_path)
+    H_series = prepare_H(H_abs, n=H_points_per_hour, mul_factor=H_mul_factor)
+    S_series = prepare_S(S_abs, n=S_points_per_hour, mul_factor=S_mul_factor)
+    calibration = calibrate_pascucci_ou_inputs(
+        H_series,
+        S_series,
+        K=K,
+        dt=dt,
+        start_hour=start_hour,
+        log_price=log_price,
+    )
+    config = build_pascucci_calibration_config(
+        calibration,
+        K=K,
+        dt=dt,
+        start_hour=start_hour,
+        log_price=log_price,
+        H_metadata={
+            "source_path": H_abs,
+            "source_sha256": file_sha256(H_abs),
+            "units": "kW",
+            "n_per_hour": H_points_per_hour,
+            "mul_factor": H_mul_factor,
+            "prepared_points": int(H_series.shape[0]),
+        },
+        S_metadata={
+            "source_path": S_abs,
+            "source_sha256": file_sha256(S_abs),
+            "units": "EUR_per_MWh",
+            "n_per_hour": S_points_per_hour,
+            "mul_factor": S_mul_factor,
+            "prepared_points": int(S_series.shape[0]),
+        },
+    )
+    calibrated_params = build_pascucci_run_config_params(params, config)
+    print(
+        "[PascucciCalibration] enabled: "
+        f"H={H_abs}, S={S_abs}, K={K}, dt={dt:g}, log_price={log_price}"
+    )
+    return calibrated_params
 
 
 def _summarize_application_cost_result(result: dict) -> dict:
@@ -150,6 +243,73 @@ def run_program(argv: Optional[List[str]] = None):
         type=float,
         default=0.0,
         help="Offset per il profilo di costo di Pascucci.",
+    )
+    parser.add_argument(
+        "--pascucci_H_path",
+        type=str,
+        default="",
+        help="CSV sorgente per calibrare H=Consumo-Produzione del modello Pascucci.",
+    )
+    parser.add_argument(
+        "--pascucci_S_path",
+        type=str,
+        default="",
+        help="XLSX sorgente per calibrare il prezzo S del modello Pascucci.",
+    )
+    parser.add_argument(
+        "--pascucci_H_points_per_hour",
+        type=int,
+        default=4,
+        help="Numero di osservazioni per ora nel CSV H prima della media oraria.",
+    )
+    parser.add_argument(
+        "--pascucci_S_points_per_hour",
+        type=int,
+        default=1,
+        help="Numero di osservazioni per ora nell'XLSX S prima della media oraria.",
+    )
+    parser.add_argument(
+        "--pascucci_H_mul_factor",
+        type=float,
+        default=0.001,
+        help="Fattore di scala applicato a H dopo la media oraria.",
+    )
+    parser.add_argument(
+        "--pascucci_S_mul_factor",
+        type=float,
+        default=0.001,
+        help="Fattore di scala applicato a S dopo la media oraria.",
+    )
+    parser.add_argument(
+        "--pascucci_calibration_K",
+        type=int,
+        default=2,
+        help="Numero di armoniche Fourier per la calibrazione OU day/night Pascucci.",
+    )
+    parser.add_argument(
+        "--pascucci_calibration_dt",
+        type=float,
+        default=1.0,
+        help="Passo temporale fisico, in ore, usato nella calibrazione OU Pascucci.",
+    )
+    parser.add_argument(
+        "--pascucci_calibration_start_hour",
+        type=float,
+        default=0.0,
+        help="Ora fisica iniziale per regime day/night e fase Fourier della calibrazione Pascucci.",
+    )
+    parser.add_argument(
+        "--pascucci_no_log_price",
+        action="store_true",
+        help="Se attivo calibra S in scala lineare invece che su log(S).",
+    )
+    parser.add_argument(
+        "--pascucci_require_calibration",
+        action="store_true",
+        help=(
+            "Richiede una calibrazione H/S esplicita per run Pascucci paper-parity. "
+            "La run fallisce prima del training se mancano --pascucci_H_path o --pascucci_S_path."
+        ),
     )
     parser.add_argument("--M", type=int, default=100)
     parser.add_argument("--N", type=int, default=100, help="N steps per block")
@@ -295,6 +455,24 @@ def run_program(argv: Optional[List[str]] = None):
         ),
     )
     parser.add_argument(
+        "--mc_confirmation_paths",
+        type=int,
+        default=0,
+        help=(
+            "Numero di traiettorie per la conferma Monte Carlo indipendente post-selection. "
+            "0 disabilita l'artifact; usare 10000 per paper-parity validator GREEN."
+        ),
+    )
+    parser.add_argument(
+        "--mc_confirmation_seed",
+        type=int,
+        default=-1,
+        help=(
+            "Seed della conferma Monte Carlo indipendente. -1 usa eval_seed+104729; "
+            "deve essere diverso da --eval_seed."
+        ),
+    )
+    parser.add_argument(
         "--recursive_gradient_diagnostics",
         action="store_true",
         help="Se attivo, salva diagnostiche gradient/clip nei log dei blocchi ricorsivi.",
@@ -394,6 +572,25 @@ def run_program(argv: Optional[List[str]] = None):
             "Jitter relativo sui boundary samples empirici tra stage del curriculum coarse. "
             "Default: eredita --empirical_jitter_scale; usa 0.0 per ripristinare il vecchio "
             "comportamento senza jitter tra stage."
+        ),
+    )
+    parser.add_argument(
+        "--coarse_disable_weight_warm_start",
+        action="store_true",
+        help=(
+            "Con --pass1_init coarse usa i boundary samples della coarse prepass ma non importa "
+            "i pesi coarse nel training principale. Serve per test boundary-only."
+        ),
+    )
+    parser.add_argument(
+        "--warm_start_norm_policy",
+        type=str,
+        default="generator",
+        choices=["generator", "blob"],
+        help=(
+            "Normalizzazione usata quando si importano pesi warm-start. "
+            "generator=stima dai boundary correnti (default storico); "
+            "blob=riusa x_norm_mean/std salvati nel blob warm-start."
         ),
     )
     parser.add_argument(
@@ -554,6 +751,7 @@ def run_program(argv: Optional[List[str]] = None):
             "structural_z_component_weights": structural_z_component_weights,
         }
     )
+    params = _maybe_apply_pascucci_calibration(args, params, model_spec.name)
     layers = model_spec.build_layers(D)
     stage_plan = [(5000, 1e-3), (5000, 5e-4), (5000, 1e-4), (5000, 5e-5)]
     final_plan = [(5000, 1e-5), (5000, 5e-6)]
@@ -585,6 +783,38 @@ def run_program(argv: Optional[List[str]] = None):
 
     visual_seed_requested = None if int(args.visual_seed) < 0 else int(args.visual_seed)
     visual_seed_effective = int(args.eval_seed) + 7919 if visual_seed_requested is None else int(visual_seed_requested)
+    if int(args.mc_confirmation_paths) < 0:
+        raise ValueError("--mc_confirmation_paths must be >= 0")
+    mc_confirmation_seed_requested = (
+        None
+        if int(args.mc_confirmation_seed) < 0
+        else int(args.mc_confirmation_seed)
+    )
+    mc_confirmation_seed_effective = (
+        int(args.eval_seed) + 104729
+        if mc_confirmation_seed_requested is None
+        else int(mc_confirmation_seed_requested)
+    )
+    if int(args.mc_confirmation_paths) > 0 and int(mc_confirmation_seed_effective) == int(args.eval_seed):
+        raise ValueError("--mc_confirmation_seed must differ from --eval_seed")
+    if (
+        int(args.mc_confirmation_paths) > 0
+        and str(model_spec.application_metric_schema) == "none"
+    ):
+        raise ValueError(
+            "--mc_confirmation_paths requires a model with application metrics; "
+            f"model '{model_spec.name}' declares application_metric_schema='none'"
+        )
+    if (
+        str(args.pass1_init or "base").strip().lower() == "coarse"
+        and bool(args.coarse_disable_weight_warm_start)
+        and bool(args.pass1_warm_start_from_next)
+    ):
+        raise ValueError(
+            "--coarse_disable_weight_warm_start cannot be combined with "
+            "--pass1_warm_start_from_next: the boundary-only diagnostic must avoid "
+            "all pass-1 weight warm-starts"
+        )
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_root = os.path.join(args.output_dir, f"run_{run_id}")
@@ -635,7 +865,13 @@ def run_program(argv: Optional[List[str]] = None):
         "visual_sample_paths": int(args.visual_sample_paths),
         "visual_seed": visual_seed_requested,
         "visual_seed_effective": int(visual_seed_effective),
+        "mc_confirmation_paths": int(args.mc_confirmation_paths),
+        "mc_confirmation_seed": mc_confirmation_seed_requested,
+        "mc_confirmation_seed_effective": int(mc_confirmation_seed_effective),
+        "mc_confirmation_enabled": bool(int(args.mc_confirmation_paths) > 0),
         "pass1_init": str(args.pass1_init),
+        "coarse_disable_weight_warm_start": bool(args.coarse_disable_weight_warm_start),
+        "warm_start_norm_policy": str(args.warm_start_norm_policy),
         "coarse_prepass_M": int(args.coarse_prepass_M),
         "coarse_prepass_N": int(args.coarse_prepass_N),
         "coarse_prepass_iter_scale": float(args.coarse_prepass_iter_scale),
@@ -667,6 +903,11 @@ def run_program(argv: Optional[List[str]] = None):
         "application_metric_schema": model_spec.application_metric_schema,
         "application_metric_names": list(model_spec.application_metric_names),
         "application_metric_aggregation": model_spec.application_metric_aggregation,
+        "pascucci_require_calibration": bool(args.pascucci_require_calibration),
+        "pascucci_calibration_enabled": bool(
+            model_spec.name == "pascucci"
+            and isinstance(params.get("pascucci_calibration"), dict)
+        ),
         "seed_manifest": {
             "global_seed": 1234,
             "eval_seed": int(args.eval_seed),
@@ -675,6 +916,8 @@ def run_program(argv: Optional[List[str]] = None):
             else int(args.recursive_fixed_eval_seed),
             "visual_seed": visual_seed_requested,
             "visual_seed_effective": int(visual_seed_effective),
+            "mc_confirmation_seed": mc_confirmation_seed_requested,
+            "mc_confirmation_seed_effective": int(mc_confirmation_seed_effective),
             "coarse_prepass_seed": int(args.coarse_prepass_seed),
             "exact_init_seed": int(args.exact_init_seed),
         },
@@ -934,14 +1177,25 @@ def run_program(argv: Optional[List[str]] = None):
                     curriculum_jitter_scale=float(effective_coarse_curriculum_jitter_scale),
                     coupling_const=float(recursive_const),
                     model_spec=model_spec,
+                    warm_start_norm_policy=str(args.warm_start_norm_policy),
                 )
             finally:
                 np.random.set_state(np_state_before_prepass)
                 set_tf_seed(1234)
             initial_boundary_samples = coarse_prepass["boundary_samples"]
-            initial_warm_start_blobs = coarse_prepass["pass1_blobs"]
+            initial_warm_start_blobs = (
+                None
+                if bool(args.coarse_disable_weight_warm_start)
+                else coarse_prepass["pass1_blobs"]
+            )
             initialization_summary["coarse_prepass"] = coarse_prepass["summary"]
             initialization_summary["coarse_prepass"]["seed"] = int(args.coarse_prepass_seed)
+            initialization_summary["coarse_prepass"]["weight_warm_start_enabled"] = not bool(
+                args.coarse_disable_weight_warm_start
+            )
+            initialization_summary["coarse_prepass"]["warm_start_norm_policy"] = str(
+                args.warm_start_norm_policy
+            )
             save_json(
                 initialization_summary["coarse_prepass"],
                 os.path.join(run_root, "coarse_prepass", "summary.json"),
@@ -1039,6 +1293,10 @@ def run_program(argv: Optional[List[str]] = None):
                 ),
                 coupling_const=float(recursive_const),
                 model_spec=model_spec,
+                mc_confirmation_paths=(
+                    int(args.mc_confirmation_paths) if is_last_requested_pass else 0
+                ),
+                mc_confirmation_seed=mc_confirmation_seed_effective,
             )
 
         rec = run_recursive_training(
@@ -1079,6 +1337,7 @@ def run_program(argv: Optional[List[str]] = None):
             fixed_boundary_Xi_initial=fixed_boundary_Xi_initial,
             fixed_boundary_rollout_inputs=fixed_boundary_rollout_inputs,
             return_gradient_diagnostics=bool(args.recursive_gradient_diagnostics),
+            warm_start_norm_policy=str(args.warm_start_norm_policy),
         )
 
         pass_entries = sorted(rec.get("passes", []), key=lambda x: int(x["pass_id"]))
@@ -1112,6 +1371,8 @@ def run_program(argv: Optional[List[str]] = None):
                 exclude_pass_ids_from_selection=excluded_pass_ids_from_selection,
                 coupling_const=float(recursive_const),
                 model_spec=model_spec,
+                mc_confirmation_paths=int(args.mc_confirmation_paths),
+                mc_confirmation_seed=mc_confirmation_seed_effective,
             )
 
         exact_summary_by_pass = plot_summary["exact_summary_by_pass"]
@@ -1119,6 +1380,17 @@ def run_program(argv: Optional[List[str]] = None):
         run_config["eval_bundle_path_effective"] = str(plot_summary["eval_bundle_path"])
         run_config["eval_bundle_sha256"] = str(plot_summary.get("eval_bundle_sha256", ""))
         run_config["eval_bundle_status"] = plot_summary.get("eval_bundle_status", None)
+        mc_summary = plot_summary.get("mc_confirmation_summary")
+        if mc_summary is not None:
+            run_config["mc_confirmation_status"] = "created"
+            run_config["mc_confirmation_summary_path"] = str(mc_summary.get("summary_path", ""))
+            run_config["mc_confirmation_summary_sha256"] = str(mc_summary.get("summary_sha256", ""))
+            run_config["mc_confirmation_npz_path"] = str(mc_summary.get("pathwise_npz_path", ""))
+            run_config["mc_confirmation_npz_sha256"] = str(mc_summary.get("pathwise_npz_sha256", ""))
+            run_config["mc_confirmation_bundle_path"] = str(mc_summary.get("bundle_path", ""))
+            run_config["mc_confirmation_bundle_sha256"] = str(mc_summary.get("bundle_sha256", ""))
+        else:
+            run_config["mc_confirmation_status"] = "disabled"
         run_config["run_config_sha256"] = _run_config_sha256(run_config)
         save_json(run_config, os.path.join(run_root, "run_config.json"))
 
@@ -1200,6 +1472,18 @@ def run_program(argv: Optional[List[str]] = None):
                 "stability_by_pass_index": plot_summary.get("application_stability_by_pass_index", {}),
                 "selected_pass_summary": plot_summary.get("selected_application_summary", None),
             }
+        if plot_summary.get("mc_confirmation_summary") is not None:
+            mc_summary = plot_summary["mc_confirmation_summary"]
+            rec_summary["mc_confirmation"] = {
+                key: value
+                for key, value in mc_summary.items()
+                if key != "payload"
+            }
+            rec_summary.setdefault(
+                "application_metrics",
+                {"schema": model_spec.application_metric_schema},
+            )
+            rec_summary["application_metrics"]["mc_confirmation"] = mc_summary.get("payload", {})
         if exact_solution is None:
             rec_summary["exact_solution"] = {"enabled": False, "profile": "none"}
         else:

@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 _EVALUATION_BUNDLE_SCHEMA = "evaluation_bundle_v2"
-_VALID_BUNDLE_KINDS = {"evaluation", "boundary_rollout"}
+_VALID_BUNDLE_KINDS = {"evaluation", "boundary_rollout", "mc_confirmation"}
 
 def build_stitched_rollout_inputs(
     blocks: List[Dict[str, float]],
@@ -50,6 +50,17 @@ def make_deterministic_xi_default(M: int, D: int, seed: int = 1234) -> np.ndarra
     Xi[:, 1] = rng.normal(1.0, 1.0, int(M))
     Xi[:, 2] = rng.normal(0.0, 1.0, int(M))
     Xi[:, 3] = rng.uniform(3.0, 7.0, int(M))
+    return Xi.astype(np.float32)
+
+def make_deterministic_xi_pascucci_paper(M: int, D: int, seed: int = 1234) -> np.ndarray:
+    if int(D) != 4:
+        raise ValueError(f"make_deterministic_xi_pascucci_paper currently supports D=4, got D={int(D)}")
+    rng = np.random.RandomState(int(seed))
+    Xi = np.zeros((int(M), int(D)), dtype=np.float32)
+    Xi[:, 0] = rng.normal(-2.3, 0.2, int(M))
+    Xi[:, 1] = rng.normal(0.4, 0.5, int(M))
+    Xi[:, 2] = rng.normal(0.0, 1.0, int(M))
+    Xi[:, 3] = rng.uniform(1.0, 9.0, int(M))
     return Xi.astype(np.float32)
 
 def save_evaluation_bundle(
@@ -241,6 +252,15 @@ def Xi_generator_default(M, D):
     Xi[:, 1] = np.random.normal(1.0, 1.0, M)
     Xi[:, 2] = np.random.normal(0.0, 1.0, M)
     Xi[:, 3] = np.random.uniform(3.0, 7.0, M)
+    return Xi.astype(np.float32)
+
+def Xi_generator_pascucci_paper(M, D):
+    assert D == 4
+    Xi = np.zeros((M, 4), dtype=np.float32)
+    Xi[:, 0] = np.random.normal(-2.3, 0.2, M)
+    Xi[:, 1] = np.random.normal(0.4, 0.5, M)
+    Xi[:, 2] = np.random.normal(0.0, 1.0, M)
+    Xi[:, 3] = np.random.uniform(1.0, 9.0, M)
     return Xi.astype(np.float32)
 
 def make_empirical_generator(samples: np.ndarray, jitter_scale: float = 0.0):
